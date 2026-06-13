@@ -1,0 +1,51 @@
+{
+  "story_id": "DEMO_ONLY:fixture_attack_story:v1",
+  "fixture_mode": "DEMO_ONLY",
+  "title_redacted": "DEMO_ONLY metadata attack story",
+  "metadata": {
+    "local_ip": "192.0.2.10",
+    "resolver_ip": "192.0.2.53",
+    "c2_ip": "198.51.100.42",
+    "exfil_ip": "203.0.113.77",
+    "lateral_ip": "192.0.2.55",
+    "c2_domain_protected": "beacon-control.example.test",
+    "exfil_domain_protected": "archive-upload.example.test",
+    "host_label_redacted": "DEMO_ONLY local workstation",
+    "process_name_redacted": "DEMO_ONLY sg-demo-agent.exe",
+    "process_path_redacted": "%USERPROFILE%\\redacted\\sg-demo-agent.exe"
+  },
+  "stages": [
+    {
+      "stage": "metadata_input",
+      "summary_redacted": "DEMO_ONLY metadata seed contains RFC 5737 IPs, .test domains, process metadata, and no payloads."
+    },
+    {
+      "stage": "observation",
+      "summary_redacted": "Flow, DNS, and TLS observations are derived from fixture metadata only."
+    },
+    {
+      "stage": "enrichment_context",
+      "summary_redacted": "Process and destination context are attached as redacted entity references."
+    },
+    {
+      "stage": "finding_evidence",
+      "summary_redacted": "Evidence-backed C2, exfiltration, and lateral movement findings are produced."
+    },
+    {
+      "stage": "risk_alert_incident",
+      "summary_redacted": "Risk events promote findings into alerts and one incident."
+    },
+    {
+      "stage": "graph",
+      "summary_redacted": "A bounded GraphViewModel is built from redacted entities and evidence references."
+    },
+    {
+      "stage": "response_recommendation",
+      "summary_redacted": "Recommend-only response options are planned with policy and rollback metadata."
+    },
+    {
+      "stage": "redacted_report",
+      "summary_redacted": "A redacted report and local-only export history record are produced."
+    }
+  ]
+}

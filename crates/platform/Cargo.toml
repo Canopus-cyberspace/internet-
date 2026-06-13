@@ -1,0 +1,15 @@
+[package]
+name = "sentinel-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_platform"
+path = "src/lib.rs"
+
+[dependencies]
+sentinel-contracts = { path = "../contracts" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

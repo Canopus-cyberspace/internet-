@@ -1,0 +1,22 @@
+[package]
+name = "sentinel-capabilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_capabilities"
+path = "src/lib.rs"
+
+[dependencies]
+sentinel-contracts = { path = "../contracts" }
+sentinel-platform = { path = "../platform" }
+sentinel-storage = { path = "../storage" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_app_core"
+path = "src/lib.rs"
+
+[dependencies]
+sentinel-capabilities = { path = "../capabilities" }
+sentinel-contracts = { path = "../contracts" }
+sentinel-infrastructure = { path = "../infrastructure" }
+sentinel-platform = { path = "../platform" }
+sentinel-storage = { path = "../storage" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

@@ -1,0 +1,1 @@
+$ vite --host localhost --port 1420 --strictPort

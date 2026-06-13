@@ -1,0 +1,30 @@
+[package]
+name = "sentinel-guard-elevated"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_elevated_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sentinel-guard-elevated"
+path = "src/main.rs"
+
+[dependencies]
+sentinel-contracts = { path = "../../crates/contracts" }
+sentinel-platform = { path = "../../crates/platform" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+windows-service = "0.7"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+] }

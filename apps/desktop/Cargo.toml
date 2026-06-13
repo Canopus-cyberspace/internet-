@@ -1,0 +1,29 @@
+[package]
+name = "sentinel-guard-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_guard_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sentinel-guard-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+sentinel-app-core = { path = "../../crates/app_core" }
+sentinel-contracts = { path = "../../crates/contracts" }
+sentinel-platform = { path = "../../crates/platform" }
+sentinel-storage = { path = "../../crates/storage" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2.workspace = true
+
+[dev-dependencies]

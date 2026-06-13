@@ -1,0 +1,17 @@
+[package]
+name = "sentinel-infrastructure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_infrastructure"
+path = "src/lib.rs"
+
+[dependencies]
+chrono.workspace = true
+sentinel-contracts = { path = "../contracts" }
+sentinel-elevated-service = { package = "sentinel-guard-elevated", path = "../../service/elevated" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

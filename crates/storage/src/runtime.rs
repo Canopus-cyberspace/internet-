@@ -13,21 +13,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sentinel_contracts::{
     AuditId, CanonicalGraphEdge, CanonicalGraphNode, EntityId, EntityRef, EntityType, EvidenceId,
     GraphEdgeType, GraphNodeType, PluginId, PrivacyClass, QualityScore, RedactedLabel,
-    RuntimeProfile, SchemaVersion, Timestamp,
+    RedactionStatus, RuntimeProfile, SchemaVersion, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 const DATABASE_DIR_NAME: &str = "SentinelGuard";
 const DATABASE_FILE_NAME: &str = "sentinel_guard.db";
 const DB_PATH_ENV: &str = "SENTINEL_DB_PATH";
 const DEMO_DB_PATH_ENV: &str = "SENTINEL_DEMO_DB_PATH";
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
+const STORAGE_WRITER_LOCK_FILE_NAME: &str = ".sentinel_storage_writer.lock";
 
 const FORBIDDEN_SCHEMA_TOKENS: &[&str] = &[
     "raw_packet",
@@ -49,6 +54,44 @@ const FORBIDDEN_SCHEMA_TOKENS: &[&str] = &[
     "refresh_token",
     "full_query_string",
     "form_content",
+];
+
+const SERVICEHOST_DURABLE_ALLOWED_FIELDS: &[&str] = &[
+    "ids_refs",
+    "categories",
+    "buckets",
+    "schema_versions",
+    "bounded_counters",
+    "lifecycle_health",
+    "degraded_reasons",
+    "provenance_audit_refs",
+    "redaction_status",
+    "ownership_epoch_metadata",
+];
+
+const FORBIDDEN_DURABLE_STATE_MARKERS: &[&str] = &[
+    "raw_log",
+    "raw_logs",
+    "raw_file",
+    "raw_files",
+    "path",
+    "filename",
+    "process_name",
+    "service_name",
+    "pid",
+    "ppid",
+    "command_line",
+    "ip",
+    "port",
+    "packet",
+    "payload",
+    "raw_provider",
+    "nonce",
+    "caller_token",
+    "credential",
+    "api_key",
+    "secret",
+    "private_marker",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +122,665 @@ impl DatabaseLocation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageWriterOwnerCategory {
+    ServiceHost,
+    DesktopPortable,
+    TestHarness,
+}
+
+impl StorageWriterOwnerCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServiceHost => "service_host",
+            Self::DesktopPortable => "desktop_portable",
+            Self::TestHarness => "test_harness",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageWriterState {
+    Owned,
+    Conflict,
+    Released,
+}
+
+impl StorageWriterState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::Conflict => "conflict",
+            Self::Released => "released",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageOwnershipStatus {
+    pub owner_category: StorageWriterOwnerCategory,
+    pub writer_state: StorageWriterState,
+    pub storage_scope: String,
+    pub canonical_writer: bool,
+    pub path_exposed: bool,
+    pub llm_key_transferred: bool,
+    pub degraded_reason: Option<String>,
+}
+
+impl StorageOwnershipStatus {
+    pub fn owner_category_str(&self) -> &'static str {
+        self.owner_category.as_str()
+    }
+
+    pub fn writer_state_str(&self) -> &'static str {
+        self.writer_state.as_str()
+    }
+
+    pub fn redacted_for_conflict(
+        owner_category: StorageWriterOwnerCategory,
+        storage_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            owner_category,
+            writer_state: StorageWriterState::Conflict,
+            storage_scope: storage_scope.into(),
+            canonical_writer: false,
+            path_exposed: false,
+            llm_key_transferred: false,
+            degraded_reason: Some("writer_already_owned".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePersistenceClassification {
+    RequiredRuntimeState,
+    BoundedTraceability,
+    BoundedConfiguration,
+    SessionOnly,
+    NotPersisted,
+    Forbidden,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceHostDurableStatePolicy {
+    pub state_name: String,
+    pub owner_category: StorageWriterOwnerCategory,
+    pub classification: StoragePersistenceClassification,
+    pub allowed_fields: Vec<String>,
+    pub restored_on_restart: bool,
+    pub servicehost_canonical: bool,
+    pub redaction_status: RedactionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitOwnedStatePolicy {
+    pub state_name: String,
+    pub owner_category: String,
+    pub classification: StoragePersistenceClassification,
+    pub transferred_to_servicehost: bool,
+    pub persisted_by_servicehost: bool,
+    pub redaction_status: RedactionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceHostDurableStorageManifest {
+    pub owner_category: StorageWriterOwnerCategory,
+    pub canonical_writer_required: bool,
+    pub desktop_writer_allowed: bool,
+    pub cross_process_sqlite_connection_allowed: bool,
+    pub schema_version: SchemaVersion,
+    pub durable_state: Vec<ServiceHostDurableStatePolicy>,
+    pub split_owned_state: Vec<SplitOwnedStatePolicy>,
+    pub forbidden_markers_rejected: Vec<String>,
+    pub redaction_status: RedactionStatus,
+}
+
+impl ServiceHostDurableStorageManifest {
+    pub fn validate(&self) -> StorageResult<()> {
+        if self.owner_category != StorageWriterOwnerCategory::ServiceHost
+            || !self.canonical_writer_required
+            || self.desktop_writer_allowed
+            || self.cross_process_sqlite_connection_allowed
+            || self.redaction_status == RedactionStatus::RedactionRequired
+        {
+            return Err(StorageError::InvalidRecord {
+                store_kind: "servicehost_durable_storage_manifest".to_string(),
+                reason: "manifest ownership boundary is unsafe".to_string(),
+            });
+        }
+        for policy in &self.durable_state {
+            validate_durable_safe_text("state_name", &policy.state_name)?;
+            if policy.owner_category != StorageWriterOwnerCategory::ServiceHost
+                || policy.classification == StoragePersistenceClassification::Forbidden
+                || policy.allowed_fields.is_empty()
+                || policy.redaction_status == RedactionStatus::RedactionRequired
+            {
+                return Err(StorageError::InvalidRecord {
+                    store_kind: policy.state_name.clone(),
+                    reason: "durable state policy is unsafe".to_string(),
+                });
+            }
+            for field in &policy.allowed_fields {
+                validate_durable_safe_text("allowed_field", field)?;
+            }
+        }
+        for policy in &self.split_owned_state {
+            validate_durable_safe_text("split_state_name", &policy.state_name)?;
+            validate_durable_safe_text("split_owner_category", &policy.owner_category)?;
+            if policy.transferred_to_servicehost
+                || policy.persisted_by_servicehost
+                || policy.redaction_status == RedactionStatus::RedactionRequired
+            {
+                return Err(StorageError::InvalidRecord {
+                    store_kind: policy.state_name.clone(),
+                    reason: "split-owned state crossed the ServiceHost boundary".to_string(),
+                });
+            }
+        }
+        for marker in &self.forbidden_markers_rejected {
+            validate_durable_marker_text("forbidden_marker", marker)?;
+        }
+        Ok(())
+    }
+
+    pub fn policy(&self, state_name: &str) -> Option<&ServiceHostDurableStatePolicy> {
+        self.durable_state
+            .iter()
+            .find(|policy| policy.state_name == state_name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceHostStorageRecoveryReport {
+    pub owner_category: StorageWriterOwnerCategory,
+    pub writer_state: StorageWriterState,
+    pub schema_validated: bool,
+    pub ownership_validated: bool,
+    pub allowed_state_restored_count: usize,
+    pub new_ownership_epoch_established: bool,
+    pub canonical_snapshots_rebuilt: bool,
+    pub scheduler_activated: bool,
+    pub sampler_activated: bool,
+    pub provider_executed: bool,
+    pub stale_findings_replayed: bool,
+    pub llm_invoked: bool,
+    pub cross_process_sqlite_connection_shared: bool,
+    pub storage_path_exposed: bool,
+    pub degraded: bool,
+    pub degraded_reason: Option<String>,
+    pub redaction_status: RedactionStatus,
+}
+
+impl ServiceHostStorageRecoveryReport {
+    pub fn from_status(
+        status: &StorageOwnershipStatus,
+        manifest: &ServiceHostDurableStorageManifest,
+        ownership_epoch: u64,
+        schema_validated: bool,
+        degraded_reason: Option<String>,
+    ) -> Self {
+        let ownership_validated = status.owner_category == StorageWriterOwnerCategory::ServiceHost
+            && status.writer_state == StorageWriterState::Owned
+            && status.canonical_writer
+            && !status.path_exposed
+            && !status.llm_key_transferred
+            && manifest.validate().is_ok();
+        let degraded =
+            !ownership_validated || !schema_validated || degraded_reason.as_ref().is_some();
+        Self {
+            owner_category: status.owner_category,
+            writer_state: status.writer_state,
+            schema_validated,
+            ownership_validated,
+            allowed_state_restored_count: if ownership_validated && schema_validated {
+                manifest
+                    .durable_state
+                    .iter()
+                    .filter(|policy| policy.restored_on_restart)
+                    .count()
+            } else {
+                0
+            },
+            new_ownership_epoch_established: ownership_epoch > 0 && ownership_validated,
+            canonical_snapshots_rebuilt: ownership_epoch > 0
+                && ownership_validated
+                && schema_validated,
+            scheduler_activated: false,
+            sampler_activated: false,
+            provider_executed: false,
+            stale_findings_replayed: false,
+            llm_invoked: false,
+            cross_process_sqlite_connection_shared: false,
+            storage_path_exposed: false,
+            degraded,
+            degraded_reason,
+            redaction_status: RedactionStatus::Redacted,
+        }
+    }
+
+    pub fn degraded(reason: impl Into<String>) -> Self {
+        Self {
+            owner_category: StorageWriterOwnerCategory::ServiceHost,
+            writer_state: StorageWriterState::Conflict,
+            schema_validated: false,
+            ownership_validated: false,
+            allowed_state_restored_count: 0,
+            new_ownership_epoch_established: false,
+            canonical_snapshots_rebuilt: false,
+            scheduler_activated: false,
+            sampler_activated: false,
+            provider_executed: false,
+            stale_findings_replayed: false,
+            llm_invoked: false,
+            cross_process_sqlite_connection_shared: false,
+            storage_path_exposed: false,
+            degraded: true,
+            degraded_reason: Some(reason.into()),
+            redaction_status: RedactionStatus::Redacted,
+        }
+    }
+}
+
+pub fn service_host_durable_storage_manifest() -> ServiceHostDurableStorageManifest {
+    let durable_state = vec![
+        state_policy(
+            "runtime_session_state",
+            StoragePersistenceClassification::RequiredRuntimeState,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "scheduler_state",
+            StoragePersistenceClassification::BoundedConfiguration,
+            true,
+            true,
+            &[
+                "ids_refs",
+                "schema_versions",
+                "lifecycle_health",
+                "degraded_reasons",
+                "ownership_epoch_metadata",
+                "safe_scheduler_settings",
+            ],
+        ),
+        state_policy(
+            "sampler_state",
+            StoragePersistenceClassification::RequiredRuntimeState,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "permission_readiness_state",
+            StoragePersistenceClassification::BoundedConfiguration,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "baseline_state",
+            StoragePersistenceClassification::BoundedTraceability,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "incident_linked_state",
+            StoragePersistenceClassification::BoundedTraceability,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "canonical_read_model_snapshots",
+            StoragePersistenceClassification::BoundedTraceability,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "report_traceability",
+            StoragePersistenceClassification::BoundedTraceability,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "export_traceability_history_metadata",
+            StoragePersistenceClassification::BoundedTraceability,
+            true,
+            true,
+            SERVICEHOST_DURABLE_ALLOWED_FIELDS,
+        ),
+        state_policy(
+            "portable_reader_cursor_state",
+            StoragePersistenceClassification::RequiredRuntimeState,
+            true,
+            true,
+            &[
+                "ids_refs",
+                "categories",
+                "schema_versions",
+                "bounded_counters",
+                "lifecycle_health",
+                "degraded_reasons",
+                "provenance_audit_refs",
+                "redaction_status",
+                "ownership_epoch_metadata",
+                "opaque_cursor",
+            ],
+        ),
+    ];
+    let split_owned_state = vec![
+        split_policy("tauri_window_state", "desktop"),
+        split_policy("ui_preferences", "desktop"),
+        split_policy("export_destination_picker", "desktop"),
+        split_policy("connection_state", "desktop"),
+        split_policy("temporary_llm_key", "desktop_memory_only_write_only"),
+    ];
+    ServiceHostDurableStorageManifest {
+        owner_category: StorageWriterOwnerCategory::ServiceHost,
+        canonical_writer_required: true,
+        desktop_writer_allowed: false,
+        cross_process_sqlite_connection_allowed: false,
+        schema_version: SchemaVersion::new(1, 0, 0),
+        durable_state,
+        split_owned_state,
+        forbidden_markers_rejected: FORBIDDEN_DURABLE_STATE_MARKERS
+            .iter()
+            .map(|marker| marker.to_string())
+            .collect(),
+        redaction_status: RedactionStatus::Redacted,
+    }
+}
+
+pub fn service_host_storage_recovery_probe(
+    config: DatabaseConfig,
+    ownership_epoch: u64,
+) -> ServiceHostStorageRecoveryReport {
+    if config.writer_owner != StorageWriterOwnerCategory::ServiceHost {
+        return ServiceHostStorageRecoveryReport::degraded("service_host_writer_required");
+    }
+    let manifest = service_host_durable_storage_manifest();
+    match DatabaseRuntime::bootstrap(config) {
+        Ok(runtime) => {
+            let health = runtime.health_check();
+            let report = match health {
+                Ok(health) => ServiceHostStorageRecoveryReport::from_status(
+                    &runtime.storage_ownership_status(),
+                    &manifest,
+                    ownership_epoch,
+                    !health.degraded,
+                    if health.degraded {
+                        Some("schema_or_store_health_degraded".to_string())
+                    } else {
+                        None
+                    },
+                ),
+                Err(_) => ServiceHostStorageRecoveryReport::from_status(
+                    &runtime.storage_ownership_status(),
+                    &manifest,
+                    ownership_epoch,
+                    false,
+                    Some("schema_validation_failed".to_string()),
+                ),
+            };
+            drop(runtime);
+            report
+        }
+        Err(_) => ServiceHostStorageRecoveryReport::degraded("storage_open_or_migration_failed"),
+    }
+}
+
+fn state_policy(
+    state_name: &str,
+    classification: StoragePersistenceClassification,
+    restored_on_restart: bool,
+    servicehost_canonical: bool,
+    allowed_fields: &[&str],
+) -> ServiceHostDurableStatePolicy {
+    ServiceHostDurableStatePolicy {
+        state_name: state_name.to_string(),
+        owner_category: StorageWriterOwnerCategory::ServiceHost,
+        classification,
+        allowed_fields: allowed_fields
+            .iter()
+            .map(|field| field.to_string())
+            .collect(),
+        restored_on_restart,
+        servicehost_canonical,
+        redaction_status: RedactionStatus::Redacted,
+    }
+}
+
+fn split_policy(state_name: &str, owner_category: &str) -> SplitOwnedStatePolicy {
+    SplitOwnedStatePolicy {
+        state_name: state_name.to_string(),
+        owner_category: owner_category.to_string(),
+        classification: StoragePersistenceClassification::NotPersisted,
+        transferred_to_servicehost: false,
+        persisted_by_servicehost: false,
+        redaction_status: RedactionStatus::Redacted,
+    }
+}
+
+fn validate_durable_safe_text(field: &'static str, value: &str) -> StorageResult<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 96 {
+        return Err(StorageError::InvalidRecord {
+            store_kind: "servicehost_durable_storage_manifest".to_string(),
+            reason: format!("{field} is empty or unbounded"),
+        });
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    for marker in FORBIDDEN_DURABLE_STATE_MARKERS {
+        if normalized == *marker || normalized.contains(&format!("{marker}_raw")) {
+            return Err(StorageError::InvalidRecord {
+                store_kind: "servicehost_durable_storage_manifest".to_string(),
+                reason: format!("{field} contains forbidden durable marker"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_durable_marker_text(field: &'static str, value: &str) -> StorageResult<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 96 {
+        return Err(StorageError::InvalidRecord {
+            store_kind: "servicehost_durable_storage_manifest".to_string(),
+            reason: format!("{field} is empty or unbounded"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StorageWriterLeaseInner {
+    key: String,
+    lock_path: Option<PathBuf>,
+    status: StorageOwnershipStatus,
+    released: Mutex<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageWriterLease {
+    inner: Arc<StorageWriterLeaseInner>,
+}
+
+impl StorageWriterLease {
+    pub fn acquire_service_host_runtime(ownership_epoch: u64) -> StorageResult<Self> {
+        Self::acquire(
+            StorageWriterOwnerCategory::ServiceHost,
+            format!("service_host_runtime_epoch_{ownership_epoch}"),
+            None,
+            "service_owned_runtime_stores",
+            true,
+        )
+    }
+
+    pub fn acquire_for_database(config: &DatabaseConfig) -> StorageResult<Self> {
+        let (key, lock_path, scope) = match &config.location {
+            DatabaseLocation::InMemory => (
+                format!("in_memory_{}", Uuid::new_v4()),
+                None,
+                "in_memory_session_store".to_string(),
+            ),
+            DatabaseLocation::File(path) => {
+                let key = format!("file_{}", stable_checksum(&path.to_string_lossy()));
+                let lock_path = path
+                    .parent()
+                    .map(|parent| parent.join(STORAGE_WRITER_LOCK_FILE_NAME));
+                (key, lock_path, "sqlite_session_store".to_string())
+            }
+        };
+        Self::acquire(config.writer_owner, key, lock_path, scope, true)
+    }
+
+    pub fn acquire_for_test_scope(
+        owner_category: StorageWriterOwnerCategory,
+        scope: impl Into<String>,
+    ) -> StorageResult<Self> {
+        let scope = scope.into();
+        Self::acquire(
+            owner_category,
+            format!("test_scope_{scope}"),
+            None,
+            scope,
+            true,
+        )
+    }
+
+    fn acquire(
+        owner_category: StorageWriterOwnerCategory,
+        key: String,
+        lock_path: Option<PathBuf>,
+        storage_scope: impl Into<String>,
+        canonical_writer: bool,
+    ) -> StorageResult<Self> {
+        if let Some(path) = &lock_path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(mut file) => {
+                    file.write_all(
+                        format!(
+                            "sentinel_guard_storage_writer\nowner={}\n",
+                            owner_category.as_str()
+                        )
+                        .as_bytes(),
+                    )?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(StorageError::StorageOwnershipConflict(
+                        "writer_already_owned".to_string(),
+                    ));
+                }
+                Err(error) => return Err(StorageError::Io(error.to_string())),
+            }
+        }
+
+        let mut registry = storage_writer_registry().lock().map_err(|_| {
+            StorageError::StorageOwnershipConflict("writer_registry_unavailable".to_string())
+        })?;
+        if registry.contains_key(&key) {
+            if let Some(path) = &lock_path {
+                let _ = fs::remove_file(path);
+            }
+            return Err(StorageError::StorageOwnershipConflict(
+                "writer_already_owned".to_string(),
+            ));
+        }
+        registry.insert(key.clone(), owner_category);
+        drop(registry);
+
+        Ok(Self {
+            inner: Arc::new(StorageWriterLeaseInner {
+                key,
+                lock_path,
+                status: StorageOwnershipStatus {
+                    owner_category,
+                    writer_state: StorageWriterState::Owned,
+                    storage_scope: storage_scope.into(),
+                    canonical_writer,
+                    path_exposed: false,
+                    llm_key_transferred: false,
+                    degraded_reason: None,
+                },
+                released: Mutex::new(false),
+            }),
+        })
+    }
+
+    pub fn status(&self) -> StorageOwnershipStatus {
+        let released = self
+            .inner
+            .released
+            .lock()
+            .map(|released| *released)
+            .unwrap_or(true);
+        let mut status = self.inner.status.clone();
+        if released {
+            status.writer_state = StorageWriterState::Released;
+            status.canonical_writer = false;
+        }
+        status
+    }
+
+    pub fn release(&self) {
+        release_storage_writer(&self.inner);
+    }
+
+    #[cfg(test)]
+    pub fn reset_for_tests() {
+        if let Ok(mut registry) = storage_writer_registry().lock() {
+            registry.clear();
+        }
+    }
+}
+
+impl Drop for StorageWriterLeaseInner {
+    fn drop(&mut self) {
+        release_storage_writer_inner(&self.key, self.lock_path.as_ref(), &self.released);
+    }
+}
+
+fn storage_writer_registry() -> &'static Mutex<BTreeMap<String, StorageWriterOwnerCategory>> {
+    static STORAGE_WRITER_REGISTRY: OnceLock<Mutex<BTreeMap<String, StorageWriterOwnerCategory>>> =
+        OnceLock::new();
+    STORAGE_WRITER_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn release_storage_writer(inner: &StorageWriterLeaseInner) {
+    release_storage_writer_inner(&inner.key, inner.lock_path.as_ref(), &inner.released);
+}
+
+fn release_storage_writer_inner(key: &str, lock_path: Option<&PathBuf>, released: &Mutex<bool>) {
+    let Ok(mut released_guard) = released.lock() else {
+        return;
+    };
+    if *released_guard {
+        return;
+    }
+    *released_guard = true;
+    if let Ok(mut registry) = storage_writer_registry().lock() {
+        registry.remove(key);
+    }
+    if let Some(path) = lock_path {
+        let _ = fs::remove_file(path);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabasePragmas {
     pub journal_mode: String,
@@ -105,6 +807,7 @@ pub struct DatabaseConfig {
     pub app_version: String,
     pub pragmas: DatabasePragmas,
     pub session_config: Option<SessionConfig>,
+    pub writer_owner: StorageWriterOwnerCategory,
 }
 
 impl DatabaseConfig {
@@ -129,6 +832,7 @@ impl DatabaseConfig {
             app_version: app_version.into(),
             pragmas: DatabasePragmas::default(),
             session_config: None,
+            writer_owner: StorageWriterOwnerCategory::DesktopPortable,
         }
     }
 
@@ -139,6 +843,7 @@ impl DatabaseConfig {
             app_version: app_version.into(),
             pragmas: DatabasePragmas::default(),
             session_config: None,
+            writer_owner: StorageWriterOwnerCategory::TestHarness,
         }
     }
 
@@ -149,6 +854,7 @@ impl DatabaseConfig {
             app_version: app_version.into(),
             pragmas: DatabasePragmas::default(),
             session_config: None,
+            writer_owner: StorageWriterOwnerCategory::TestHarness,
         }
     }
 
@@ -174,11 +880,17 @@ impl DatabaseConfig {
             app_version: app_version.into(),
             pragmas: DatabasePragmas::default(),
             session_config: Some(session_config),
+            writer_owner: StorageWriterOwnerCategory::DesktopPortable,
         }
     }
 
     pub fn db_directory_redacted(&self) -> String {
         redacted_database_directory(&self.location)
+    }
+
+    pub fn with_writer_owner(mut self, writer_owner: StorageWriterOwnerCategory) -> Self {
+        self.writer_owner = writer_owner;
+        self
     }
 }
 
@@ -279,6 +991,7 @@ pub struct DatabaseBootstrapReport {
     pub demo_seeded: bool,
     pub privacy_service_initialized: bool,
     pub schema_privacy_checked: bool,
+    pub storage_ownership: StorageOwnershipStatus,
     pub degraded: bool,
 }
 
@@ -288,6 +1001,7 @@ pub struct DatabaseRuntime {
     report: DatabaseBootstrapReport,
     privacy_engine: PrivacyEngine,
     session_lifecycle: Option<SessionLifecycle>,
+    writer_lease: StorageWriterLease,
 }
 
 impl DatabaseRuntime {
@@ -306,6 +1020,7 @@ impl DatabaseRuntime {
         config: DatabaseConfig,
         session_lifecycle: Option<SessionLifecycle>,
     ) -> StorageResult<Self> {
+        let writer_lease = StorageWriterLease::acquire_for_database(&config)?;
         let mut connection = open_connection(&config)?;
         let pragmas = apply_connection_pragmas(&connection, &config.pragmas)?;
         let migrations = storage_migrations()?;
@@ -375,6 +1090,7 @@ impl DatabaseRuntime {
             demo_seeded,
             privacy_service_initialized: true,
             schema_privacy_checked: true,
+            storage_ownership: writer_lease.status(),
             degraded,
         };
 
@@ -383,6 +1099,7 @@ impl DatabaseRuntime {
             report,
             privacy_engine: PrivacyEngine::new(),
             session_lifecycle,
+            writer_lease,
         })
     }
 
@@ -428,6 +1145,14 @@ impl DatabaseRuntime {
                 degraded,
             })
         })
+    }
+
+    pub fn storage_ownership_status(&self) -> StorageOwnershipStatus {
+        self.writer_lease.status()
+    }
+
+    pub fn release_storage_writer(&self) {
+        self.writer_lease.release();
     }
 }
 
@@ -1253,9 +1978,13 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path();
         let first = DatabaseRuntime::bootstrap(DatabaseConfig::normal("0.1.0", path.clone()))?;
+        assert!(matches!(
+            first.report().storage_ownership.writer_state,
+            StorageWriterState::Owned
+        ));
+        drop(first);
         let second = DatabaseRuntime::bootstrap(DatabaseConfig::normal("0.1.0", path.clone()))?;
 
-        assert_eq!(first.report().migrations_applied, 1);
         assert!(second.report().migrations_skipped >= 1);
 
         let migration_count = second.handle().with_connection(|connection| {
@@ -1266,6 +1995,236 @@ mod tests {
                 .map_err(StorageError::from)
         })?;
         assert_eq!(migration_count, 1);
+
+        cleanup_temp_db(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_servicehost_acquires_writer_and_rejects_desktop_concurrent_writer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        StorageWriterLease::reset_for_tests();
+        let service = StorageWriterLease::acquire_for_test_scope(
+            StorageWriterOwnerCategory::ServiceHost,
+            "ownership_shared",
+        )?;
+        let status = service.status();
+
+        assert_eq!(
+            status.owner_category,
+            StorageWriterOwnerCategory::ServiceHost
+        );
+        assert_eq!(status.writer_state, StorageWriterState::Owned);
+        assert!(status.canonical_writer);
+        assert!(!status.path_exposed);
+        assert!(!status.llm_key_transferred);
+
+        let desktop = StorageWriterLease::acquire_for_test_scope(
+            StorageWriterOwnerCategory::DesktopPortable,
+            "ownership_shared",
+        );
+        assert!(matches!(
+            desktop,
+            Err(StorageError::StorageOwnershipConflict(_))
+        ));
+
+        let serialized = serde_json::to_string(&status)?;
+        for marker in ["c:\\", "sid", "token", "api_key", "password", "nonce"] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(marker),
+                "storage ownership status leaked marker {marker}"
+            );
+        }
+        service.release();
+        StorageWriterLease::reset_for_tests();
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_shutdown_releases_writer_and_allows_safe_reopen(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        StorageWriterLease::reset_for_tests();
+        let service = StorageWriterLease::acquire_for_test_scope(
+            StorageWriterOwnerCategory::ServiceHost,
+            "ownership_reopen",
+        )?;
+        service.release();
+        assert_eq!(service.status().writer_state, StorageWriterState::Released);
+
+        let reopened = StorageWriterLease::acquire_for_test_scope(
+            StorageWriterOwnerCategory::ServiceHost,
+            "ownership_reopen",
+        )?;
+        assert_eq!(reopened.status().writer_state, StorageWriterState::Owned);
+        drop(reopened);
+        StorageWriterLease::reset_for_tests();
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_database_runtime_rejects_concurrent_file_writer_and_reopens_after_drop(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let service = DatabaseRuntime::bootstrap(
+            DatabaseConfig::normal("0.1.0", path.clone())
+                .with_writer_owner(StorageWriterOwnerCategory::ServiceHost),
+        )?;
+        assert_eq!(
+            service.storage_ownership_status().owner_category,
+            StorageWriterOwnerCategory::ServiceHost
+        );
+
+        let desktop_attempt = DatabaseRuntime::bootstrap(
+            DatabaseConfig::normal("0.1.0", path.clone())
+                .with_writer_owner(StorageWriterOwnerCategory::DesktopPortable),
+        );
+        assert!(matches!(
+            desktop_attempt,
+            Err(StorageError::StorageOwnershipConflict(_))
+        ));
+
+        drop(service);
+        let reopened = DatabaseRuntime::bootstrap(
+            DatabaseConfig::normal("0.1.0", path.clone())
+                .with_writer_owner(StorageWriterOwnerCategory::ServiceHost),
+        )?;
+        assert_eq!(
+            reopened.storage_ownership_status().writer_state,
+            StorageWriterState::Owned
+        );
+        drop(reopened);
+        cleanup_temp_db(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_servicehost_durable_manifest_declares_policy_approved_state_only(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = service_host_durable_storage_manifest();
+
+        manifest.validate()?;
+        assert_eq!(
+            manifest.owner_category,
+            StorageWriterOwnerCategory::ServiceHost
+        );
+        assert!(manifest.canonical_writer_required);
+        assert!(!manifest.desktop_writer_allowed);
+        assert!(!manifest.cross_process_sqlite_connection_allowed);
+        for required in [
+            "runtime_session_state",
+            "scheduler_state",
+            "sampler_state",
+            "permission_readiness_state",
+            "baseline_state",
+            "incident_linked_state",
+            "canonical_read_model_snapshots",
+            "report_traceability",
+            "export_traceability_history_metadata",
+            "portable_reader_cursor_state",
+        ] {
+            let policy = manifest.policy(required).expect("required policy");
+            assert_eq!(
+                policy.owner_category,
+                StorageWriterOwnerCategory::ServiceHost
+            );
+            assert_ne!(
+                policy.classification,
+                StoragePersistenceClassification::Forbidden
+            );
+            assert!(policy.servicehost_canonical);
+            assert_eq!(policy.redaction_status, RedactionStatus::Redacted);
+        }
+        assert!(manifest.split_owned_state.iter().any(|policy| {
+            policy.state_name == "temporary_llm_key"
+                && policy.owner_category == "desktop_memory_only_write_only"
+                && !policy.transferred_to_servicehost
+                && !policy.persisted_by_servicehost
+        }));
+        let serialized = serde_json::to_string(&manifest)?;
+        for forbidden in [
+            "c:\\",
+            "session_token",
+            "api_key_value",
+            "raw_payload_column",
+            "caller_token_value",
+            "process_name_value",
+        ] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(forbidden),
+                "manifest leaked forbidden marker {forbidden}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_servicehost_restart_validates_writer_schema_and_rebuilds_snapshots(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        {
+            let first = DatabaseRuntime::bootstrap(
+                DatabaseConfig::normal("0.1.0", path.clone())
+                    .with_writer_owner(StorageWriterOwnerCategory::ServiceHost),
+            )?;
+            assert_eq!(
+                first.storage_ownership_status().owner_category,
+                StorageWriterOwnerCategory::ServiceHost
+            );
+        }
+
+        let report = service_host_storage_recovery_probe(
+            DatabaseConfig::normal("0.1.0", path.clone())
+                .with_writer_owner(StorageWriterOwnerCategory::ServiceHost),
+            42,
+        );
+
+        assert!(!report.degraded);
+        assert!(report.schema_validated);
+        assert!(report.ownership_validated);
+        assert!(report.new_ownership_epoch_established);
+        assert!(report.canonical_snapshots_rebuilt);
+        assert!(report.allowed_state_restored_count >= 10);
+        assert!(!report.scheduler_activated);
+        assert!(!report.sampler_activated);
+        assert!(!report.provider_executed);
+        assert!(!report.stale_findings_replayed);
+        assert!(!report.llm_invoked);
+        assert!(!report.cross_process_sqlite_connection_shared);
+        assert!(!report.storage_path_exposed);
+
+        cleanup_temp_db(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_corrupted_storage_degrades_without_path_or_secret_exposure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, b"not a sqlite database")?;
+
+        let report = service_host_storage_recovery_probe(
+            DatabaseConfig::normal("0.1.0", path.clone())
+                .with_writer_owner(StorageWriterOwnerCategory::ServiceHost),
+            43,
+        );
+
+        assert!(report.degraded);
+        assert!(!report.schema_validated);
+        assert!(!report.ownership_validated);
+        assert!(!report.storage_path_exposed);
+        assert!(!report.llm_invoked);
+        assert!(!report.provider_executed);
+        let serialized = serde_json::to_string(&report)?;
+        assert!(!serialized.contains(path.to_string_lossy().as_ref()));
+        for forbidden in ["c:\\", "api_key", "password", "session_token", "nonce"] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(forbidden),
+                "recovery report leaked forbidden marker {forbidden}"
+            );
+        }
 
         cleanup_temp_db(&path);
         Ok(())
@@ -1340,6 +2299,7 @@ mod tests {
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
         if let Some(parent) = path.parent() {
+            let _ = fs::remove_file(parent.join(STORAGE_WRITER_LOCK_FILE_NAME));
             let _ = fs::remove_dir(parent);
             if let Some(root) = parent.parent() {
                 let _ = fs::remove_dir(root);

@@ -1,4 +1,5 @@
 use crate::read_commands::ReadOnlyCommandState;
+use crate::runtime_container::RuntimeEventBusHandle;
 use sentinel_contracts::{
     AuthorizedNativeCapabilityCategory, AuthorizedNativeCapabilityStatus, CommandResult, CoreError,
     ErrorCode, ErrorSeverity, EventEnvelope, EventType, NativeAuthorizationMode,
@@ -11,7 +12,7 @@ use sentinel_contracts::{
     Timestamp, TraceContext, MAX_NATIVE_AUDIT_REFS,
 };
 use sentinel_platform::{
-    EventBus, PublishOptions, TopicName, AUDIT_NATIVE_PERMISSION, NATIVE_CAPABILITY_STATUS,
+    PublishOptions, TopicName, AUDIT_NATIVE_PERMISSION, NATIVE_CAPABILITY_STATUS,
     NATIVE_PERMISSION_STATUS, NATIVE_VISIBILITY_STATUS, SECURITY_VISIBILITY_DEGRADED,
 };
 use serde_json::json;
@@ -24,12 +25,20 @@ pub struct AuthorizedNativePermissionRuntime {
     capabilities: Vec<AuthorizedNativeCapabilityStatus>,
     audit_entries: Vec<NativePermissionAuditEntry>,
     status_events: Vec<NativeStatusEvent>,
-    event_bus: EventBus,
+    event_bus: RuntimeEventBusHandle,
     producer_plugin: PluginId,
 }
 
 impl AuthorizedNativePermissionRuntime {
+    #[cfg(test)]
     pub fn from_read_state(read: &ReadOnlyCommandState) -> Self {
+        Self::from_read_state_with_event_bus(read, RuntimeEventBusHandle::new_legacy_core_topics())
+    }
+
+    pub(crate) fn from_read_state_with_event_bus(
+        read: &ReadOnlyCommandState,
+        event_bus: RuntimeEventBusHandle,
+    ) -> Self {
         let capabilities = if read.authorized_native_capabilities.is_empty() {
             default_capability_catalog()
         } else {
@@ -39,7 +48,7 @@ impl AuthorizedNativePermissionRuntime {
             capabilities,
             audit_entries: read.native_permission_audit_entries.clone(),
             status_events: read.native_status_events.clone(),
-            event_bus: EventBus::with_core_topics(),
+            event_bus,
             producer_plugin: PluginId::new_v4(),
         }
     }

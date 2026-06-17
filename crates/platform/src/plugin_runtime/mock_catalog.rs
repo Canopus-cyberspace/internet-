@@ -809,6 +809,73 @@ fn mock_plugin_specs() -> Vec<MockPluginSpec> {
             checkpoint_support: SupportLevel::Optional,
         },
         MockPluginSpec {
+            plugin_key: "c2_detection",
+            plugin_id: "00000000-0000-0000-0000-00000000019d",
+            plugin_name: "C2 Detection Mock",
+            description: "Metadata-only C2 detection catalog entry for bounded flow, session, DNS, TLS, process, and local intelligence runtime wiring.",
+            replacement_task: "400_c2_detection_mvp_static_runtime_binding",
+            capability_domain: "platform_detection",
+            plugin_type: PluginType::Detection,
+            runtime_mode: RuntimeMode::Streaming,
+            input_contracts: &[
+                "network.flow.record",
+                "network.session.record",
+                "network.dns.observation",
+                "network.tls.observation",
+                "identity.process_context",
+                "intel.domain_context",
+                "intel.ip_context",
+                "intel.cloud_context",
+                "intel.certificate_context",
+            ],
+            output_contracts: &[
+                "security.finding",
+                "security.evidence",
+                "security.risk_hint",
+                "graph.hint",
+            ],
+            required_plugin_dependencies: &[
+                "flow_sessionization",
+                "dns_security_v2",
+                "process_context",
+                "domain_reputation",
+                "infrastructure_intelligence",
+                "evidence_management",
+            ],
+            permissions: vec![
+                scoped_data_permission(
+                    "read.network.metadata",
+                    &[
+                        "network.flow.record",
+                        "network.session.record",
+                        "network.dns.observation",
+                        "network.tls.observation",
+                    ],
+                ),
+                scoped_data_permission(
+                    "read.identity.process_context",
+                    &["identity.process_context"],
+                ),
+                scoped_data_permission(
+                    "read.intelligence.local_context",
+                    &[
+                        "intel.domain_context",
+                        "intel.ip_context",
+                        "intel.cloud_context",
+                        "intel.certificate_context",
+                    ],
+                ),
+                scoped_data_permission("write.security.finding", &["security.finding"]),
+                scoped_data_permission("write.security.evidence", &["security.evidence"]),
+                scoped_data_permission("write.security.risk_hint", &["security.risk_hint"]),
+                scoped_data_permission("write.graph_hint", &["graph.hint"]),
+            ],
+            finding_types: &["security.finding.c2"],
+            graph_hint_types: &["suspicious_c2_relation"],
+            statefulness: PluginStatefulness::Baseline,
+            checkpoint_support: SupportLevel::Optional,
+        },
+        MockPluginSpec {
             plugin_key: "exfiltration_detection",
             plugin_id: "00000000-0000-0000-0000-00000000019b",
             plugin_name: "Exfiltration Detection Mock",
@@ -1359,7 +1426,13 @@ fn mock_plugin_specs() -> Vec<MockPluginSpec> {
             capability_domain: "platform_detection",
             plugin_type: PluginType::Detection,
             runtime_mode: RuntimeMode::Streaming,
-            input_contracts: &["network.flow.record", "network.session.record"],
+            input_contracts: &[
+                "network.flow.record",
+                "network.session.record",
+                "identity.auth_metadata",
+                "identity.smb_operational_metadata",
+                "identity.ssh_operational_metadata",
+            ],
             output_contracts: &[
                 "security.finding",
                 "security.evidence",
@@ -1371,6 +1444,14 @@ fn mock_plugin_specs() -> Vec<MockPluginSpec> {
                 scoped_data_permission(
                     "read.network.metadata",
                     &["network.flow.record", "network.session.record"],
+                ),
+                scoped_data_permission(
+                    "read.identity.metadata",
+                    &[
+                        "identity.auth_metadata",
+                        "identity.smb_operational_metadata",
+                        "identity.ssh_operational_metadata",
+                    ],
                 ),
                 scoped_data_permission("write.security.finding", &["security.finding"]),
                 scoped_data_permission("write.security.evidence", &["security.evidence"]),
@@ -1570,6 +1651,7 @@ fn mock_plugin_specs() -> Vec<MockPluginSpec> {
                 "identity.auth_metadata",
                 "cloud.saas_metadata",
                 "deception.event_metadata",
+                "network.sdn_control_plane.metadata",
                 "security.finding",
             ],
             output_contracts: &[
@@ -1600,6 +1682,7 @@ fn mock_plugin_specs() -> Vec<MockPluginSpec> {
                         "identity.auth_metadata",
                         "cloud.saas_metadata",
                         "deception.event_metadata",
+                        "network.sdn_control_plane.metadata",
                         "security.finding",
                     ],
                 ),
@@ -1667,6 +1750,111 @@ fn mock_plugin_specs() -> Vec<MockPluginSpec> {
             ],
             finding_types: &[],
             graph_hint_types: &["native_sampler_batch_context_fact"],
+            statefulness: PluginStatefulness::MemoryState,
+            checkpoint_support: SupportLevel::Optional,
+        },
+        MockPluginSpec {
+            plugin_key: "native_network_fact",
+            plugin_id: "00000000-0000-0000-0000-0000000001b0",
+            plugin_name: "Native Network Fact Runtime",
+            description: "ServiceHost-owned metadata-only native network fact runtime for bounded IP Helper and ETW category visibility.",
+            replacement_task: "explicit_native_network_servicehost_handoff",
+            capability_domain: "platform_detection",
+            plugin_type: PluginType::Transform,
+            runtime_mode: RuntimeMode::Streaming,
+            input_contracts: &["native.ip_helper.metadata", "native.etw_network.metadata"],
+            output_contracts: &["native.connection.category_fact"],
+            required_plugin_dependencies: &["multi_layer_security_fusion"],
+            permissions: vec![
+                scoped_data_permission(
+                    "read.native.network_metadata",
+                    &["native.ip_helper.metadata", "native.etw_network.metadata"],
+                ),
+                scoped_data_permission(
+                    "write.native.connection.category_fact",
+                    &["native.connection.category_fact"],
+                ),
+            ],
+            finding_types: &[],
+            graph_hint_types: &["native_connection_category_fact"],
+            statefulness: PluginStatefulness::MemoryState,
+            checkpoint_support: SupportLevel::Optional,
+        },
+        MockPluginSpec {
+            plugin_key: "endpoint_threat_analysis_lite",
+            plugin_id: "00000000-0000-0000-0000-0000000001af",
+            plugin_name: "Endpoint Threat Analysis Lite Mock",
+            description: "Metadata-only endpoint threat analysis catalog entry for validated category facts, portable evidence, baseline context, risk hints, ATT&CK context, graph refs, and advisory outputs.",
+            replacement_task: "endpoint_threat_analysis_lite_runtime_wiring",
+            capability_domain: "platform_detection",
+            plugin_type: PluginType::PlatformDetection,
+            runtime_mode: RuntimeMode::Streaming,
+            input_contracts: &[
+                "endpoint.native_health.category_fact",
+                "endpoint.service.category_fact",
+                "endpoint.process.category_fact",
+                "endpoint.process_parent.category_fact",
+                "security.finding",
+                "security.risk_hint",
+                "security.hypothesis",
+                "security.fusion.summary",
+            ],
+            output_contracts: &[
+                "endpoint.threat.candidate",
+                "endpoint.threat.finding",
+                "endpoint.threat.evidence",
+                "endpoint.threat.risk_hint",
+                "endpoint.visibility.advisory",
+                "endpoint.threat.rejected",
+                "graph.hint",
+                "audit.endpoint_threat_analysis",
+            ],
+            required_plugin_dependencies: &["native_sampler_fact", "multi_layer_security_fusion"],
+            permissions: vec![
+                scoped_data_permission(
+                    "read.endpoint.threat_context",
+                    &[
+                        "endpoint.native_health.category_fact",
+                        "endpoint.service.category_fact",
+                        "endpoint.process.category_fact",
+                        "endpoint.process_parent.category_fact",
+                        "security.finding",
+                        "security.risk_hint",
+                        "security.hypothesis",
+                        "security.fusion.summary",
+                    ],
+                ),
+                scoped_data_permission(
+                    "write.endpoint.threat_analysis",
+                    &[
+                        "endpoint.threat.candidate",
+                        "endpoint.threat.finding",
+                        "endpoint.threat.evidence",
+                        "endpoint.threat.risk_hint",
+                        "endpoint.visibility.advisory",
+                        "endpoint.threat.rejected",
+                        "audit.endpoint_threat_analysis",
+                    ],
+                ),
+                scoped_data_permission("write.graph_hint", &["graph.hint"]),
+            ],
+            finding_types: &[
+                "endpoint.possible_category_population_change",
+                "endpoint.possible_parent_category_transition",
+                "endpoint.possible_auth_pressure_context",
+                "endpoint.possible_service_change_context",
+                "endpoint.possible_saas_cloud_context",
+                "endpoint.possible_deception_context",
+            ],
+            graph_hint_types: &[
+                "endpoint_finding_to_process_category_fact",
+                "endpoint_finding_to_parent_relation_fact",
+                "endpoint_finding_to_service_category_fact",
+                "endpoint_finding_to_evidence",
+                "endpoint_finding_to_hypothesis",
+                "endpoint_finding_to_risk",
+                "endpoint_finding_to_attack_candidate",
+            ],
             statefulness: PluginStatefulness::MemoryState,
             checkpoint_support: SupportLevel::Optional,
         },
@@ -1770,6 +1958,7 @@ fn mock_plugin_id(plugin_key: &str) -> PluginId {
         "tls_fingerprint" => "00000000-0000-0000-0000-000000000195",
         "process_context" => "00000000-0000-0000-0000-000000000196",
         "asset_exposure" => "00000000-0000-0000-0000-00000000019a",
+        "c2_detection" => "00000000-0000-0000-0000-00000000019d",
         "exfiltration_detection" => "00000000-0000-0000-0000-00000000019b",
         "lateral_movement_lite" => "00000000-0000-0000-0000-00000000019c",
         "domain_reputation" => "00000000-0000-0000-0000-000000000197",
@@ -1789,6 +1978,9 @@ fn mock_plugin_id(plugin_key: &str) -> PluginId {
         "saas_cloud_abuse_lite" => "00000000-0000-0000-0000-0000000001ab",
         "deception_event_lite" => "00000000-0000-0000-0000-0000000001ac",
         "multi_layer_security_fusion" => "00000000-0000-0000-0000-0000000001ad",
+        "native_sampler_fact" => "00000000-0000-0000-0000-0000000001ae",
+        "native_network_fact" => "00000000-0000-0000-0000-0000000001b0",
+        "endpoint_threat_analysis_lite" => "00000000-0000-0000-0000-0000000001af",
         _ => panic!("unknown built-in mock plugin key: {plugin_key}"),
     };
 
@@ -1811,6 +2003,8 @@ fn plugin_name_for_key(plugin_key: &str, flavor: CatalogFlavor) -> &'static str 
         "process_context" => "Process Context",
         "asset_exposure" if flavor.is_mock_only() => "Asset Exposure Mock",
         "asset_exposure" => "Asset Exposure",
+        "c2_detection" if flavor.is_mock_only() => "C2 Detection Mock",
+        "c2_detection" => "C2 Detection",
         "exfiltration_detection" if flavor.is_mock_only() => "Exfiltration Detection Mock",
         "exfiltration_detection" => "Exfiltration Detection",
         "lateral_movement_lite" if flavor.is_mock_only() => "Lateral Movement Lite Mock",
@@ -1858,6 +2052,11 @@ fn plugin_name_for_key(plugin_key: &str, flavor: CatalogFlavor) -> &'static str 
         }
         "multi_layer_security_fusion" => "Multi-Layer Security Fusion",
         "native_sampler_fact" => "Native Sampler Fact Runtime",
+        "native_network_fact" => "Native Network Fact Runtime",
+        "endpoint_threat_analysis_lite" if flavor.is_mock_only() => {
+            "Endpoint Threat Analysis Lite Mock"
+        }
+        "endpoint_threat_analysis_lite" => "Endpoint Threat Analysis Lite",
         _ => "Unknown Mock Plugin",
     }
 }
@@ -2025,7 +2224,7 @@ mod tests {
             .map(|plugin| plugin.manifest().plugin_name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(catalog.plugins().len(), 27);
+        assert_eq!(catalog.plugins().len(), 30);
         assert!(names.contains(&"Packet Capture Mock"));
         assert!(names.contains(&"Asset Exposure Mock"));
         assert!(names.contains(&"DNS Security V2 Mock"));
@@ -2039,6 +2238,9 @@ mod tests {
         assert!(names.contains(&"Deception Event Lite Mock"));
         assert!(names.contains(&"Multi-Layer Security Fusion Mock"));
         assert!(names.contains(&"Native Sampler Fact Runtime"));
+        assert!(names.contains(&"Native Network Fact Runtime"));
+        assert!(names.contains(&"Endpoint Threat Analysis Lite Mock"));
+        assert!(names.contains(&"C2 Detection Mock"));
         assert!(names.contains(&"Exfiltration Detection Mock"));
         assert!(names.contains(&"Lateral Movement Lite Mock"));
         assert!(names.contains(&"Risk Based Alerting Mock"));
@@ -2079,7 +2281,7 @@ mod tests {
             .map(|plugin| plugin.manifest().plugin_name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(catalog.plugins().len(), 27);
+        assert_eq!(catalog.plugins().len(), 30);
         assert!(!catalog.mock_only_catalog());
         assert!(!catalog.production_ready());
         assert!(names.contains(&"Packet Capture Adapter"));
@@ -2095,6 +2297,9 @@ mod tests {
         assert!(names.contains(&"Deception Event Lite"));
         assert!(names.contains(&"Multi-Layer Security Fusion"));
         assert!(names.contains(&"Native Sampler Fact Runtime"));
+        assert!(names.contains(&"Native Network Fact Runtime"));
+        assert!(names.contains(&"Endpoint Threat Analysis Lite"));
+        assert!(names.contains(&"C2 Detection"));
         assert!(names.contains(&"Exfiltration Detection"));
         assert!(names.contains(&"Lateral Movement Lite"));
         assert!(names.contains(&"Risk Based Alerting"));
@@ -2254,6 +2459,88 @@ mod tests {
     }
 
     #[test]
+    fn static_internal_endpoint_threat_analysis_declares_bounded_runtime_contracts_and_starts() {
+        let catalog = BuiltInPluginCatalog::static_internal().expect("catalog");
+        let manifest = catalog
+            .manifests()
+            .into_iter()
+            .find(|manifest| manifest.plugin_name == "Endpoint Threat Analysis Lite")
+            .expect("endpoint threat manifest");
+
+        let input_contracts = manifest
+            .input_contracts
+            .iter()
+            .map(|contract| contract.contract_name.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "endpoint.process.category_fact",
+            "endpoint.process_parent.category_fact",
+            "endpoint.service.category_fact",
+            "security.finding",
+            "security.hypothesis",
+            "security.fusion.summary",
+        ] {
+            assert!(
+                input_contracts.contains(&required),
+                "missing endpoint input contract {required}"
+            );
+        }
+
+        let output_contracts = manifest
+            .output_contracts
+            .iter()
+            .map(|contract| contract.contract_name.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "endpoint.threat.candidate",
+            "endpoint.threat.finding",
+            "endpoint.threat.evidence",
+            "endpoint.threat.risk_hint",
+            "endpoint.visibility.advisory",
+            "endpoint.threat.rejected",
+            "audit.endpoint_threat_analysis",
+        ] {
+            assert!(
+                output_contracts.contains(&required),
+                "missing endpoint output contract {required}"
+            );
+        }
+
+        assert!(!manifest.required_permissions.iter().any(|permission| {
+            permission.permission.as_str().contains("raw")
+                || permission.permission.as_str().contains("process_identity")
+                || permission.permission.as_str().contains("response")
+                || permission.permission.as_str().contains("credential")
+        }));
+
+        let endpoint_plugin_id = manifest.plugin_id.clone();
+        let mut runtime = PluginRuntime::new();
+        catalog
+            .register_with_runtime(&mut runtime)
+            .expect("register static catalog");
+
+        let mut contracts = ContractRegistry::new();
+        for contract in catalog.contract_descriptors() {
+            contracts.register(contract).expect("register contract");
+        }
+
+        let mut permissions = PermissionResolver::new();
+        for manifest in catalog.manifests() {
+            permissions.register_plugin_manifest_permissions(manifest);
+        }
+
+        let validation = runtime
+            .registry()
+            .validate_startup(&endpoint_plugin_id, &contracts, &permissions)
+            .expect("startup validation");
+        assert!(
+            validation.allowed,
+            "endpoint threat startup should be allowed: {:?}",
+            validation.issues
+        );
+    }
+
+    #[test]
     fn static_internal_asset_exposure_declares_metadata_only_runtime_contracts_and_starts() {
         let catalog = BuiltInPluginCatalog::static_internal().expect("catalog");
         let manifest = catalog
@@ -2332,6 +2619,112 @@ mod tests {
         assert!(
             validation.allowed,
             "asset exposure startup should be allowed: {:?}",
+            validation.issues
+        );
+    }
+
+    #[test]
+    fn static_internal_c2_detection_declares_metadata_only_runtime_contracts_and_starts() {
+        let catalog = BuiltInPluginCatalog::static_internal().expect("catalog");
+        let manifest = catalog
+            .manifests()
+            .into_iter()
+            .find(|manifest| manifest.plugin_name == "C2 Detection")
+            .expect("c2 detection manifest");
+
+        let input_contracts = manifest
+            .input_contracts
+            .iter()
+            .map(|contract| contract.contract_name.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "network.flow.record",
+            "network.session.record",
+            "network.dns.observation",
+            "network.tls.observation",
+            "identity.process_context",
+            "intel.domain_context",
+            "intel.ip_context",
+            "intel.cloud_context",
+            "intel.certificate_context",
+        ] {
+            assert!(
+                input_contracts.contains(&required),
+                "missing c2 input contract {required}"
+            );
+        }
+
+        let output_contracts = manifest
+            .output_contracts
+            .iter()
+            .map(|contract| contract.contract_name.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "security.finding",
+            "security.evidence",
+            "security.risk_hint",
+            "graph.hint",
+        ] {
+            assert!(
+                output_contracts.contains(&required),
+                "missing c2 output contract {required}"
+            );
+        }
+        for forbidden in [
+            "security.risk",
+            "security.alert",
+            "security.incident",
+            "graph.update",
+            "graph.path",
+            "response.plan",
+            "response.result",
+            "report.generated",
+            "report.exported",
+        ] {
+            assert!(
+                !output_contracts.contains(&forbidden),
+                "c2 detection must not declare forbidden output {forbidden}"
+            );
+        }
+        assert_eq!(
+            manifest.finding_types,
+            vec!["security.finding.c2".to_string()]
+        );
+        assert_eq!(
+            manifest.graph_hint_types,
+            vec!["suspicious_c2_relation".to_string()]
+        );
+        assert!(manifest.required_permissions.iter().all(|permission| {
+            let permission = permission.permission.as_str();
+            !permission.contains("execute")
+                && !permission.contains("firewall")
+                && !permission.contains("qos")
+                && !permission.contains("process_control")
+        }));
+
+        let c2_plugin_id = manifest.plugin_id.clone();
+        let mut runtime = PluginRuntime::new();
+        catalog
+            .register_with_runtime(&mut runtime)
+            .expect("register static catalog");
+
+        let mut contracts = ContractRegistry::new();
+        for contract in catalog.contract_descriptors() {
+            contracts.register(contract).expect("register contract");
+        }
+
+        let mut permissions = PermissionResolver::new();
+        for manifest in catalog.manifests() {
+            permissions.register_plugin_manifest_permissions(manifest);
+        }
+
+        let validation = runtime
+            .registry()
+            .validate_startup(&c2_plugin_id, &contracts, &permissions)
+            .expect("startup validation");
+        assert!(
+            validation.allowed,
+            "c2 detection startup should be allowed: {:?}",
             validation.issues
         );
     }

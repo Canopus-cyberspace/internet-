@@ -306,6 +306,7 @@ pub enum NativeSamplerRuntimeAction {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeProviderCategory {
+    WindowsSystemHealthSnapshot,
     WindowsServiceControlManager,
     WindowsToolhelpProcessSnapshot,
     UnsupportedPlatform,
@@ -341,6 +342,34 @@ pub enum NativeRuntimeHealthState {
     Revoked,
     Failed,
     Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeResourcePressureBucket {
+    Low,
+    Moderate,
+    High,
+    Critical,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeHostUptimeBucket {
+    LessThanOneHour,
+    OneToTwentyFourHours,
+    OneToSevenDays,
+    MoreThanSevenDays,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSampleFreshnessBucket {
+    Current,
+    Stale,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -970,6 +999,22 @@ impl NativeSamplerActivationPreview {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSamplerCounterSummary {
+    pub provider_enabled_count: u32,
+    pub raw_record_count: u32,
+    pub schema_accepted_count: u32,
+    pub schema_rejected_count: u32,
+    pub rate_limited_count: u32,
+    pub queue_dropped_count: u32,
+    pub normalized_record_count: u32,
+    pub published_batch_count: u32,
+    pub eventbus_publication_count: u32,
+    pub dag_dispatch_count: u32,
+    pub plugin_runtime_invocation_count: u32,
+    pub observations_consumed_count: u32,
+    pub facts_emitted_count: u32,
+    pub detector_consumer_invocation_count: u32,
+    pub detector_observations_consumed_count: u32,
+    pub detector_output_count: u32,
     pub sampled_record_count: u32,
     pub sampled_record_count_bucket: String,
     pub skipped_record_count: u32,
@@ -987,6 +1032,22 @@ pub struct NativeSamplerCounterSummary {
 impl NativeSamplerCounterSummary {
     pub fn empty() -> Self {
         Self {
+            provider_enabled_count: 0,
+            raw_record_count: 0,
+            schema_accepted_count: 0,
+            schema_rejected_count: 0,
+            rate_limited_count: 0,
+            queue_dropped_count: 0,
+            normalized_record_count: 0,
+            published_batch_count: 0,
+            eventbus_publication_count: 0,
+            dag_dispatch_count: 0,
+            plugin_runtime_invocation_count: 0,
+            observations_consumed_count: 0,
+            facts_emitted_count: 0,
+            detector_consumer_invocation_count: 0,
+            detector_observations_consumed_count: 0,
+            detector_output_count: 0,
             sampled_record_count: 0,
             sampled_record_count_bucket: "none".to_string(),
             skipped_record_count: 0,
@@ -1129,6 +1190,9 @@ pub struct NativeHealthMetadataRecord {
     pub authorization_state: NativePermissionState,
     pub runtime_state: NativeSamplerRuntimeState,
     pub health_state: NativeRuntimeHealthState,
+    pub resource_pressure_bucket: NativeResourcePressureBucket,
+    pub uptime_bucket: NativeHostUptimeBucket,
+    pub freshness_bucket: NativeSampleFreshnessBucket,
     pub degraded_reason: Option<String>,
     pub missing_prerequisite_flags: Vec<String>,
     pub sample_duration_bucket: String,

@@ -5,8 +5,9 @@ use sentinel_contracts::{
     IntelligenceRecordId, LayeredSamplerDeclaration, MappingProvenance, PluginId,
     PortableAuthMetadata, PortableCaptureInputSourceType, PortableCaptureProvenance,
     PortableDeceptionEventMetadata, PortableProviderCategory, PortableSaasCloudMetadata,
-    PrivacyClass, QualityBreakdown, QualityScore, RiskHint, RiskReason, SamplerState, SamplingMode,
-    SecurityFact, SecurityLayer, SecuritySeverity, Timestamp, MAX_FUSION_ITEMS, MAX_FUSION_REFS,
+    PortableSdnControlPlaneEventCategory, PortableSdnControlPlaneMetadata, PrivacyClass,
+    QualityBreakdown, QualityScore, RiskHint, RiskReason, SamplerState, SamplingMode, SecurityFact,
+    SecurityLayer, SecuritySeverity, Timestamp, MAX_FUSION_ITEMS, MAX_FUSION_REFS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -25,6 +26,7 @@ pub struct MultiLayerFusionInput<'a> {
     pub auth_metadata: &'a [PortableAuthMetadata],
     pub saas_cloud_metadata: &'a [PortableSaasCloudMetadata],
     pub deception_events: &'a [PortableDeceptionEventMetadata],
+    pub sdn_control_plane_metadata: &'a [PortableSdnControlPlaneMetadata],
     pub findings: &'a [Finding],
 }
 
@@ -214,6 +216,13 @@ pub fn layered_sampler_catalog() -> Result<Vec<LayeredSamplerDeclaration>, Multi
             "imported_deception_metadata",
             &["deception_interaction", "protocol_category"][..],
             &["deception.event_metadata"][..],
+        ),
+        (
+            "sdn_control_plane_metadata_sampler",
+            SecurityLayer::SdnControlPlane,
+            "imported_sdn_control_plane_metadata",
+            &["control_plane_change", "policy_route_scope"][..],
+            &["network.sdn_control_plane.metadata"][..],
         ),
         (
             "localhost_metadata_proxy_sampler",
@@ -454,6 +463,39 @@ fn normalize_security_facts(
         fact.provenance_id = Some(event.provenance_id.clone());
         fact.redaction_status = event.redaction_status.clone();
         fact.confidence_hint = event.quality_score.clone();
+        fact.validate()?;
+        facts.push(fact);
+    }
+    for sdn in input.sdn_control_plane_metadata {
+        let mut fact = SecurityFact::new(
+            SecurityLayer::SdnControlPlane,
+            sdn_fact_category(&sdn.event_category),
+            "sdn_control_plane_metadata_sampler",
+            sdn.time_bucket_start.clone(),
+        )?;
+        fact.provider_service_category = Some(sdn_controller_label(&sdn.controller_category));
+        fact.status_category = Some(format!("{:?}", sdn.status_bucket).to_ascii_lowercase());
+        fact.relation_category = sdn
+            .route_change_category
+            .clone()
+            .or_else(|| sdn.topology_change_category.clone())
+            .or_else(|| sdn.policy_action_category.clone());
+        fact.execution_context_category = sdn.affected_asset_category.clone();
+        fact.trust_category = sdn.exposure_category.clone();
+        fact.lifecycle_bucket = Some(format!("{:?}", sdn.impact_scope_bucket).to_ascii_lowercase());
+        fact.count_bucket = sdn.count_bucket.clone();
+        fact.evidence_refs = sdn.evidence_refs.clone();
+        fact.provenance_id = Some(sdn.provenance_id.clone());
+        fact.redaction_status = sdn.redaction_status.clone();
+        fact.missing_visibility_flags = bounded_unique(
+            sdn.missing_visibility_flags
+                .iter()
+                .cloned()
+                .chain(["no_live_controller_api_visibility".to_string()])
+                .collect(),
+        );
+        fact.degraded_reason = Some("metadata_only_sdn_control_plane_import".to_string());
+        fact.confidence_hint = sdn.quality_score.clone();
         fact.validate()?;
         facts.push(fact);
     }
@@ -818,6 +860,22 @@ fn provider_label(provider: &PortableProviderCategory) -> String {
     format!("{provider:?}").to_ascii_lowercase()
 }
 
+fn sdn_fact_category(event_category: &PortableSdnControlPlaneEventCategory) -> &'static str {
+    match event_category {
+        PortableSdnControlPlaneEventCategory::TopologyChange => "topology_change_observed",
+        PortableSdnControlPlaneEventCategory::RouteChange => "route_change_observed",
+        PortableSdnControlPlaneEventCategory::PolicyChange => "policy_change_observed",
+        PortableSdnControlPlaneEventCategory::AclChange => "acl_change_observed",
+        PortableSdnControlPlaneEventCategory::ControllerHealth => "controller_health_observed",
+        PortableSdnControlPlaneEventCategory::FlowRuleChange => "flow_rule_change_observed",
+        PortableSdnControlPlaneEventCategory::Unknown => "control_plane_change_observed",
+    }
+}
+
+fn sdn_controller_label(controller: &sentinel_contracts::PortableSdnControllerCategory) -> String {
+    format!("{controller:?}").to_ascii_lowercase()
+}
+
 fn layer_label(layer: &SecurityLayer) -> String {
     format!("{layer:?}").to_ascii_lowercase()
 }
@@ -950,7 +1008,7 @@ mod tests {
     #[test]
     fn sampler_catalog_declares_portable_and_placeholder_boundaries() {
         let samplers = layered_sampler_catalog().expect("samplers");
-        assert_eq!(samplers.len(), 11);
+        assert_eq!(samplers.len(), 12);
         assert!(samplers.iter().any(|sampler| {
             sampler.layer == SecurityLayer::SdnPlaceholder
                 && !sampler.portable_default_available
@@ -984,6 +1042,7 @@ mod tests {
                     auth_metadata: &[],
                     saas_cloud_metadata: &[],
                     deception_events: &[],
+                    sdn_control_plane_metadata: &[],
                     findings: &[finding],
                 },
             )
@@ -1022,6 +1081,7 @@ mod tests {
                     auth_metadata: &[auth],
                     saas_cloud_metadata: &[],
                     deception_events: &[],
+                    sdn_control_plane_metadata: &[],
                     findings: &[],
                 },
             )

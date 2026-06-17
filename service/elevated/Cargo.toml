@@ -1,5 +1,5 @@
 [package]
-name = "sentinel-guard-elevated"
+name = "sentinel-service-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,12 @@ path = "src/lib.rs"
 name = "sentinel-guard-elevated"
 path = "src/main.rs"
 
+[[bin]]
+name = "sentinel-guard-service-host"
+path = "src/service_host_main.rs"
+
 [dependencies]
+sentinel-app-core = { path = "../../crates/app_core" }
 sentinel-contracts = { path = "../../crates/contracts" }
 sentinel-platform = { path = "../../crates/platform" }
 serde.workspace = true
@@ -24,7 +29,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_Threading",
 ] }

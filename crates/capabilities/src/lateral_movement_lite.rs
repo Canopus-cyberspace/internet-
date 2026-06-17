@@ -413,7 +413,7 @@ impl InternalFanoutDetector {
             )?
             .with_flows(&flows)
             .with_entities(entities_for_flow(representative, context, None)?);
-            signal.target = Some(LateralTarget::Ip(representative.dst_ip));
+            signal.target = Some(LateralTarget::UnknownInternal);
             signals.push(signal);
         }
         Ok(signals)
@@ -453,29 +453,17 @@ impl ServiceProbeDetector {
                 continue;
             }
             let service = service_name_for_port(flow.dst_port);
+            let target = LateralTarget::Service(service.to_string());
             let mut signal = LateralMovementSignal::new(
                 LateralSignalKind::ServiceProbe,
-                format!(
-                    "service_probe:{}:{}:{}",
-                    flow.flow_id, flow.dst_ip, flow.dst_port
-                ),
+                format!("service_probe:{}:{}", flow.flow_id, normalize(service)),
                 format!("{service} service probe visible from flow metadata only."),
                 0.58,
                 0.52,
             )?
             .with_flow(flow)
-            .with_entities(entities_for_flow(
-                flow,
-                context,
-                Some(&LateralTarget::Port {
-                    ip: flow.dst_ip,
-                    port: flow.dst_port,
-                }),
-            )?);
-            signal.target = Some(LateralTarget::Port {
-                ip: flow.dst_ip,
-                port: flow.dst_port,
-            });
+            .with_entities(entities_for_flow(flow, context, Some(&target))?);
+            signal.target = Some(target);
             signals.push(signal);
         }
         Ok(signals)
@@ -518,6 +506,7 @@ impl UnknownProcessInternalAccessDetector {
             if !unknown_process {
                 continue;
             }
+            let target = LateralTarget::Service(service_name_for_port(flow.dst_port).to_string());
             let mut signal = LateralMovementSignal::new(
                 LateralSignalKind::UnknownProcessInternalAccess,
                 format!("unknown_process_access:{}", flow.flow_id),
@@ -526,18 +515,8 @@ impl UnknownProcessInternalAccessDetector {
                 0.46,
             )?
             .with_flow(flow)
-            .with_entities(entities_for_flow(
-                flow,
-                context,
-                Some(&LateralTarget::Port {
-                    ip: flow.dst_ip,
-                    port: flow.dst_port,
-                }),
-            )?);
-            signal.target = Some(LateralTarget::Port {
-                ip: flow.dst_ip,
-                port: flow.dst_port,
-            });
+            .with_entities(entities_for_flow(flow, context, Some(&target))?);
+            signal.target = Some(target);
             signals.push(signal);
         }
         Ok(signals)
@@ -595,10 +574,9 @@ impl ExposureLinkedMovementDetector {
                     findings.as_slice(),
                     context,
                 )?);
-                signal.target = Some(LateralTarget::Port {
-                    ip: flow.dst_ip,
-                    port: flow.dst_port,
-                });
+                signal.target = Some(LateralTarget::Service(
+                    service_name_for_port(flow.dst_port).to_string(),
+                ));
                 signal.related_port_exposure_refs = vec![exposure.port_exposure_record_id.clone()];
                 signal.related_asset_finding_refs = findings
                     .iter()
@@ -997,13 +975,16 @@ fn entities_for_exposure(
             port: flow.dst_port,
         }),
     )?;
-    entities.push(exposure.port_entity.clone());
+    entities.push(redacted_port_entity(
+        &exposure.port_entity,
+        exposure.local_port,
+    ));
     if let Some(process_entity) = &exposure.process_entity {
         entities.push(process_entity.clone());
     }
     for finding in findings {
         for entity in finding.finding.entity_refs() {
-            entities.push(entity.clone());
+            entities.push(redacted_lateral_entity(entity));
         }
     }
     Ok(entities)
@@ -1044,8 +1025,8 @@ fn unknown_process_entity() -> Result<EntityRef, LateralMovementError> {
 
 fn ip_entity(ip: &IpAddress) -> Result<EntityRef, LateralMovementError> {
     let mut entity = EntityRef::new(EntityId::new_v4(), EntityType::Ip);
-    entity.entity_name = Some(ip.to_string());
-    entity.namespace = Some("network.ip".to_string());
+    entity.entity_name = Some(internal_ip_bucket(ip).to_string());
+    entity.namespace = Some("network.internal_ip_bucket".to_string());
     entity.source = Some("lateral_movement_lite".to_string());
     entity.confidence = quality_score(0.7)?;
     Ok(entity)
@@ -1053,8 +1034,8 @@ fn ip_entity(ip: &IpAddress) -> Result<EntityRef, LateralMovementError> {
 
 fn port_entity(ip: &IpAddress, port: u16) -> Result<EntityRef, LateralMovementError> {
     let mut entity = EntityRef::new(EntityId::new_v4(), EntityType::Port);
-    entity.entity_name = Some(format!("{}:{port}", ip));
-    entity.namespace = Some("network.internal_port".to_string());
+    entity.entity_name = Some(internal_port_bucket(ip, port).to_string());
+    entity.namespace = Some("network.internal_port_bucket".to_string());
     entity.source = Some("lateral_movement_lite".to_string());
     entity.confidence = quality_score(0.68)?;
     Ok(entity)
@@ -1076,6 +1057,71 @@ fn unknown_internal_entity() -> Result<EntityRef, LateralMovementError> {
     entity.source = Some("lateral_movement_lite".to_string());
     entity.confidence = quality_score(0.35)?;
     Ok(entity)
+}
+
+fn redacted_port_entity(entity: &EntityRef, port: u16) -> EntityRef {
+    let mut redacted = entity.clone();
+    redacted.entity_name = Some(internal_port_bucket_name(port).to_string());
+    redacted.namespace = Some("network.internal_port_bucket".to_string());
+    redacted.source = Some("lateral_movement_lite".to_string());
+    redacted
+}
+
+fn redacted_lateral_entity(entity: &EntityRef) -> EntityRef {
+    let mut redacted = entity.clone();
+    match redacted.entity_type {
+        EntityType::Ip => {
+            redacted.entity_name = Some("internal_ip_ref".to_string());
+            redacted.namespace = Some("network.internal_ip_bucket".to_string());
+        }
+        EntityType::Port => {
+            redacted.entity_name = Some("internal_service_port_bucket".to_string());
+            redacted.namespace = Some("network.internal_port_bucket".to_string());
+        }
+        _ => {}
+    }
+    redacted
+}
+
+fn internal_ip_bucket(ip: &IpAddress) -> &'static str {
+    match ip.as_ip_addr() {
+        IpAddr::V4(value) => {
+            let octets = value.octets();
+            if octets[0] == 10 {
+                "internal_ipv4_rfc1918_10"
+            } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                "internal_ipv4_rfc1918_172"
+            } else if octets[0] == 192 && octets[1] == 168 {
+                "internal_ipv4_rfc1918_192"
+            } else if octets[0] == 169 && octets[1] == 254 {
+                "internal_ipv4_link_local"
+            } else {
+                "internal_ip_ref"
+            }
+        }
+        IpAddr::V6(value) if value.is_unique_local() => "internal_ipv6_unique_local",
+        IpAddr::V6(value) if value.is_unicast_link_local() => "internal_ipv6_link_local",
+        IpAddr::V6(_) => "internal_ip_ref",
+    }
+}
+
+fn internal_port_bucket(ip: &IpAddress, port: u16) -> String {
+    format!(
+        "{}:{}",
+        internal_ip_bucket(ip),
+        internal_port_bucket_name(port)
+    )
+}
+
+fn internal_port_bucket_name(port: u16) -> &'static str {
+    match port {
+        22 => "service_ssh",
+        135 => "service_rpc",
+        139 | 445 => "service_smb",
+        3389 => "service_rdp",
+        5985 | 5986 => "service_winrm",
+        _ => "service_internal",
+    }
 }
 
 fn entity_refs_for_finding(signals: &[LateralMovementSignal]) -> Vec<EntityRef> {

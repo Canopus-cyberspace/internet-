@@ -65,6 +65,8 @@ import type {
   NativeSchedulerActionRequestDto,
   NativeSchedulerActionResultDto,
   NativeSchedulerEnablementPreviewDto,
+  NativeSchedulerHostActionResultDto,
+  NativeSchedulerHostStartPreviewDto,
   SaveLlmAlertStoryApiKeyRequestDto,
   SettingsMutationResultDto,
   TestLlmAlertStoryConnectionRequestDto,
@@ -370,6 +372,42 @@ export function applyNativeSchedulerAction(request: NativeSchedulerActionRequest
   return invokeCore<NativeSchedulerActionResultDto>("apply_native_scheduler_action", {
     request,
   });
+}
+
+export function previewNativeSchedulerHostStart() {
+  return invokeCore<NativeSchedulerHostStartPreviewDto>(
+    "preview_native_scheduler_host_start",
+  );
+}
+
+export function startNativeSchedulerHost() {
+  return invokeCore<NativeSchedulerHostActionResultDto>(
+    "start_native_scheduler_host",
+  );
+}
+
+export function pauseNativeSchedulerHost() {
+  return invokeCore<NativeSchedulerHostActionResultDto>(
+    "pause_native_scheduler_host",
+  );
+}
+
+export function resumeNativeSchedulerHost() {
+  return invokeCore<NativeSchedulerHostActionResultDto>(
+    "resume_native_scheduler_host",
+  );
+}
+
+export function wakeNativeSchedulerHost() {
+  return invokeCore<NativeSchedulerHostActionResultDto>(
+    "wake_native_scheduler_host",
+  );
+}
+
+export function stopNativeSchedulerHost() {
+  return invokeCore<NativeSchedulerHostActionResultDto>(
+    "stop_native_scheduler_host",
+  );
 }
 
 export function runDemoStory() {

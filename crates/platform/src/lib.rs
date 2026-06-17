@@ -11,6 +11,9 @@ pub mod plugin_runtime;
 pub mod registry;
 pub mod resolver;
 
+#[cfg(test)]
+mod runtime_architecture_tests;
+
 pub use component::*;
 pub use event_bus::*;
 pub use observability::{

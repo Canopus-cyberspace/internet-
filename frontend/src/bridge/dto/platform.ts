@@ -65,8 +65,28 @@ export interface ServiceStatusViewDto {
   privileged_actions_available: boolean;
   capture_available: boolean;
   machine_local_capability_status?: CapabilityStatusSummaryDto | null;
+  mutation_authorization_status?: MutationAuthorizationStatusDto | null;
   message_redacted: string;
   generated_at: Timestamp;
+}
+
+export interface MutationAuthorizationStatusDto {
+  schema_version: JsonValue;
+  framework_state: string;
+  policy_catalog_version: JsonValue;
+  supported_command_count: number;
+  dry_run_only: boolean;
+  production_execution_enabled: boolean;
+  last_decision_category?: string | null;
+  denied_count_bucket: string;
+  expired_count_bucket: string;
+  replay_count_bucket: string;
+  caller_trust_ready: boolean;
+  ownership_runtime_ready: boolean;
+  degraded_reasons: string[];
+  audit_refs: string[];
+  provenance_id: string;
+  redaction_status: string;
 }
 
 export type CapabilityStatusDto =

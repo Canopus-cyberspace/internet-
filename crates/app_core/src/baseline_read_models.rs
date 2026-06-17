@@ -1541,11 +1541,13 @@ fn layer_label(layer: &SecurityLayer) -> &'static str {
         SecurityLayer::SaasCloud => "saas_cloud",
         SecurityLayer::Deception => "deception",
         SecurityLayer::LocalMetadataProxy => "local_metadata_proxy",
+        SecurityLayer::SdnControlPlane => "sdn_control_plane",
         SecurityLayer::SdnPlaceholder => "sdn_placeholder",
         SecurityLayer::AuthorizedNativeHostPlaceholder => "authorized_native_host_placeholder",
         SecurityLayer::AuthorizedNativeHealth => "authorized_native_health",
         SecurityLayer::AuthorizedNativeService => "authorized_native_service",
         SecurityLayer::AuthorizedNativeProcess => "authorized_native_process",
+        SecurityLayer::AuthorizedNativeNetwork => "authorized_native_network",
     }
 }
 

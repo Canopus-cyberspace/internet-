@@ -32,13 +32,46 @@ describe("Network workspace", () => {
     expect(markup).toContain("Import Network Metadata");
     expect(markup).toContain("Local metadata proxy");
     expect(markup).toContain("AutoSecOps watch");
+    expect(markup).toContain("Provider status");
+    expect(markup).toContain("Native network providers are inactive.");
+    expect(markup).toContain("Portable metadata analysis remains available.");
+    expect(markup).toContain("IP Helper adapter supports explicit bounded execution.");
+    expect(markup).toContain(
+      "ETW read models expose bounded lifecycle health, counters, handoff refs, and fallback visibility.",
+    );
+    expect(markup).toContain("ETW product surface");
+    expect(markup).toContain("Npcap enhancement is deferred.");
+    expect(markup).toContain("Packet capture is unavailable.");
+    expect(markup).toContain(
+      "Enabled IP Helper commands: Activate, Sample once, Stop, Configure schedule, Enable schedule, Pause schedule, Resume schedule, Disable schedule.",
+    );
+    expect(markup).toContain("IP Helper sampling is explicit and bounded.");
+    expect(markup).toContain("No packet capture is performed.");
+    expect(markup).toContain("No process-to-network attribution is provided.");
+    expect(markup).toContain(
+      "IP Helper schedule control is session-bound; timer sampling remains explicit and bounded.",
+    );
+    expect(markup).toContain(
+      "No ETW provider is automatically activated by reads, reports, exports, or UI refresh.",
+    );
+    expect(markup).toContain(
+      "ETW starts only after explicit authorization. Automatic scheduling, packet visibility, process-network attribution, exact process identity, and response execution remain unavailable.",
+    );
+    expect(markup).toContain("Activate");
+    expect(markup).toContain("Sample once");
+    expect(markup).toContain("Stop");
+    expect(markup).toContain("Configure schedule");
+    expect(markup).toContain("Enable schedule");
+    expect(markup).toContain("Pause schedule");
+    expect(markup).toContain("Resume schedule");
+    expect(markup).toContain("Disable schedule");
     expect(markup).toContain("Drop one .har or .jsonl file");
     expect(markup).toContain("127.0.0.1:&lt;port&gt;");
     expect(markup).toContain("Detail");
     expect(markup).toContain("Loading redacted network metadata.");
     expect(markup).not.toContain(mockOnlyMarker());
     expect(markup).not.toContain("powershell.exe");
-    expect(markup).not.toContain("packet capture");
+    expect(markup).not.toContain("packet bytes");
   });
 
   it("redacts sensitive flow table display strings", () => {

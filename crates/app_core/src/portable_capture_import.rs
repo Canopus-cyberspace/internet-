@@ -1,8 +1,8 @@
 use crate::read_commands::ReadOnlyCommandState;
+use crate::runtime_container::RuntimeServices;
 use sentinel_capabilities::{
     preview_portable_capture_import as capability_preview_portable_capture_import,
-    run_portable_capture_lite_with_service_contexts, PortableCaptureLiteError,
-    PortableCaptureLitePreparedBatch, PortableCaptureLiteRunResult,
+    PortableCaptureLiteError, PortableCaptureLitePreparedBatch, PortableCaptureLiteRunResult,
 };
 use sentinel_contracts::{
     CommandResult, CoreError, DataSourceId, ErrorCode, ErrorSeverity, IncidentId,
@@ -58,6 +58,7 @@ pub struct PortableCaptureImportResult {
     pub saas_cloud_summary: Option<PortableSaasCloudSummary>,
     pub deception_event_count: usize,
     pub deception_summary: Option<PortableDeceptionSummary>,
+    pub sdn_control_plane_metadata_count: usize,
     pub security_fact_count: usize,
     pub attack_hypothesis_count: usize,
     pub finding_count: usize,
@@ -88,11 +89,22 @@ pub fn prepare_portable_capture_import(
     })
 }
 
+#[cfg(test)]
 pub fn ingest_portable_capture_import(
     state: &mut ReadOnlyCommandState,
     prepared: &PreparedPortableCaptureImport,
 ) -> CommandResult<PortableCaptureImportResult> {
-    let run_result = execute_portable_capture_import(prepared).map_err(portable_capture_error)?;
+    let runtime = RuntimeServices::for_test("portable-import").map_err(portable_capture_error)?;
+    ingest_portable_capture_import_with_runtime(state, prepared, &runtime)
+}
+
+pub(crate) fn ingest_portable_capture_import_with_runtime(
+    state: &mut ReadOnlyCommandState,
+    prepared: &PreparedPortableCaptureImport,
+    runtime: &RuntimeServices,
+) -> CommandResult<PortableCaptureImportResult> {
+    let run_result = execute_portable_capture_import_with_runtime(prepared, runtime)
+        .map_err(portable_capture_error)?;
     apply_portable_capture_run(state, &run_result);
     Ok(PortableCaptureImportResult {
         preview_id: prepared.preview.preview_id.clone(),
@@ -109,6 +121,7 @@ pub fn ingest_portable_capture_import(
         saas_cloud_summary: run_result.saas_cloud_summary.clone(),
         deception_event_count: run_result.deception_events.len(),
         deception_summary: run_result.deception_summary.clone(),
+        sdn_control_plane_metadata_count: run_result.sdn_control_plane_metadata.len(),
         security_fact_count: run_result.security_facts.len(),
         attack_hypothesis_count: run_result.attack_hypotheses.len(),
         finding_count: run_result.findings.len(),
@@ -156,14 +169,21 @@ pub fn apply_portable_capture_run(
         .push(run_result.provenance.clone());
 }
 
+fn execute_portable_capture_import_with_runtime(
+    prepared: &PreparedPortableCaptureImport,
+    runtime: &RuntimeServices,
+) -> Result<PortableCaptureLiteRunResult, PortableCaptureLiteError> {
+    let runtime_service_contexts = safe_service_capability_contexts_for_import();
+    runtime.run_portable_capture(&prepared.prepared_batch, &runtime_service_contexts)
+}
+
+#[cfg(test)]
 fn execute_portable_capture_import(
     prepared: &PreparedPortableCaptureImport,
 ) -> Result<PortableCaptureLiteRunResult, PortableCaptureLiteError> {
-    let runtime_service_contexts = safe_service_capability_contexts_for_import();
-    run_portable_capture_lite_with_service_contexts(
-        &prepared.prepared_batch,
-        &runtime_service_contexts,
-    )
+    let runtime = RuntimeServices::for_test("portable-import-execute")
+        .map_err(|error| PortableCaptureLiteError::Runtime(error.to_string()))?;
+    execute_portable_capture_import_with_runtime(prepared, &runtime)
 }
 
 fn safe_service_capability_contexts_for_import() -> Vec<ServiceCapabilityContext> {

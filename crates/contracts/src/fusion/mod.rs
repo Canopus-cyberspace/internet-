@@ -45,11 +45,13 @@ pub enum SecurityLayer {
     SaasCloud,
     Deception,
     LocalMetadataProxy,
+    SdnControlPlane,
     SdnPlaceholder,
     AuthorizedNativeHostPlaceholder,
     AuthorizedNativeHealth,
     AuthorizedNativeService,
     AuthorizedNativeProcess,
+    AuthorizedNativeNetwork,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -22,11 +22,16 @@ pub mod capture;
 pub mod ipc;
 pub mod runtime_ipc;
 pub mod security;
+pub mod service_host;
 pub use attribution::*;
 pub use capture::*;
 pub use ipc::*;
 pub use runtime_ipc::*;
 pub use security::*;
+pub use service_host::*;
+
+#[cfg(test)]
+pub(crate) static SERVICE_HOST_RUNTIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const STUB_ONLY_LABEL: &str = "STUB_ONLY";
 pub const NOT_FOR_PRODUCTION_LABEL: &str = "NOT_FOR_PRODUCTION";

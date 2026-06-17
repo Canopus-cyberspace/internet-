@@ -23,6 +23,7 @@ pub enum StorageError {
         expected: String,
         actual: String,
     },
+    StorageOwnershipConflict(String),
     UnsupportedQuery(String),
 }
 
@@ -54,6 +55,9 @@ impl fmt::Display for StorageError {
                     f,
                     "store snapshot kind mismatch: expected {expected}, got {actual}"
                 )
+            }
+            Self::StorageOwnershipConflict(message) => {
+                write!(f, "storage ownership conflict: {message}")
             }
             Self::UnsupportedQuery(message) => write!(f, "unsupported store query: {message}"),
         }

@@ -88,6 +88,7 @@ impl PortableDnsSecurityV2Plugin {
                 .response_code
                 .as_deref()
                 .is_some_and(|code| code.eq_ignore_ascii_case("NXDOMAIN"))
+                && !observation.client_ip.as_ip_addr().is_unspecified()
             {
                 nxdomain_by_client
                     .entry(observation.client_ip.to_string())
@@ -97,12 +98,16 @@ impl PortableDnsSecurityV2Plugin {
 
             let domain_entity =
                 domain_entity(&observation.query_name_protected, &observation.timestamp)?;
-            let client_entity = ip_entity(
-                "portable.dns.client",
-                observation.client_ip,
-                &observation.timestamp,
-                EntityType::Ip,
-            )?;
+            let client_entity = if observation.client_ip.as_ip_addr().is_unspecified() {
+                None
+            } else {
+                Some(ip_entity(
+                    "portable.dns.client",
+                    observation.client_ip,
+                    &observation.timestamp,
+                    EntityType::Ip,
+                )?)
+            };
 
             if observation.features.character_entropy.unwrap_or_default() >= 3.9
                 && observation.features.query_length >= 20
@@ -113,7 +118,7 @@ impl PortableDnsSecurityV2Plugin {
                     "portable.dns_security_v2.high_entropy_labels",
                     "DNS metadata shows a long high-entropy query pattern.",
                     domain_entity.clone(),
-                    Some(client_entity.clone()),
+                    client_entity.clone(),
                     SecuritySeverity::Medium,
                     0.31,
                     0.73,
@@ -129,7 +134,7 @@ impl PortableDnsSecurityV2Plugin {
                     "portable.dns_security_v2.excessive_subdomain_depth",
                     "DNS metadata shows excessive subdomain depth.",
                     domain_entity.clone(),
-                    Some(client_entity.clone()),
+                    client_entity.clone(),
                     SecuritySeverity::Medium,
                     0.24,
                     0.7,
@@ -152,7 +157,7 @@ impl PortableDnsSecurityV2Plugin {
                     "portable.dns_security_v2.sparse_answer_suspicious_domain",
                     "DNS metadata has sparse answers for a suspicious domain pattern.",
                     domain_entity,
-                    Some(client_entity),
+                    client_entity,
                     SecuritySeverity::Medium,
                     0.22,
                     0.68,

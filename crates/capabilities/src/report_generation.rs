@@ -6,11 +6,11 @@ use sentinel_contracts::{
     GraphSnapshot, GraphSnapshotId, Incident, IncidentId, InvestigationDrillDownSummary,
     LlmAlertStoryId, LlmAlertStoryRecord, MetadataSamplingBatchSummary,
     MetadataWatchControllerStatus, NativePermissionStatusSummary, NativeSamplerReadinessSummary,
-    NativeSamplerRuntimeSummary, NativeSchedulerOperationalSummary, NativeVisibilitySummary,
-    PrivacyClass, QualityBreakdown, RedactedDataCategory, RedactionStatus, RedactionSummary,
-    Report, ReportContractError, ReportExportPolicy, ReportId, ReportSection, ReportSectionType,
-    ReportStatus, ReportType, ResponsePlan, ResponsePlanId, ResponseResult, ResponseResultId,
-    RollbackResult, RollbackResultId, SecuritySeverity, TimeRange, Timestamp,
+    NativeSamplerRuntimeSummary, NativeSchedulerHostStatus, NativeSchedulerOperationalSummary,
+    NativeVisibilitySummary, PrivacyClass, QualityBreakdown, RedactedDataCategory, RedactionStatus,
+    RedactionSummary, Report, ReportContractError, ReportExportPolicy, ReportId, ReportSection,
+    ReportSectionType, ReportStatus, ReportType, ResponsePlan, ResponsePlanId, ResponseResult,
+    ResponseResultId, RollbackResult, RollbackResultId, SecuritySeverity, TimeRange, Timestamp,
     DEFAULT_GRAPH_VIEW_EDGE_LIMIT, DEFAULT_GRAPH_VIEW_NODE_LIMIT, MAX_EXPORT_GRAPH_EVIDENCE_REFS,
 };
 use sentinel_storage::privacy_service::{
@@ -126,6 +126,7 @@ pub struct IncidentReportInput {
     pub native_sampler_readiness: Option<NativeSamplerReadinessSummary>,
     pub native_sampler_runtime: Option<NativeSamplerRuntimeSummary>,
     pub native_scheduler_operational: Option<NativeSchedulerOperationalSummary>,
+    pub native_scheduler_host: Option<NativeSchedulerHostStatus>,
     pub llm_alert_stories: Vec<LlmAlertStoryRecord>,
     pub response_plans: Vec<ResponsePlan>,
     pub response_results: Vec<ResponseResult>,
@@ -152,6 +153,7 @@ impl IncidentReportInput {
             native_sampler_readiness: None,
             native_sampler_runtime: None,
             native_scheduler_operational: None,
+            native_scheduler_host: None,
             llm_alert_stories: Vec::new(),
             response_plans: Vec::new(),
             response_results: Vec::new(),
@@ -838,6 +840,13 @@ impl IncidentReportGenerator {
                 ))
             })?;
         }
+        if let Some(native_scheduler_host) = &input.native_scheduler_host {
+            native_scheduler_host.validate().map_err(|error| {
+                ReportGenerationError::Serialization(format!(
+                    "native scheduler host summary failed safety validation: {error}"
+                ))
+            })?;
+        }
 
         let redaction = self.redaction_pipeline.default_summary();
         let mut report = Report::new(
@@ -1255,7 +1264,10 @@ impl IncidentReportGenerator {
             let mut section = self.section(
                 ReportSectionType::NativeScheduler,
                 "Native scheduler operational traceability",
-                native_scheduler_operational_content(scheduler),
+                native_scheduler_operational_content(
+                    scheduler,
+                    input.native_scheduler_host.as_ref(),
+                ),
                 &redaction,
                 SectionTraceRefs::empty(),
             )?;
@@ -1914,7 +1926,10 @@ fn native_sampler_runtime_content(runtime: &NativeSamplerRuntimeSummary) -> Valu
     })
 }
 
-fn native_scheduler_operational_content(scheduler: &NativeSchedulerOperationalSummary) -> Value {
+fn native_scheduler_operational_content(
+    scheduler: &NativeSchedulerOperationalSummary,
+    host: Option<&NativeSchedulerHostStatus>,
+) -> Value {
     let safe_schedule_rows = scheduler
         .safe_persisted_schedules
         .iter()
@@ -1976,6 +1991,61 @@ fn native_scheduler_operational_content(scheduler: &NativeSchedulerOperationalSu
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let host_orchestration = host
+        .map(|host| {
+            json!({
+                "orchestrator_ref": host.orchestrator_id,
+                "controller_ref": host.controller_id,
+                "lifecycle_state": host.lifecycle_state,
+                "health_state": host.health_state,
+                "wake_state": host.wake_state,
+                "latest_wake_reason": host.latest_wake_reason,
+                "enabled_sampler_count_bucket": host.enabled_sampler_count_bucket,
+                "eligible_sampler_count_bucket": host.eligible_sampler_count_bucket,
+                "next_wake_bucket": host.next_wake_bucket,
+                "last_tick_ref": host.last_tick_ref,
+                "latest_cycle_ref": host.latest_cycle_ref,
+                "successful_wake_count_bucket": host.successful_wake_count_bucket,
+                "no_op_wake_count_bucket": host.no_op_wake_count_bucket,
+                "degraded_wake_count_bucket": host.degraded_wake_count_bucket,
+                "cancelled_wake_count_bucket": host.cancelled_wake_count_bucket,
+                "manual_cycle_count_bucket": host.manual_cycle_count_bucket,
+                "autonomous_cycle_count_bucket": host.autonomous_cycle_count_bucket,
+                "watchdog_state": host.watchdog_state,
+                "shutdown_state": host.shutdown_state,
+                "timer_task_active": host.timer_task_active,
+                "task_ownership_state": host.task_ownership_state,
+                "current_wait_state": host.current_wait_state,
+                "pending_wake": host.pending_wake,
+                "cancellation_state": host.cancellation_state,
+                "join_state": host.join_state,
+                "join_timeout_category": host.join_timeout_category,
+                "shutdown_cleanup_status": host.shutdown_cleanup_status,
+                "audit_refs": host.audit_refs,
+                "session_bound": true,
+                "startup_auto_run": host.startup_auto_started,
+                "os_service": host.os_service_started,
+                "report_export_side_effects": false,
+                "provider_refresh_on_report": false,
+                "scheduler_wake_on_report": false,
+                "response_execution": host.response_execution_started,
+                "automatic_llm_calls": host.automatic_llm_calls,
+                "bounded_refs_only": true,
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "available": false,
+                "session_bound": true,
+                "startup_auto_run": false,
+                "os_service": false,
+                "report_export_side_effects": false,
+                "scheduler_wake_on_report": false,
+                "automatic_llm_calls": false,
+                "response_execution": false,
+                "bounded_refs_only": true,
+            })
+        });
     json!({
         "scheduler_health": scheduler.scheduler_health,
         "controller_state": scheduler.status.controller_state,
@@ -1999,6 +2069,7 @@ fn native_scheduler_operational_content(scheduler: &NativeSchedulerOperationalSu
         "safe_schedule_rows": safe_schedule_rows,
         "freshness_dimension_rows": freshness_dimension_rows,
         "missed_sample_dimension_rows": missed_sample_dimension_rows,
+        "host_orchestration": host_orchestration,
         "safe_persistence_only": scheduler.safe_persistence_only,
         "raw_native_data_persisted": scheduler.raw_native_data_persisted,
         "runtime_subject_persisted": scheduler.runtime_subject_persisted,
@@ -3078,6 +3149,7 @@ mod tests {
             native_sampler_readiness: None,
             native_sampler_runtime: None,
             native_scheduler_operational: None,
+            native_scheduler_host: None,
             llm_alert_stories: Vec::new(),
             response_plans: vec![plan],
             response_results: vec![response_result],

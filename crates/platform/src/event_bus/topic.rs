@@ -11,6 +11,9 @@ pub const NETWORK_DNS_OBSERVATION: &str = "network.dns.observation";
 pub const NETWORK_TLS_OBSERVATION: &str = "network.tls.observation";
 pub const NETWORK_HTTP_METADATA: &str = "network.http.metadata";
 pub const IDENTITY_AUTH_METADATA: &str = "identity.auth_metadata";
+pub const IDENTITY_RDP_OPERATIONAL_METADATA: &str = "identity.rdp_operational_metadata";
+pub const IDENTITY_SMB_OPERATIONAL_METADATA: &str = "identity.smb_operational_metadata";
+pub const IDENTITY_SSH_OPERATIONAL_METADATA: &str = "identity.ssh_operational_metadata";
 pub const CLOUD_SAAS_METADATA: &str = "cloud.saas_metadata";
 pub const DECEPTION_EVENT_METADATA: &str = "deception.event_metadata";
 pub const IDENTITY_PROCESS_CONTEXT: &str = "identity.process_context";
@@ -37,6 +40,23 @@ pub const NATIVE_SCHEDULER_HOST_PAUSED: &str = "native.scheduler.host_paused";
 pub const NATIVE_SCHEDULER_HOST_RESUMED: &str = "native.scheduler.host_resumed";
 pub const NATIVE_SCHEDULER_HOST_STOPPED: &str = "native.scheduler.host_stopped";
 pub const NATIVE_SCHEDULER_HOST_FAILED: &str = "native.scheduler.host_failed";
+pub const NATIVE_SCHEDULER_HOST_TASK_STARTED: &str = "native.scheduler.host_task_started";
+pub const NATIVE_SCHEDULER_HOST_TASK_WAKE: &str = "native.scheduler.host_task_wake";
+pub const NATIVE_SCHEDULER_HOST_TASK_IDLE: &str = "native.scheduler.host_task_idle";
+pub const NATIVE_SCHEDULER_HOST_TASK_PAUSED: &str = "native.scheduler.host_task_paused";
+pub const NATIVE_SCHEDULER_HOST_TASK_RESUMED: &str = "native.scheduler.host_task_resumed";
+pub const NATIVE_SCHEDULER_HOST_TASK_STOPPING: &str = "native.scheduler.host_task_stopping";
+pub const NATIVE_SCHEDULER_HOST_TASK_STOPPED: &str = "native.scheduler.host_task_stopped";
+pub const NATIVE_SCHEDULER_HOST_TASK_FAILED: &str = "native.scheduler.host_task_failed";
+pub const NATIVE_SCHEDULER_HOST_TASK_JOINED: &str = "native.scheduler.host_task_joined";
+pub const NETWORK_PROVIDER_CONTROLLER_STATUS: &str = "network.provider_controller.status";
+pub const NETWORK_PROVIDER_STATUS: &str = "network.provider.status";
+pub const NETWORK_VISIBILITY_STATUS: &str = "network.visibility.status";
+pub const AUDIT_NETWORK_PROVIDER_CONTROLLER: &str = "audit.network_provider_controller";
+pub const AUDIT_NETWORK_PROVIDER_EXECUTION: &str = "audit.network_provider_execution";
+pub const NATIVE_IP_HELPER_METADATA: &str = "native.ip_helper.metadata";
+pub const NATIVE_ETW_NETWORK_METADATA: &str = "native.etw_network.metadata";
+pub const NATIVE_CONNECTION_CATEGORY_FACT: &str = "native.connection.category_fact";
 pub const NATIVE_HEALTH_METADATA: &str = "native.health.metadata";
 pub const NATIVE_SERVICE_METADATA: &str = "native.service.metadata";
 pub const NATIVE_PROCESS_METADATA: &str = "native.process.metadata";
@@ -45,6 +65,12 @@ pub const ENDPOINT_NATIVE_HEALTH_CATEGORY_FACT: &str = "endpoint.native_health.c
 pub const ENDPOINT_SERVICE_CATEGORY_FACT: &str = "endpoint.service.category_fact";
 pub const ENDPOINT_PROCESS_CATEGORY_FACT: &str = "endpoint.process.category_fact";
 pub const ENDPOINT_PROCESS_PARENT_CATEGORY_FACT: &str = "endpoint.process_parent.category_fact";
+pub const ENDPOINT_THREAT_CANDIDATE: &str = "endpoint.threat.candidate";
+pub const ENDPOINT_THREAT_FINDING: &str = "endpoint.threat.finding";
+pub const ENDPOINT_THREAT_EVIDENCE: &str = "endpoint.threat.evidence";
+pub const ENDPOINT_THREAT_RISK_HINT: &str = "endpoint.threat.risk_hint";
+pub const ENDPOINT_VISIBILITY_ADVISORY: &str = "endpoint.visibility.advisory";
+pub const ENDPOINT_THREAT_REJECTED: &str = "endpoint.threat.rejected";
 pub const NATIVE_VISIBILITY_STATUS: &str = "native.visibility.status";
 pub const SECURITY_VISIBILITY_STATUS: &str = "security.visibility.status";
 pub const SECURITY_VISIBILITY_DEGRADED: &str = "security.visibility.degraded";
@@ -53,10 +79,18 @@ pub const AUDIT_NATIVE_SAMPLER_REVIEW: &str = "audit.native_sampler_review";
 pub const AUDIT_NATIVE_SAMPLER_RUNTIME: &str = "audit.native_sampler_runtime";
 pub const AUDIT_NATIVE_SCHEDULER: &str = "audit.native_scheduler";
 pub const AUDIT_NATIVE_SCHEDULER_HOST: &str = "audit.native_scheduler_host";
+pub const AUDIT_ENDPOINT_THREAT_ANALYSIS: &str = "audit.endpoint_threat_analysis";
 pub const INTEL_DOMAIN_CONTEXT: &str = "intel.domain_context";
 pub const INTEL_IP_CONTEXT: &str = "intel.ip_context";
 pub const INTEL_CLOUD_CONTEXT: &str = "intel.cloud_context";
+pub const INTEL_CERTIFICATE_CONTEXT: &str = "intel.certificate_context";
+pub const ASSET_RECORD: &str = "asset.record";
+pub const ASSET_SERVICE_RECORD: &str = "asset.service_record";
+pub const ASSET_PORT_EXPOSURE: &str = "asset.port_exposure";
+pub const ASSET_EXPOSURE_OBSERVATION: &str = "asset.exposure.observation";
 pub const ASSET_EXPOSURE: &str = "asset.exposure";
+pub const NETWORK_SDN_CONTROL_PLANE_METADATA: &str = "network.sdn_control_plane.metadata";
+pub const SECURITY_FINDING_ASSET_RISK: &str = "security.finding.asset_risk";
 pub const SECURITY_OBSERVATION: &str = "security.observation";
 pub const SECURITY_FUSION_CONTEXT: &str = "security.fusion.context";
 pub const SECURITY_FACT: &str = "security.fact";
@@ -269,6 +303,24 @@ pub fn core_v1_topics() -> Vec<Topic> {
             &v1,
         ),
         topic(
+            IDENTITY_RDP_OPERATIONAL_METADATA,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            IDENTITY_SMB_OPERATIONAL_METADATA,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            IDENTITY_SSH_OPERATIONAL_METADATA,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
             CLOUD_SAAS_METADATA,
             TopicLayer::Context,
             PriorityLane::P2Normal,
@@ -426,6 +478,96 @@ pub fn core_v1_topics() -> Vec<Topic> {
             &v1,
         ),
         topic(
+            NATIVE_SCHEDULER_HOST_TASK_STARTED,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_WAKE,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_IDLE,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_PAUSED,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_RESUMED,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_STOPPING,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_STOPPED,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_FAILED,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_SCHEDULER_HOST_TASK_JOINED,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NETWORK_PROVIDER_CONTROLLER_STATUS,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NETWORK_PROVIDER_STATUS,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NETWORK_VISIBILITY_STATUS,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_IP_HELPER_METADATA,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_ETW_NETWORK_METADATA,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NATIVE_CONNECTION_CATEGORY_FACT,
+            TopicLayer::Security,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
             NATIVE_HEALTH_METADATA,
             TopicLayer::Context,
             PriorityLane::P2Normal,
@@ -474,6 +616,44 @@ pub fn core_v1_topics() -> Vec<Topic> {
             &v1,
         ),
         topic(
+            ENDPOINT_THREAT_CANDIDATE,
+            TopicLayer::Security,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            ENDPOINT_THREAT_FINDING,
+            TopicLayer::Security,
+            PriorityLane::P1High,
+            &v1,
+        )
+        .protected(),
+        topic(
+            ENDPOINT_THREAT_EVIDENCE,
+            TopicLayer::Security,
+            PriorityLane::P1High,
+            &v1,
+        )
+        .protected(),
+        topic(
+            ENDPOINT_THREAT_RISK_HINT,
+            TopicLayer::Security,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            ENDPOINT_VISIBILITY_ADVISORY,
+            TopicLayer::Security,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            ENDPOINT_THREAT_REJECTED,
+            TopicLayer::Security,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
             NATIVE_VISIBILITY_STATUS,
             TopicLayer::Context,
             PriorityLane::P2Normal,
@@ -498,8 +678,50 @@ pub fn core_v1_topics() -> Vec<Topic> {
             &v1,
         ),
         topic(
+            INTEL_CERTIFICATE_CONTEXT,
+            TopicLayer::Context,
+            PriorityLane::P3Low,
+            &v1,
+        ),
+        topic(
+            ASSET_RECORD,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            ASSET_SERVICE_RECORD,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            ASSET_PORT_EXPOSURE,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            ASSET_EXPOSURE_OBSERVATION,
+            TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
             ASSET_EXPOSURE,
             TopicLayer::Context,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            NETWORK_SDN_CONTROL_PLANE_METADATA,
+            TopicLayer::Network,
+            PriorityLane::P2Normal,
+            &v1,
+        ),
+        topic(
+            SECURITY_FINDING_ASSET_RISK,
+            TopicLayer::Security,
             PriorityLane::P2Normal,
             &v1,
         ),
@@ -683,6 +905,27 @@ pub fn core_v1_topics() -> Vec<Topic> {
         )
         .protected(),
         topic(
+            AUDIT_ENDPOINT_THREAT_ANALYSIS,
+            TopicLayer::Audit,
+            PriorityLane::P1High,
+            &v1,
+        )
+        .protected(),
+        topic(
+            AUDIT_NETWORK_PROVIDER_CONTROLLER,
+            TopicLayer::Audit,
+            PriorityLane::P1High,
+            &v1,
+        )
+        .protected(),
+        topic(
+            AUDIT_NETWORK_PROVIDER_EXECUTION,
+            TopicLayer::Audit,
+            PriorityLane::P1High,
+            &v1,
+        )
+        .protected(),
+        topic(
             REPORT_GENERATED,
             TopicLayer::Report,
             PriorityLane::P4BestEffort,
@@ -744,13 +987,89 @@ mod tests {
             NATIVE_SCHEDULER_HOST_RESUMED,
             NATIVE_SCHEDULER_HOST_STOPPED,
             NATIVE_SCHEDULER_HOST_FAILED,
+            NATIVE_SCHEDULER_HOST_TASK_STARTED,
+            NATIVE_SCHEDULER_HOST_TASK_WAKE,
+            NATIVE_SCHEDULER_HOST_TASK_IDLE,
+            NATIVE_SCHEDULER_HOST_TASK_PAUSED,
+            NATIVE_SCHEDULER_HOST_TASK_RESUMED,
+            NATIVE_SCHEDULER_HOST_TASK_STOPPING,
+            NATIVE_SCHEDULER_HOST_TASK_STOPPED,
+            NATIVE_SCHEDULER_HOST_TASK_FAILED,
+            NATIVE_SCHEDULER_HOST_TASK_JOINED,
+            NETWORK_PROVIDER_CONTROLLER_STATUS,
+            NETWORK_PROVIDER_STATUS,
+            NETWORK_VISIBILITY_STATUS,
+            NATIVE_IP_HELPER_METADATA,
+            NATIVE_ETW_NETWORK_METADATA,
+            NATIVE_CONNECTION_CATEGORY_FACT,
+            ENDPOINT_THREAT_CANDIDATE,
+            ENDPOINT_THREAT_FINDING,
+            ENDPOINT_THREAT_EVIDENCE,
+            ENDPOINT_THREAT_RISK_HINT,
+            ENDPOINT_VISIBILITY_ADVISORY,
+            ENDPOINT_THREAT_REJECTED,
             SECURITY_VISIBILITY_DEGRADED,
             AUDIT_NATIVE_PERMISSION,
             AUDIT_NATIVE_SCHEDULER_HOST,
+            AUDIT_ENDPOINT_THREAT_ANALYSIS,
+            AUDIT_NETWORK_PROVIDER_CONTROLLER,
+            AUDIT_NETWORK_PROVIDER_EXECUTION,
         ] {
             assert!(topics.iter().any(|topic| topic == expected));
         }
         assert!(!topics.iter().any(|topic| topic == "native.telemetry"));
         assert!(!topics.iter().any(|topic| topic == "native.process.record"));
+        assert!(!topics
+            .iter()
+            .any(|topic| topic == "network.provider.connection"));
+        assert!(!topics.iter().any(|topic| topic == "network.packet.bytes"));
+    }
+
+    #[test]
+    fn provider_controller_topics_are_status_and_audit_only() {
+        let topics = core_v1_topics();
+        let provider_topics = topics
+            .iter()
+            .filter(|topic| topic.name.as_str().contains("provider"))
+            .collect::<Vec<_>>();
+
+        assert!(provider_topics.iter().any(|topic| {
+            topic.name.as_str() == NETWORK_PROVIDER_CONTROLLER_STATUS
+                && topic.layer == TopicLayer::Context
+        }));
+        assert!(provider_topics.iter().any(|topic| {
+            topic.name.as_str() == NETWORK_PROVIDER_STATUS && topic.layer == TopicLayer::Context
+        }));
+        assert!(provider_topics.iter().any(|topic| {
+            topic.name.as_str() == AUDIT_NETWORK_PROVIDER_CONTROLLER
+                && topic.layer == TopicLayer::Audit
+                && topic.protected_delivery
+        }));
+        assert!(provider_topics.iter().any(|topic| {
+            topic.name.as_str() == AUDIT_NETWORK_PROVIDER_EXECUTION
+                && topic.layer == TopicLayer::Audit
+                && topic.protected_delivery
+        }));
+        assert!(!provider_topics.iter().any(|topic| {
+            topic.name.as_str().contains("packet")
+                || topic.name.as_str().contains("connection")
+                || topic.name.as_str().contains("event")
+        }));
+    }
+
+    #[test]
+    fn native_network_topics_are_bounded_without_process_network_or_packet_claims() {
+        let topics = core_v1_topics()
+            .into_iter()
+            .map(|topic| topic.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(topics.contains(&NATIVE_IP_HELPER_METADATA.to_string()));
+        assert!(topics.contains(&NATIVE_ETW_NETWORK_METADATA.to_string()));
+        assert!(topics.contains(&NATIVE_CONNECTION_CATEGORY_FACT.to_string()));
+        assert!(topics.contains(&AUDIT_NETWORK_PROVIDER_EXECUTION.to_string()));
+        assert!(!topics.contains(&"native.process_network.category_fact".to_string()));
+        assert!(!topics.contains(&"native.packet.header_fact".to_string()));
+        assert!(!topics.contains(&"native.packet.payload_fact".to_string()));
     }
 }

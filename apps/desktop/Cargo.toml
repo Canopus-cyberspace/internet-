@@ -18,6 +18,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 sentinel-app-core = { path = "../../crates/app_core" }
 sentinel-contracts = { path = "../../crates/contracts" }
+sentinel-infrastructure = { path = "../../crates/infrastructure" }
 sentinel-platform = { path = "../../crates/platform" }
 sentinel-storage = { path = "../../crates/storage" }
 serde.workspace = true
@@ -27,3 +28,4 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 sha2.workspace = true
 
 [dev-dependencies]
+sentinel-app-core = { path = "../../crates/app_core", features = ["test-support"] }

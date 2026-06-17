@@ -22,6 +22,8 @@ import {
   getNativeSamplerReadinessSummary,
   getNativeSamplerRuntimeStatus,
   getNativeSamplerRuntimeSummary,
+  getNativeSchedulerHostHealth,
+  getNativeSchedulerHostStatus,
   getNativeSchedulerOperationalSummary,
   getNativeSchedulerSummary,
   getNativeVisibilitySummary,
@@ -37,6 +39,12 @@ import {
   updateLlmAlertStorySettings,
   previewNativeSamplerActivation,
   previewNativeSchedulerEnablement,
+  previewNativeSchedulerHostStart,
+  startNativeSchedulerHost,
+  pauseNativeSchedulerHost,
+  resumeNativeSchedulerHost,
+  wakeNativeSchedulerHost,
+  stopNativeSchedulerHost,
   previewNativePermissionRequest,
   updateNativePermission,
   updatePrivacyPolicy,
@@ -161,6 +169,20 @@ export function useNativeSchedulerOperationalSummaryQuery() {
   return useQuery({
     queryKey: queryKeys.settings.nativeSchedulerOperational,
     queryFn: getNativeSchedulerOperationalSummary,
+  });
+}
+
+export function useNativeSchedulerHostStatusQuery() {
+  return useQuery({
+    queryKey: queryKeys.settings.nativeSchedulerHostStatus,
+    queryFn: getNativeSchedulerHostStatus,
+  });
+}
+
+export function useNativeSchedulerHostHealthQuery() {
+  return useQuery({
+    queryKey: queryKeys.settings.nativeSchedulerHostHealth,
+    queryFn: getNativeSchedulerHostHealth,
   });
 }
 
@@ -395,6 +417,12 @@ export function usePreviewNativeSchedulerEnablementMutation() {
   });
 }
 
+export function usePreviewNativeSchedulerHostStartMutation() {
+  return useMutation({
+    mutationFn: previewNativeSchedulerHostStart,
+  });
+}
+
 export function useApplyNativeSamplerRuntimeActionMutation() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -431,6 +459,8 @@ export function useApplyNativeSchedulerActionMutation() {
       for (const queryKey of [
         queryKeys.settings.nativeScheduler,
         queryKeys.settings.nativeSchedulerStatus,
+        queryKeys.settings.nativeSchedulerHostStatus,
+        queryKeys.settings.nativeSchedulerHostHealth,
         queryKeys.settings.nativeSamplerSchedules,
         queryKeys.settings.nativeSamplerRuntime,
         queryKeys.settings.nativePermission,
@@ -441,6 +471,85 @@ export function useApplyNativeSchedulerActionMutation() {
         void queryClient.invalidateQueries({
           queryKey: queryKeys.settings.nativeSamplerSchedule(request.sampler_id),
         });
+      }
+    },
+  });
+}
+
+function nativeSchedulerHostInvalidationKeys() {
+  return [
+    queryKeys.settings.nativeScheduler,
+    queryKeys.settings.nativeSchedulerOperational,
+    queryKeys.settings.nativeSchedulerStatus,
+    queryKeys.settings.nativeSchedulerHostStatus,
+    queryKeys.settings.nativeSchedulerHostHealth,
+    queryKeys.settings.nativeSamplerRuntime,
+    queryKeys.settings.nativePermission,
+    queryKeys.settings.nativeVisibility,
+    queryKeys.settings.edrReadiness,
+    queryKeys.security.fusion,
+    queryKeys.security.fusionFacts,
+    queryKeys.security.attackCoverage,
+    queryKeys.security.evidenceQuality,
+    queryKeys.report.list,
+  ];
+}
+
+export function useStartNativeSchedulerHostMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: startNativeSchedulerHost,
+    onSuccess: () => {
+      for (const queryKey of nativeSchedulerHostInvalidationKeys()) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    },
+  });
+}
+
+export function usePauseNativeSchedulerHostMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: pauseNativeSchedulerHost,
+    onSuccess: () => {
+      for (const queryKey of nativeSchedulerHostInvalidationKeys()) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    },
+  });
+}
+
+export function useResumeNativeSchedulerHostMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: resumeNativeSchedulerHost,
+    onSuccess: () => {
+      for (const queryKey of nativeSchedulerHostInvalidationKeys()) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    },
+  });
+}
+
+export function useWakeNativeSchedulerHostMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: wakeNativeSchedulerHost,
+    onSuccess: () => {
+      for (const queryKey of nativeSchedulerHostInvalidationKeys()) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    },
+  });
+}
+
+export function useStopNativeSchedulerHostMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: stopNativeSchedulerHost,
+    onSuccess: () => {
+      for (const queryKey of nativeSchedulerHostInvalidationKeys()) {
+        void queryClient.invalidateQueries({ queryKey });
       }
     },
   });

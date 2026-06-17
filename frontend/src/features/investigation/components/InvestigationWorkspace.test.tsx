@@ -15,6 +15,7 @@ import {
   BaselineFollowUpPanel,
   CaseList,
 } from "./InvestigationWorkspace";
+import { EndpointThreatPanel } from "./EndpointThreatPanel";
 
 registerDefaultRenderers();
 
@@ -28,6 +29,7 @@ describe("Investigation workspace", () => {
     expect(markup).toContain("Evidence");
     expect(markup).toContain("Timeline");
     expect(markup).toContain("Baseline follow-up");
+    expect(markup).toContain("Endpoint threat analysis");
     expect(markup).toContain("Risk");
     expect(markup).toContain("Response plan");
     expect(markup).toContain("Report action");
@@ -252,6 +254,158 @@ describe("Investigation workspace", () => {
     expect(markup).not.toContain("api_key");
     expect(markup).not.toContain("private_key");
     expect(markup).not.toContain("cookie");
+  });
+
+  it("renders endpoint threat investigation context with warnings and redacted refs", () => {
+    const markup = renderToStaticMarkup(
+      <EndpointThreatPanel
+        loading={false}
+        summary={{
+          generated_at: "2026-06-13T00:00:00Z",
+          detector_status: "completed_metadata_only",
+          candidate_count: 1,
+          finding_count: 1,
+          evidence_count: 2,
+          risk_hint_count: 1,
+          advisory_count: 1,
+          rejected_count: 1,
+          graph_ref_count: 1,
+          findings: [
+            {
+              finding_id: "endpoint-finding-safe-ref",
+              candidate_ref: "endpoint-candidate-safe-ref",
+              category: "possible_endpoint_context_for_saas_cloud_abuse",
+              detector_id: "possible_endpoint_context_for_saas_cloud_abuse",
+              detector_version: "1.0.0",
+              evidence_refs: ["evidence-safe-a", "evidence-safe-b"],
+              endpoint_evidence_refs: ["endpoint-evidence-safe-a"],
+              risk_hint_refs: ["endpoint-risk-hint-safe"],
+              attack_refs: [
+                {
+                  tactic_id: "TA0011",
+                  technique_id: "T1071.001",
+                  attack_version: "enterprise_2026_metadata_only",
+                  confidence_bucket: "low",
+                  required_visibility: ["process_network_attribution_unavailable"],
+                  technique_observed: false,
+                },
+              ],
+              confidence_bucket: "moderate",
+              uncertainty_bucket: "bounded_metadata_uncertainty",
+              severity_bucket: "low",
+              independent_source_count: 2,
+              causal_claim: "correlation_only",
+              summary_redacted:
+                "possible endpoint context supporting an existing security finding",
+              missing_visibility_flags: [
+                "specific_process_identity_unavailable",
+                "process_network_attribution_unavailable",
+              ],
+              evidence_quality_bucket: "moderate",
+              correlation_quality_bucket: "limited",
+              provenance_id: "provenance-safe-ref",
+              redaction_status: "redacted",
+            },
+          ],
+          rejected_candidates: [
+            {
+              rejected_candidate_id: "rejected-safe-ref",
+              analysis_input_ref: "analysis-safe-ref",
+              category: "visibility_limited_suspicion",
+              reason: "cmd.exe should stay hidden",
+              evidence_refs: ["evidence-safe-a"],
+              missing_visibility_flags: [],
+              provenance_id: "provenance-safe-ref",
+              redaction_status: "redacted",
+            },
+          ],
+          evidence_correlation: {
+            evidence_refs: ["evidence-safe-a", "evidence-safe-b"],
+            endpoint_evidence_refs: ["endpoint-evidence-safe-a"],
+            portable_finding_refs: ["finding-safe-ref"],
+            hypothesis_refs: ["hypothesis-safe-ref"],
+            baseline_refs: ["baseline-safe-ref"],
+            risk_refs: ["risk-safe-ref"],
+            provenance_refs: ["provenance-safe-ref"],
+          },
+          quality: {
+            detector_status: "completed_metadata_only",
+            evidence_quality_buckets: ["moderate"],
+            source_reliability_buckets: ["corroborated"],
+            correlation_quality_buckets: ["limited"],
+            redaction_statuses: ["redacted"],
+            freshness_categories: ["fresh"],
+          },
+          baseline_support: {
+            baseline_refs: ["baseline-safe-ref"],
+            support_bucket: "fresh_metadata_baseline_refs",
+          },
+          missing_visibility: {
+            missing_visibility_flags: ["packet_visibility_unavailable"],
+            degraded_reasons: ["alice@example.com should stay hidden"],
+          },
+          risk_hints: [
+            {
+              risk_hint_id: "endpoint-risk-hint-safe",
+              finding_ref: "endpoint-finding-safe-ref",
+              candidate_ref: "endpoint-candidate-safe-ref",
+              category: "correlated_portable_finding_context",
+              risk_bucket: "low",
+              confidence_bucket: "low",
+              evidence_refs: ["evidence-safe-a"],
+              risk_refs: ["risk-safe-ref"],
+              provenance_id: "provenance-safe-ref",
+              redaction_status: "redacted",
+            },
+          ],
+          attack_context: [],
+          graph_refs: ["graph-safe-ref"],
+          report_refs: ["report-safe-ref"],
+          export_refs: ["export-safe-ref"],
+          visibility_advisories: [
+            {
+              advisory_id: "advisory-safe-ref",
+              analysis_input_ref: "analysis-safe-ref",
+              category: "C:\\Users\\Sensitive\\service.exe",
+              missing_visibility_flags: ["command_line_visibility_unavailable"],
+              confidence_cap: "low",
+              evidence_refs: ["evidence-safe-a"],
+              provenance_id: "provenance-safe-ref",
+              redaction_status: "redacted",
+            },
+          ],
+          degraded_reasons: ["metadata_only_endpoint_visibility"],
+          automatic_llm_calls: false,
+          response_execution_started: false,
+        }}
+      />,
+    );
+
+    expect(markup).toContain(
+      "Possible endpoint context supporting an existing security finding",
+    );
+    expect(markup).toContain("Finding category");
+    expect(markup).toContain("Detector");
+    expect(markup).toContain("1.0.0");
+    expect(markup).toContain("Moderate confidence");
+    expect(markup).toContain("Bounded metadata uncertainty");
+    expect(markup).toContain("2 evidence refs / 2 independent sources");
+    expect(markup).toContain("Process/service category context");
+    expect(markup).toContain("Baseline support Fresh metadata baseline refs");
+    expect(markup).toContain("Reliability Corroborated");
+    expect(markup).toContain("evidence quality Moderate");
+    expect(markup).toContain("Specific process identity unavailable");
+    expect(markup).toContain("Process-network attribution unavailable");
+    expect(markup).toContain("Confirmed compromise not established");
+    expect(markup).toContain("Related hypotheses");
+    expect(markup).toContain("Related risks");
+    expect(markup).toContain("Rejected candidate reasons");
+    expect(markup).toContain("Visibility advisories");
+    expect(markup).not.toContain("process.exe");
+    expect(markup).not.toContain("cmd.exe");
+    expect(markup).not.toContain("alice@example.com");
+    expect(markup).not.toContain("C:\\Users");
+    expect(markup).not.toContain("service.exe");
   });
 
   it("renders a stable empty case-list state without fallback security records", () => {

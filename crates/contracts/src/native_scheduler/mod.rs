@@ -29,6 +29,15 @@ pub const NATIVE_SCHEDULER_ALLOWED_TOPICS: &[&str] = &[
     "native.scheduler.host_resumed",
     "native.scheduler.host_stopped",
     "native.scheduler.host_failed",
+    "native.scheduler.host_task_started",
+    "native.scheduler.host_task_wake",
+    "native.scheduler.host_task_idle",
+    "native.scheduler.host_task_paused",
+    "native.scheduler.host_task_resumed",
+    "native.scheduler.host_task_stopping",
+    "native.scheduler.host_task_stopped",
+    "native.scheduler.host_task_failed",
+    "native.scheduler.host_task_joined",
     "audit.native_scheduler",
     "audit.native_scheduler_host",
 ];
@@ -196,13 +205,23 @@ pub enum NativeSchedulerHostWakeState {
 #[serde(rename_all = "snake_case")]
 pub enum NativeSchedulerHostWakeReason {
     SamplerDue,
+    ScheduleEnabled,
+    ScheduleDisabled,
     ScheduleChanged,
+    ScheduleUpdated,
     PermissionChanged,
+    PermissionRevoked,
     SamplerStateChanged,
+    SamplerActivated,
+    SamplerPaused,
+    SamplerResumed,
+    SamplerStopped,
     RetryDue,
     ManualWake,
+    ControllerPaused,
     ControllerResumed,
     StatusReconciliation,
+    SessionCleanup,
     StopRequested,
     ShutdownRequested,
     Revoked,
@@ -1251,6 +1270,14 @@ pub struct NativeSchedulerHostStatus {
     pub watchdog_state: NativeSchedulerHostWatchdogState,
     pub shutdown_state: NativeSchedulerHostShutdownState,
     pub degraded_reason: Option<String>,
+    pub timer_task_active: bool,
+    pub task_ownership_state: String,
+    pub current_wait_state: String,
+    pub pending_wake: bool,
+    pub cancellation_state: String,
+    pub join_state: String,
+    pub join_timeout_category: Option<String>,
+    pub shutdown_cleanup_status: String,
     pub audit_refs: Vec<AuditId>,
     pub provenance_id: String,
     pub redaction_status: RedactionStatus,
@@ -1266,7 +1293,10 @@ pub struct NativeSchedulerHostStatus {
 
 impl NativeSchedulerHostStatus {
     pub fn validate(&self) -> Result<(), NativeSamplerContractError> {
-        validate_safe_text("native scheduler host orchestrator id", &self.orchestrator_id)?;
+        validate_safe_text(
+            "native scheduler host orchestrator id",
+            &self.orchestrator_id,
+        )?;
         validate_safe_text("native scheduler host controller id", &self.controller_id)?;
         validate_safe_text(
             "native scheduler host enabled sampler count",
@@ -1313,6 +1343,24 @@ impl NativeSchedulerHostStatus {
             "native scheduler host degraded reason",
             self.degraded_reason.as_deref(),
         )?;
+        validate_safe_text(
+            "native scheduler host task ownership",
+            &self.task_ownership_state,
+        )?;
+        validate_safe_text("native scheduler host wait state", &self.current_wait_state)?;
+        validate_safe_text(
+            "native scheduler host cancellation state",
+            &self.cancellation_state,
+        )?;
+        validate_safe_text("native scheduler host join state", &self.join_state)?;
+        validate_optional_safe_text(
+            "native scheduler host join timeout",
+            self.join_timeout_category.as_deref(),
+        )?;
+        validate_safe_text(
+            "native scheduler host cleanup status",
+            &self.shutdown_cleanup_status,
+        )?;
         validate_safe_text("native scheduler host provenance", &self.provenance_id)?;
         if self.audit_refs.len() > MAX_NATIVE_SCHEDULER_REFS
             || self.redaction_status == RedactionStatus::RedactionRequired
@@ -1324,6 +1372,8 @@ impl NativeSchedulerHostStatus {
             || (self.lifecycle_state == NativeSchedulerHostLifecycleState::Running
                 && (!self.host_task_owned || !self.singleton_owner))
             || (self.host_task_owned && !self.singleton_owner)
+            || (self.timer_task_active && !self.host_task_owned)
+            || (self.pending_wake && !self.timer_task_active)
         {
             return Err(NativeSamplerContractError::UnsafeSamplerState(
                 "native scheduler host status boundary",
@@ -1370,7 +1420,10 @@ impl NativeSchedulerHostCycleSummary {
             &self.controller_id,
         )?;
         validate_topics(&self.emitted_topics)?;
-        validate_safe_text("native scheduler host cycle provenance", &self.provenance_id)?;
+        validate_safe_text(
+            "native scheduler host cycle provenance",
+            &self.provenance_id,
+        )?;
         if self.cycle_origin == NativeSchedulerCycleOrigin::TestFixture && !cfg!(test) {
             return Err(NativeSamplerContractError::UnsafeSamplerState(
                 "native scheduler host cycle origin",
@@ -1381,7 +1434,10 @@ impl NativeSchedulerHostCycleSummary {
             || self.provider_direct_calls
             || self.automatic_llm_calls
             || self.response_execution_started
-            || (self.scheduler_cycle_ref.is_none() && self.tick_invoked && !self.no_due_work)
+            || (self.scheduler_cycle_ref.is_none()
+                && self.tick_invoked
+                && !self.no_due_work
+                && !self.degraded)
         {
             return Err(NativeSamplerContractError::UnsafeSamplerState(
                 "native scheduler host cycle boundary",
@@ -1405,8 +1461,14 @@ pub struct NativeSchedulerHostAuditEntry {
 impl NativeSchedulerHostAuditEntry {
     pub fn validate(&self) -> Result<(), NativeSamplerContractError> {
         validate_safe_text("native scheduler host audit time bucket", &self.time_bucket)?;
-        validate_safe_text("native scheduler host audit provenance", &self.provenance_id)?;
-        validate_safe_text("native scheduler host audit summary", &self.summary_redacted)
+        validate_safe_text(
+            "native scheduler host audit provenance",
+            &self.provenance_id,
+        )?;
+        validate_safe_text(
+            "native scheduler host audit summary",
+            &self.summary_redacted,
+        )
     }
 }
 
@@ -1459,16 +1521,16 @@ pub struct NativeSchedulerHostActionRequest {
 impl NativeSchedulerHostActionRequest {
     pub fn validate(&self) -> Result<(), NativeSamplerContractError> {
         validate_safe_text("native scheduler host action reason", &self.reason_redacted)?;
-        if matches!(
+        let explicit_required = matches!(
             self.action,
             NativeSchedulerHostAction::Start
                 | NativeSchedulerHostAction::Pause
                 | NativeSchedulerHostAction::Resume
-                | NativeSchedulerHostAction::WakeNow
                 | NativeSchedulerHostAction::Stop
                 | NativeSchedulerHostAction::ClearInactiveState
-        ) && !self.explicit_user_action
-        {
+        ) || (self.action == NativeSchedulerHostAction::WakeNow
+            && self.wake_reason == NativeSchedulerHostWakeReason::ManualWake);
+        if explicit_required && !self.explicit_user_action {
             return Err(NativeSamplerContractError::UnsafeSamplerState(
                 "native scheduler host explicit user action",
             ));
@@ -1693,5 +1755,96 @@ mod tests {
     fn schedule_buckets_reject_unbounded_and_unlimited_values() {
         assert!(serde_json::from_str::<NativeScheduleIntervalBucket>("\"unbounded\"").is_err());
         assert!(serde_json::from_str::<NativeScheduleRetryBudgetBucket>("\"unlimited\"").is_err());
+    }
+
+    fn host_status() -> NativeSchedulerHostStatus {
+        NativeSchedulerHostStatus {
+            orchestrator_id: "session_native_scheduler_host".to_string(),
+            controller_id: "native_scheduler_controller".to_string(),
+            lifecycle_state: NativeSchedulerHostLifecycleState::Running,
+            health_state: NativeSchedulerHostHealthState::Healthy,
+            wake_state: NativeSchedulerHostWakeState::Waiting,
+            latest_wake_reason: Some(NativeSchedulerHostWakeReason::ManualWake),
+            enabled_sampler_count_bucket: "one".to_string(),
+            eligible_sampler_count_bucket: "one".to_string(),
+            next_wake_bucket: "due_soon".to_string(),
+            last_wake_bucket: Some("current_session".to_string()),
+            last_tick_ref: Some(NativeSchedulerCycleId::new_v4()),
+            latest_cycle_ref: Some(NativeSchedulerCycleId::new_v4()),
+            successful_wake_count_bucket: "one".to_string(),
+            no_op_wake_count_bucket: "none".to_string(),
+            degraded_wake_count_bucket: "none".to_string(),
+            cancelled_wake_count_bucket: "none".to_string(),
+            restart_count_bucket: "none".to_string(),
+            manual_cycle_count_bucket: "none".to_string(),
+            autonomous_cycle_count_bucket: "one".to_string(),
+            watchdog_state: NativeSchedulerHostWatchdogState::Healthy,
+            shutdown_state: NativeSchedulerHostShutdownState::None,
+            degraded_reason: None,
+            timer_task_active: true,
+            task_ownership_state: "owned".to_string(),
+            current_wait_state: "waiting".to_string(),
+            pending_wake: false,
+            cancellation_state: "none".to_string(),
+            join_state: "not_joining".to_string(),
+            join_timeout_category: None,
+            shutdown_cleanup_status: "not_requested".to_string(),
+            audit_refs: vec![AuditId::new_v4()],
+            provenance_id: "native_scheduler_host_orchestrator".to_string(),
+            redaction_status: RedactionStatus::Redacted,
+            host_task_owned: true,
+            singleton_owner: true,
+            startup_auto_started: false,
+            os_service_started: false,
+            provider_direct_calls: false,
+            automatic_llm_calls: false,
+            response_execution_started: false,
+            generated_at: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn host_status_is_bounded_session_owned_and_side_effect_free() {
+        host_status().validate().expect("valid host status");
+        let mut unsafe_status = host_status();
+        unsafe_status.degraded_reason = Some("raw runtime error with token".to_string());
+        assert!(unsafe_status.validate().is_err());
+
+        let mut unsafe_owner = host_status();
+        unsafe_owner.singleton_owner = false;
+        assert!(unsafe_owner.validate().is_err());
+    }
+
+    #[test]
+    fn host_cycle_topics_are_declared_without_provider_shortcuts() {
+        let cycle = NativeSchedulerHostCycleSummary {
+            host_cycle_id: NativeSchedulerCycleId::new_v4(),
+            orchestrator_id: "session_native_scheduler_host".to_string(),
+            controller_id: "native_scheduler_controller".to_string(),
+            cycle_origin: NativeSchedulerCycleOrigin::Autonomous,
+            wake_reason: NativeSchedulerHostWakeReason::SamplerDue,
+            lifecycle_state: NativeSchedulerHostLifecycleState::Running,
+            health_state: NativeSchedulerHostHealthState::Healthy,
+            wake_state: NativeSchedulerHostWakeState::Woken,
+            scheduler_cycle_ref: Some(NativeSchedulerCycleId::new_v4()),
+            tick_invoked: true,
+            no_due_work: false,
+            degraded: false,
+            cancelled: false,
+            cycle_gate_busy: false,
+            emitted_topics: vec!["native.scheduler.host_wake".to_string()],
+            audit_refs: vec![AuditId::new_v4()],
+            provenance_id: "native_scheduler_host_orchestrator".to_string(),
+            redaction_status: RedactionStatus::Redacted,
+            provider_direct_calls: false,
+            automatic_llm_calls: false,
+            response_execution_started: false,
+            generated_at: Timestamp::now(),
+        };
+        cycle.validate().expect("valid host cycle");
+
+        let mut unsafe_cycle = cycle;
+        unsafe_cycle.emitted_topics = vec!["native.process.metadata".to_string()];
+        assert!(unsafe_cycle.validate().is_err());
     }
 }

@@ -35,6 +35,7 @@
 pub mod asset_exposure;
 pub mod c2_detection;
 pub mod continuous_metadata_watch;
+pub mod endpoint_threat_detection;
 pub mod evidence_management;
 pub mod exfiltration_detection;
 pub mod export_history;
@@ -42,8 +43,10 @@ pub mod graph_analytics;
 pub mod graph_stage;
 pub mod lateral_movement_lite;
 pub mod local_proxy_metadata_provider;
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock_network_pipeline;
 pub mod multi_layer_fusion;
+pub mod native_network_fact;
 pub mod native_sampler_runtime;
 pub mod network_observations;
 pub mod portable_capture_lite;
@@ -54,9 +57,15 @@ pub mod response_planning;
 pub mod risk_alerting;
 pub mod static_plugin_runtime;
 
+#[cfg(test)]
+mod runtime_boundary_tests;
+#[cfg(test)]
+mod runtime_test_support;
+
 pub use asset_exposure::*;
 pub use c2_detection::*;
 pub use continuous_metadata_watch::*;
+pub use endpoint_threat_detection::*;
 pub use evidence_management::*;
 pub use exfiltration_detection::*;
 pub use export_history::*;
@@ -64,8 +73,10 @@ pub use graph_analytics::*;
 pub use graph_stage::*;
 pub use lateral_movement_lite::*;
 pub use local_proxy_metadata_provider::*;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock_network_pipeline::*;
 pub use multi_layer_fusion::*;
+pub use native_network_fact::*;
 pub use native_sampler_runtime::*;
 pub use network_observations::*;
 pub use portable_capture_lite::*;

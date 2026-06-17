@@ -562,6 +562,16 @@ pub fn source_kind_for_parser(parser_family: &MetadataParserFamily) -> MetadataW
     match parser_family {
         MetadataParserFamily::Har => MetadataWatchSourceKind::WatchedHarFolder,
         MetadataParserFamily::JsonlNetwork => MetadataWatchSourceKind::WatchedJsonlFolder,
+        MetadataParserFamily::DnsResolverLog => MetadataWatchSourceKind::TailedDnsResolverLog,
+        MetadataParserFamily::ApiGatewayLog => MetadataWatchSourceKind::TailedApiGatewayLog,
+        MetadataParserFamily::WafLog => MetadataWatchSourceKind::TailedWafLog,
+        MetadataParserFamily::CdnEdgeLog => MetadataWatchSourceKind::TailedCdnEdgeLog,
+        MetadataParserFamily::SdnControlPlaneLog => {
+            MetadataWatchSourceKind::TailedSdnControlPlaneLog
+        }
+        MetadataParserFamily::ObjectStorageAuditLog => {
+            MetadataWatchSourceKind::TailedObjectStorageAuditLog
+        }
         MetadataParserFamily::WebAccessLog => MetadataWatchSourceKind::TailedWebLog,
         MetadataParserFamily::AuthSecurityLog => MetadataWatchSourceKind::TailedAuthSecurityLog,
         MetadataParserFamily::SaasCloudJsonl => MetadataWatchSourceKind::TailedSaasCloudJsonl,
@@ -602,6 +612,12 @@ fn parser_label(parser_family: &MetadataParserFamily) -> &'static str {
     match parser_family {
         MetadataParserFamily::Har => "har",
         MetadataParserFamily::JsonlNetwork => "jsonl_network",
+        MetadataParserFamily::DnsResolverLog => "dns_resolver_log",
+        MetadataParserFamily::ApiGatewayLog => "api_gateway_log",
+        MetadataParserFamily::WafLog => "waf_log",
+        MetadataParserFamily::CdnEdgeLog => "cdn_edge_log",
+        MetadataParserFamily::SdnControlPlaneLog => "sdn_control_plane_log",
+        MetadataParserFamily::ObjectStorageAuditLog => "object_storage_audit_log",
         MetadataParserFamily::WebAccessLog => "web_access_log",
         MetadataParserFamily::AuthSecurityLog => "auth_security_log",
         MetadataParserFamily::SaasCloudJsonl => "saas_cloud_jsonl",

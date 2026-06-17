@@ -25,6 +25,7 @@ describe("Portable capture import panel", () => {
               auth_metadata_records: 0,
               saas_cloud_metadata_records: 0,
               deception_event_records: 0,
+              sdn_control_plane_records: 0,
             },
             redaction_status: "redacted",
           },
@@ -66,6 +67,7 @@ describe("Portable capture import panel", () => {
               auth_metadata_records: 0,
               saas_cloud_metadata_records: 0,
               deception_event_records: 0,
+              sdn_control_plane_records: 0,
             },
             redaction_status: "redacted",
           },
@@ -89,6 +91,7 @@ describe("Portable capture import panel", () => {
           saas_cloud_summary: null,
           deception_event_count: 0,
           deception_summary: null,
+          sdn_control_plane_metadata_count: 0,
           security_fact_count: 3,
           attack_hypothesis_count: 1,
           finding_count: 1,
@@ -131,6 +134,24 @@ describe("Portable capture import panel", () => {
     );
     expect(portableCaptureSourceTypeForPath("C:/drop/rdp-decoy.jsonl")).toBe(
       "imported_deception_event_log",
+    );
+    expect(portableCaptureSourceTypeForPath("C:/drop/bind-resolver.log")).toBe(
+      "imported_dns_resolver_log",
+    );
+    expect(portableCaptureSourceTypeForPath("C:/drop/aws-api-gateway.jsonl")).toBe(
+      "imported_api_gateway_log",
+    );
+    expect(portableCaptureSourceTypeForPath("C:/drop/cloudflare-waf.jsonl")).toBe(
+      "imported_waf_log",
+    );
+    expect(portableCaptureSourceTypeForPath("C:/drop/cloudfront-edge.jsonl")).toBe(
+      "imported_cdn_edge_log",
+    );
+    expect(portableCaptureSourceTypeForPath("C:/drop/onos-control-plane.jsonl")).toBe(
+      "imported_sdn_control_plane_log",
+    );
+    expect(portableCaptureSourceTypeForPath("C:/drop/s3-object-storage-audit.jsonl")).toBe(
+      "imported_object_storage_audit_log",
     );
     expect(portableCaptureSourceTypeForPath("C:/drop/network.pcapng")).toBeNull();
     expect(

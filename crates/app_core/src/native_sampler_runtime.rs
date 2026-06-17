@@ -1,7 +1,9 @@
 use crate::native_sampler_readiness::get_native_sampler_readiness_detail;
 use crate::read_commands::ReadOnlyCommandState;
+use crate::run_endpoint_threat_analysis_runtime_with_services;
+use crate::runtime_container::{RuntimeEventBusHandle, RuntimeServices};
 use sentinel_capabilities::{
-    register_static_native_sampler_fact_plugin, NATIVE_SAMPLER_RUNTIME_SCHEMA_VERSION,
+    NATIVE_SAMPLER_FACT_STATIC_PLUGIN_ID, NATIVE_SAMPLER_RUNTIME_SCHEMA_VERSION,
 };
 use sentinel_contracts::{
     AuditId, CommandResult, ContractDescriptor, CoreError, DataSourceId, ErrorCode, ErrorSeverity,
@@ -12,25 +14,31 @@ use sentinel_contracts::{
     NativeProcessExecutionContextCategory, NativeProcessLifecycleStateBucket,
     NativeProcessMetadataRecord, NativeProcessObservationId, NativeProcessParentRelationCategory,
     NativeProcessTrustCategory, NativeProviderAvailabilityState, NativeProviderCategory,
-    NativeRuntimeHealthState, NativeRuntimePlatformCategory, NativeSamplerActivationPreview,
-    NativeSamplerBatchId, NativeSamplerCategory, NativeSamplerCounterSummary,
-    NativeSamplerReadinessState, NativeSamplerRuntimeAction, NativeSamplerRuntimeActionRequest,
-    NativeSamplerRuntimeActionResult, NativeSamplerRuntimeAuditEntry, NativeSamplerRuntimeBatch,
-    NativeSamplerRuntimeState, NativeSamplerRuntimeStatus, NativeSamplerRuntimeSummary,
-    NativeServiceBucketCount, NativeServiceCategory, NativeServiceCategoryCount,
-    NativeServiceMetadataRecord, NativeServiceObservationId, NativeServiceStartupTypeBucket,
-    NativeServiceStateBucket, NativeServiceTrustCategory, NativeSessionContextCategory,
-    NativeSignednessBucket, PluginId, PluginManifest, PrivacyClass, QualityScore, RedactionStatus,
-    SchemaVersion, SecurityFact, SecurityFactId, Timestamp, TraceContext,
+    NativeRuntimeHealthState, NativeRuntimePlatformCategory, NativeSampleFreshnessBucket,
+    NativeSamplerActivationPreview, NativeSamplerBatchId, NativeSamplerCategory,
+    NativeSamplerCounterSummary, NativeSamplerReadinessState, NativeSamplerRuntimeAction,
+    NativeSamplerRuntimeActionRequest, NativeSamplerRuntimeActionResult,
+    NativeSamplerRuntimeAuditEntry, NativeSamplerRuntimeBatch, NativeSamplerRuntimeState,
+    NativeSamplerRuntimeStatus, NativeSamplerRuntimeSummary, NativeServiceBucketCount,
+    NativeServiceCategory, NativeServiceCategoryCount, NativeServiceMetadataRecord,
+    NativeServiceObservationId, NativeSessionContextCategory, NativeSignednessBucket, PluginId,
+    PluginManifest, PrivacyClass, QualityScore, RedactionStatus, SchemaVersion, SecurityFact,
+    SecurityFactId, Timestamp, TraceContext,
+};
+use sentinel_infrastructure::{
+    WindowsNativeHealthAdapter, WindowsNativeHealthSample, WindowsNativeServiceAdapter,
+    WindowsNativeServiceBounds,
 };
 use sentinel_platform::{
-    CheckpointSupport, ContractRegistry, EventBus, PermissionResolver, PipelineDag, PipelineNode,
-    PipelineStage, PluginContext, PluginEventBatch, PluginRuntime, PolicyScope, PublishOptions,
-    ReplaySupport, Scheduler, SchedulerKind, StageBinding, TopicName, AUDIT_NATIVE_SAMPLER_RUNTIME,
-    ENDPOINT_NATIVE_HEALTH_CATEGORY_FACT, ENDPOINT_PROCESS_CATEGORY_FACT,
-    ENDPOINT_PROCESS_PARENT_CATEGORY_FACT, ENDPOINT_SERVICE_CATEGORY_FACT, NATIVE_HEALTH_METADATA,
-    NATIVE_PROCESS_METADATA, NATIVE_PROCESS_PARENT_METADATA, NATIVE_SAMPLER_RUNTIME_STATUS,
-    NATIVE_SERVICE_METADATA, SECURITY_VISIBILITY_STATUS,
+    CheckpointSupport, ContractRegistry, PermissionResolver, PluginContext, PluginEventBatch,
+    PolicyScope, PublishOptions, ReplaySupport, TopicName, AUDIT_ENDPOINT_THREAT_ANALYSIS,
+    AUDIT_NATIVE_SAMPLER_RUNTIME, ENDPOINT_NATIVE_HEALTH_CATEGORY_FACT,
+    ENDPOINT_PROCESS_CATEGORY_FACT, ENDPOINT_PROCESS_PARENT_CATEGORY_FACT,
+    ENDPOINT_SERVICE_CATEGORY_FACT, ENDPOINT_THREAT_CANDIDATE, ENDPOINT_THREAT_EVIDENCE,
+    ENDPOINT_THREAT_FINDING, ENDPOINT_THREAT_REJECTED, ENDPOINT_THREAT_RISK_HINT,
+    ENDPOINT_VISIBILITY_ADVISORY, GRAPH_HINT, NATIVE_HEALTH_METADATA, NATIVE_PROCESS_METADATA,
+    NATIVE_PROCESS_PARENT_METADATA, NATIVE_SAMPLER_RUNTIME_STATUS, NATIVE_SERVICE_METADATA,
+    SECURITY_VISIBILITY_STATUS,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,12 +59,24 @@ pub struct NativeSamplerRuntime {
     seen_generation_keys: BTreeSet<String>,
     previous_process_population: BTreeMap<ProcessAggregateKey, u32>,
     sampling_in_progress: BTreeSet<String>,
-    event_bus: EventBus,
+    event_bus: RuntimeEventBusHandle,
+    runtime_services: RuntimeServices,
     producer_plugin: PluginId,
 }
 
 impl NativeSamplerRuntime {
+    #[cfg(test)]
     pub fn from_read_state(read: &ReadOnlyCommandState) -> Self {
+        Self::from_read_state_with_services(
+            read,
+            RuntimeServices::for_test("native-sampler").expect("test runtime services"),
+        )
+    }
+
+    pub(crate) fn from_read_state_with_services(
+        read: &ReadOnlyCommandState,
+        runtime_services: RuntimeServices,
+    ) -> Self {
         Self {
             statuses: read.native_sampler_runtime_statuses.clone(),
             batches: read.native_sampler_runtime_batches.clone(),
@@ -68,7 +88,8 @@ impl NativeSamplerRuntime {
                 .collect(),
             previous_process_population: BTreeMap::new(),
             sampling_in_progress: BTreeSet::new(),
-            event_bus: EventBus::with_core_topics(),
+            event_bus: runtime_services.event_bus(),
+            runtime_services,
             producer_plugin: PluginId::new_v4(),
         }
     }
@@ -214,6 +235,8 @@ impl NativeSamplerRuntime {
             status.fact_refs = bounded_fact_refs(batch.fact_refs.clone());
             status.evidence_refs = bounded_evidence_refs(batch.evidence_refs.clone());
             status.latest_batch_id = Some(batch.batch_id.clone());
+            status.counters = batch.counters.clone();
+            status.validate().map_err(contract_error)?;
             self.upsert_status(status.clone());
             self.store_batch(batch.clone());
         }
@@ -246,82 +269,14 @@ impl NativeSamplerRuntime {
         read: &ReadOnlyCommandState,
         sampler_id: &str,
     ) -> CommandResult<NativeSamplerRuntimeStatus> {
-        if let Some(status) = self
-            .statuses
-            .iter()
-            .find(|status| status.sampler_id == sampler_id)
-            .cloned()
-        {
-            return Ok(status);
-        }
-        let detail = get_native_sampler_readiness_detail(read, sampler_id)?;
-        let implemented = detail.contract.sampler_implemented;
-        let runtime_state = if !implemented {
-            NativeSamplerRuntimeState::NotImplemented
-        } else if detail.review.readiness_state.is_blocked() {
-            NativeSamplerRuntimeState::ReadinessBlocked
-        } else if detail.review.permission_state == NativePermissionState::Revoked {
-            NativeSamplerRuntimeState::Revoked
-        } else if detail.review.allowed {
-            NativeSamplerRuntimeState::ReadyInactive
-        } else {
-            NativeSamplerRuntimeState::ReadinessBlocked
-        };
-        let provider = provider_status_for(&detail.contract.category);
-        let missing_prerequisite_flags = missing_visibility_flags_for(&detail);
-        let degraded_reason = match runtime_state {
-            NativeSamplerRuntimeState::NotImplemented => {
-                Some("sampler_not_implemented".to_string())
-            }
-            NativeSamplerRuntimeState::ReadinessBlocked => {
-                Some("sampler_readiness_blocked".to_string())
-            }
-            NativeSamplerRuntimeState::Revoked => Some("authorization_revoked".to_string()),
-            _ => None,
-        }
-        .or(provider.degraded_reason);
-        let health_state = match runtime_state {
-            NativeSamplerRuntimeState::NotImplemented => NativeRuntimeHealthState::Unsupported,
-            NativeSamplerRuntimeState::ReadinessBlocked => NativeRuntimeHealthState::Degraded,
-            NativeSamplerRuntimeState::Revoked => NativeRuntimeHealthState::Revoked,
-            _ => NativeRuntimeHealthState::Idle,
-        };
-        let status = NativeSamplerRuntimeStatus {
-            sampler_id: detail.contract.sampler_id.clone(),
-            category: detail.contract.category.clone(),
-            capability_id: detail.contract.required_capability_id.clone(),
-            readiness_state: detail.review.readiness_state.clone(),
-            runtime_state,
-            permission_state: detail.review.permission_state.clone(),
-            provider_category: provider.provider_category,
-            platform_category: provider.platform_category,
-            provider_availability_state: provider.availability_state,
-            health_state,
-            degraded_reason,
-            missing_prerequisite_flags,
-            interval_sampling_enabled: false,
-            max_records_per_sample: DEFAULT_MAX_RECORDS,
-            max_bytes_per_sample: DEFAULT_MAX_BYTES,
-            timeout_millis: DEFAULT_TIMEOUT_MS,
-            queue_size_bound: QUEUE_SIZE_BOUND,
-            latest_batch_id: None,
-            latest_sample_time_bucket: None,
-            counters: NativeSamplerCounterSummary::empty(),
-            emitted_topics: vec![NATIVE_SAMPLER_RUNTIME_STATUS.to_string()],
-            fact_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            audit_refs: detail.review.audit_refs,
-            provenance_id: PROVENANCE_ID.to_string(),
-            redaction_status: RedactionStatus::Redacted,
-            telemetry_collection_active: false,
-            response_execution_allowed: false,
-            service_installation_started: false,
-            driver_loading_started: false,
-            host_mutation_performed: false,
-            automatic_llm_calls: false,
-        };
-        status.validate().map_err(contract_error)?;
-        Ok(status)
+        status_for_detail_from_statuses(read, &self.statuses, sampler_id)
+    }
+
+    pub(crate) fn status_from_read_state(
+        read: &ReadOnlyCommandState,
+        sampler_id: &str,
+    ) -> CommandResult<NativeSamplerRuntimeStatus> {
+        status_for_detail_from_statuses(read, &read.native_sampler_runtime_statuses, sampler_id)
     }
 
     pub fn summary(
@@ -341,148 +296,44 @@ impl NativeSamplerRuntime {
                 statuses.push(self.status_for_detail(read, sampler_id)?);
             }
         }
-        let latest_batch_refs = self
-            .batches
-            .iter()
-            .rev()
-            .take(sentinel_contracts::MAX_NATIVE_RUNTIME_BATCHES)
-            .map(|batch| batch.batch_id.clone())
-            .collect::<Vec<_>>();
-        let fact_refs = bounded_fact_refs(
-            self.batches
+        native_sampler_summary_from_parts(statuses, &self.batches, &self.audit_entries)
+    }
+
+    pub(crate) fn summary_from_read_state(
+        read: &ReadOnlyCommandState,
+    ) -> CommandResult<NativeSamplerRuntimeSummary> {
+        let mut statuses = read.native_sampler_runtime_statuses.clone();
+        for sampler_id in [
+            "native_health_probe_sampler",
+            "service_metadata_sampler",
+            "process_metadata_sampler",
+        ] {
+            if !statuses
                 .iter()
-                .flat_map(|batch| batch.fact_refs.iter().cloned())
-                .collect(),
-        );
-        let evidence_refs = bounded_evidence_refs(
-            self.batches
-                .iter()
-                .flat_map(|batch| batch.evidence_refs.iter().cloned())
-                .collect(),
-        );
-        let audit_refs = self
-            .audit_entries
-            .iter()
-            .rev()
-            .take(sentinel_contracts::MAX_NATIVE_SAMPLER_REFS)
-            .map(|entry| entry.audit_id.clone())
-            .collect::<Vec<_>>();
-        let service_records = self
-            .batches
-            .iter()
-            .flat_map(|batch| batch.service_records.iter())
-            .collect::<Vec<_>>();
-        let process_records = self
-            .batches
-            .iter()
-            .flat_map(|batch| batch.process_records.iter())
-            .collect::<Vec<_>>();
-        let summary =
-            NativeSamplerRuntimeSummary {
-                runtime_count: statuses.len() as u32,
-                active_count: count_runtime(&statuses, NativeSamplerRuntimeState::Active),
-                paused_count: count_runtime(&statuses, NativeSamplerRuntimeState::Paused),
-                degraded_count: statuses
-                    .iter()
-                    .filter(|status| {
-                        matches!(
-                            status.runtime_state,
-                            NativeSamplerRuntimeState::Degraded
-                                | NativeSamplerRuntimeState::ReadinessBlocked
-                                | NativeSamplerRuntimeState::Failed
-                        )
-                    })
-                    .count() as u32,
-                stopped_count: count_runtime(&statuses, NativeSamplerRuntimeState::Stopped),
-                revoked_count: count_runtime(&statuses, NativeSamplerRuntimeState::Revoked),
-                latest_batch_refs,
-                fact_refs,
-                evidence_refs,
-                audit_refs,
-                service_category_counts: service_category_counts(&service_records),
-                service_state_counts: service_bucket_counts(service_records.iter().map(|record| {
-                    format!("{:?}", record.service_state_bucket).to_ascii_lowercase()
-                })),
-                startup_type_counts: service_bucket_counts(service_records.iter().map(|record| {
-                    format!("{:?}", record.startup_type_bucket).to_ascii_lowercase()
-                })),
-                process_category_counts: process_category_counts(
-                    process_records.iter().copied(),
-                    false,
-                ),
-                parent_process_category_counts: process_category_counts(
-                    process_records.iter().copied(),
-                    true,
-                ),
-                process_relation_counts: process_bucket_counts(
-                    process_records.iter().map(|record| {
-                        format!("{:?}", record.relation_category).to_ascii_lowercase()
-                    }),
-                ),
-                execution_context_counts: process_bucket_counts(process_records.iter().map(
-                    |record| {
-                        format!("{:?}", record.execution_context_category).to_ascii_lowercase()
-                    },
-                )),
-                process_trust_counts: process_bucket_counts(
-                    process_records
-                        .iter()
-                        .map(|record| format!("{:?}", record.trust_category).to_ascii_lowercase()),
-                ),
-                process_signedness_counts: process_bucket_counts(
-                    process_records.iter().map(|record| {
-                        format!("{:?}", record.signedness_bucket).to_ascii_lowercase()
-                    }),
-                ),
-                process_privilege_counts: process_bucket_counts(process_records.iter().map(
-                    |record| {
-                        format!("{:?}", record.privilege_context_category).to_ascii_lowercase()
-                    },
-                )),
-                process_lifecycle_counts: process_bucket_counts(process_records.iter().map(
-                    |record| format!("{:?}", record.lifecycle_state_bucket).to_ascii_lowercase(),
-                )),
-                quality_bucket: quality_bucket_for(&statuses, &self.batches),
-                service_visibility_available: self
-                    .batches
-                    .iter()
-                    .any(|batch| !batch.service_records.is_empty()),
-                native_health_visibility_available: self
-                    .batches
-                    .iter()
-                    .any(|batch| batch.health_record.is_some()),
-                process_visibility_available: self
-                    .batches
-                    .iter()
-                    .any(|batch| !batch.process_records.is_empty()),
-                parent_process_visibility_available: self.batches.iter().any(|batch| {
-                    batch.process_records.iter().any(|record| {
-                        record.parent_process_category != NativeProcessCategory::Unknown
-                    })
-                }),
-                process_network_attribution_available: false,
-                packet_visibility_available: false,
-                response_execution_allowed: false,
-                edr_coverage_claimed: false,
-                automatic_llm_calls: false,
-                statuses,
-                generated_at: Timestamp::now(),
-            };
-        summary.validate().map_err(contract_error)?;
-        Ok(summary)
+                .any(|status| status.sampler_id == sampler_id)
+            {
+                statuses.push(Self::status_from_read_state(read, sampler_id)?);
+            }
+        }
+        native_sampler_summary_from_parts(
+            statuses,
+            &read.native_sampler_runtime_batches,
+            &read.native_sampler_runtime_audit_entries,
+        )
     }
 
     pub fn latest_batch(
         &self,
         sampler_id: &str,
     ) -> CommandResult<Option<NativeSamplerRuntimeBatch>> {
-        validate_safe_request_id("native sampler id", sampler_id)?;
-        Ok(self
-            .batches
-            .iter()
-            .rev()
-            .find(|batch| batch.sampler_id == sampler_id)
-            .cloned())
+        latest_native_sampler_batch(&self.batches, sampler_id)
+    }
+
+    pub(crate) fn latest_batch_from_read_state(
+        read: &ReadOnlyCommandState,
+        sampler_id: &str,
+    ) -> CommandResult<Option<NativeSamplerRuntimeBatch>> {
+        latest_native_sampler_batch(&read.native_sampler_runtime_batches, sampler_id)
     }
 
     pub fn revoke_matching_capability(
@@ -529,7 +380,7 @@ impl NativeSamplerRuntime {
     ) -> CommandResult<NativeSamplerRuntimeBatch> {
         let started = Instant::now();
         let batch_id = NativeSamplerBatchId::new_v4();
-        let provider = provider_status_for(category);
+        let mut provider = provider_status_for(category);
         let mut counters = NativeSamplerCounterSummary::empty();
         let mut health_record = None;
         let mut service_records = Vec::new();
@@ -537,11 +388,29 @@ impl NativeSamplerRuntime {
         let mut emitted_topics = vec![NATIVE_SAMPLER_RUNTIME_STATUS.to_string()];
         match category {
             NativeSamplerCategory::NativeHealthProbeSampler => {
-                counters.sampled_record_count = 1;
-                counters.sampled_record_count_bucket = "single".to_string();
+                let sample = WindowsNativeHealthAdapter.sample();
+                provider = ProviderStatus {
+                    provider_category: sample.provider_category.clone(),
+                    platform_category: sample.platform_category.clone(),
+                    availability_state: sample.availability_state.clone(),
+                    degraded_reason: sample.degraded_reason.clone(),
+                };
+                counters.provider_enabled_count = sample.provider_enabled_count;
+                counters.raw_record_count = sample.raw_record_count;
+                counters.schema_accepted_count = sample.schema_accepted_count;
+                counters.schema_rejected_count = sample.schema_rejected_count;
+                counters.normalized_record_count = sample.normalized_record_count;
+                counters.sampled_record_count = sample.normalized_record_count;
+                counters.sampled_record_count_bucket =
+                    counter_bucket(sample.normalized_record_count);
+                counters.rejected_record_count = sample.schema_rejected_count;
+                if sample.normalized_record_count == 0 {
+                    counters.skipped_record_count = 1;
+                    counters.skipped_record_count_bucket = "single".to_string();
+                }
                 counters.duration_bucket = duration_bucket(started.elapsed().as_millis() as u64);
                 counters.bytes_processed_bucket = "metadata_only_low".to_string();
-                health_record = Some(native_health_record(status, &provider, &counters));
+                health_record = Some(native_health_record(status, &sample, &counters));
                 emitted_topics.push(NATIVE_HEALTH_METADATA.to_string());
                 emitted_topics.push(ENDPOINT_NATIVE_HEALTH_CATEGORY_FACT.to_string());
             }
@@ -551,6 +420,7 @@ impl NativeSamplerRuntime {
                     request,
                     &mut self.seen_generation_keys,
                 );
+                provider = sampled.provider;
                 counters = sampled.counters;
                 counters.duration_bucket = duration_bucket(started.elapsed().as_millis() as u64);
                 service_records = sampled.records;
@@ -640,15 +510,24 @@ impl NativeSamplerRuntime {
             }
         };
         self.publish_payload(topic, batch, "bounded native sampler metadata")?;
+        batch.counters.published_batch_count = 1;
+        batch.counters.eventbus_publication_count = 1;
         if batch.category == NativeSamplerCategory::ProcessMetadataSampler {
             self.publish_payload(
                 NATIVE_PROCESS_PARENT_METADATA,
                 batch,
                 "bounded native process parent-category metadata",
             )?;
+            batch.counters.eventbus_publication_count =
+                batch.counters.eventbus_publication_count.saturating_add(1);
         }
-        validate_native_fact_dag(topic, fact_topics_for(&batch.category))?;
+        let fact_topics = fact_topics_for(&batch.category);
+        validate_native_fact_dag(&self.runtime_services, topic, fact_topics.clone())?;
+        batch.counters.dag_dispatch_count = 1;
         let facts = self.run_fact_runtime(batch)?;
+        batch.counters.plugin_runtime_invocation_count = 1;
+        batch.counters.observations_consumed_count = 1;
+        batch.counters.facts_emitted_count = facts.len().min(u32::MAX as usize) as u32;
         for fact in facts {
             let topic = match fact.layer {
                 sentinel_contracts::SecurityLayer::AuthorizedNativeHealth => {
@@ -671,9 +550,29 @@ impl NativeSamplerRuntime {
                 }
             };
             self.publish_payload(topic, &fact, "bounded native sampler fact")?;
+            batch.counters.eventbus_publication_count =
+                batch.counters.eventbus_publication_count.saturating_add(1);
             batch.fact_refs.push(fact.fact_id.clone());
             read.security_facts.items.push(fact);
         }
+        for fact_topic in &fact_topics {
+            self.runtime_services
+                .validate_dag_route(fact_topic, endpoint_threat_output_topics())?;
+        }
+        batch.counters.dag_dispatch_count = batch.counters.dag_dispatch_count.saturating_add(1);
+        let endpoint_receipt = run_endpoint_threat_analysis_runtime_with_services(
+            read,
+            self.runtime_services.clone(),
+        )?;
+        batch.counters.detector_consumer_invocation_count = endpoint_receipt.consumer_invocations;
+        batch.counters.detector_observations_consumed_count =
+            endpoint_receipt.observations_consumed;
+        batch.counters.detector_output_count =
+            endpoint_receipt.emitted_topics.len().min(u32::MAX as usize) as u32;
+        batch.counters.eventbus_publication_count = batch
+            .counters
+            .eventbus_publication_count
+            .saturating_add(batch.counters.detector_output_count);
         batch.fact_refs = bounded_fact_refs(batch.fact_refs.clone());
         batch.validate().map_err(contract_error)?;
         Ok(())
@@ -683,68 +582,69 @@ impl NativeSamplerRuntime {
         &self,
         batch: &NativeSamplerRuntimeBatch,
     ) -> CommandResult<Vec<SecurityFact>> {
-        let mut runtime = PluginRuntime::new();
-        let plugin_id = register_static_native_sampler_fact_plugin(&mut runtime)
-            .map_err(native_runtime_error)?;
-        let manifest = runtime
-            .manifest(&plugin_id)
-            .ok_or_else(|| native_runtime_error("native sampler fact manifest missing"))?
-            .clone();
-        let contracts = contract_registry_for_manifest(&manifest)?;
-        let mut permissions = PermissionResolver::new();
-        permissions.register_plugin_manifest_permissions(&manifest);
-        let validation = runtime
-            .registry()
-            .validate_startup(&plugin_id, &contracts, &permissions)
-            .map_err(native_runtime_error)?;
-        let trace_context = TraceContext::new_root();
-        let mut context = plugin_context_for_manifest(&manifest, trace_context.clone())?;
-        context.policy_scope = PolicyScope::Plugin;
-        runtime
-            .start_plugin(&plugin_id, &validation, &mut context)
-            .map_err(native_runtime_error)?;
-        let mut plugin_batch = PluginEventBatch::new(plugin_id.clone(), 1);
-        plugin_batch
-            .push(native_runtime_event(
-                &self.producer_plugin,
-                match batch.category {
-                    NativeSamplerCategory::NativeHealthProbeSampler => NATIVE_HEALTH_METADATA,
-                    NativeSamplerCategory::ServiceMetadataSampler => NATIVE_SERVICE_METADATA,
-                    NativeSamplerCategory::ProcessMetadataSampler => NATIVE_PROCESS_METADATA,
-                    _ => {
-                        return Err(CoreError::validation_failure(
-                            "native sampler batch category is not fact-runtime publishable",
-                        ));
+        self.runtime_services.with_plugin_runtime(|runtime| {
+            let plugin_id = PluginId::parse_str(NATIVE_SAMPLER_FACT_STATIC_PLUGIN_ID)
+                .map_err(native_runtime_error)?;
+            let manifest = runtime
+                .manifest(&plugin_id)
+                .ok_or_else(|| native_runtime_error("native sampler fact manifest missing"))?
+                .clone();
+            let contracts = contract_registry_for_manifest(&manifest)?;
+            let mut permissions = PermissionResolver::new();
+            permissions.register_plugin_manifest_permissions(&manifest);
+            let validation = runtime
+                .registry()
+                .validate_startup(&plugin_id, &contracts, &permissions)
+                .map_err(native_runtime_error)?;
+            let trace_context = TraceContext::new_root();
+            let mut context = plugin_context_for_manifest(&manifest, trace_context.clone())?;
+            context.policy_scope = PolicyScope::Plugin;
+            runtime
+                .start_plugin(&plugin_id, &validation, &mut context)
+                .map_err(native_runtime_error)?;
+            let mut plugin_batch = PluginEventBatch::new(plugin_id.clone(), 1);
+            plugin_batch
+                .push(native_runtime_event(
+                    &self.producer_plugin,
+                    match batch.category {
+                        NativeSamplerCategory::NativeHealthProbeSampler => NATIVE_HEALTH_METADATA,
+                        NativeSamplerCategory::ServiceMetadataSampler => NATIVE_SERVICE_METADATA,
+                        NativeSamplerCategory::ProcessMetadataSampler => NATIVE_PROCESS_METADATA,
+                        _ => {
+                            return Err(CoreError::validation_failure(
+                                "native sampler batch category is not fact-runtime publishable",
+                            ));
+                        }
+                    },
+                    batch,
+                    &trace_context,
+                )?)
+                .map_err(native_runtime_error)?;
+            let output = runtime
+                .process_batch(&plugin_id, &mut context, &plugin_batch)
+                .map_err(native_runtime_error)?;
+            let mut facts = Vec::new();
+            for event in output.events {
+                match event.event_type.as_str() {
+                    ENDPOINT_NATIVE_HEALTH_CATEGORY_FACT
+                    | ENDPOINT_SERVICE_CATEGORY_FACT
+                    | ENDPOINT_PROCESS_CATEGORY_FACT
+                    | ENDPOINT_PROCESS_PARENT_CATEGORY_FACT => {
+                        facts.push(
+                            serde_json::from_value::<SecurityFact>(event.payload)
+                                .map_err(native_runtime_error)?,
+                        );
                     }
-                },
-                batch,
-                &trace_context,
-            )?)
-            .map_err(native_runtime_error)?;
-        let output = runtime
-            .process_batch(&plugin_id, &mut context, &plugin_batch)
-            .map_err(native_runtime_error)?;
-        let mut facts = Vec::new();
-        for event in output.events {
-            match event.event_type.as_str() {
-                ENDPOINT_NATIVE_HEALTH_CATEGORY_FACT
-                | ENDPOINT_SERVICE_CATEGORY_FACT
-                | ENDPOINT_PROCESS_CATEGORY_FACT
-                | ENDPOINT_PROCESS_PARENT_CATEGORY_FACT => {
-                    facts.push(
-                        serde_json::from_value::<SecurityFact>(event.payload)
-                            .map_err(native_runtime_error)?,
-                    );
-                }
-                other => {
-                    return Err(CoreError::validation_failure(
-                        "native sampler fact runtime emitted undeclared output",
-                    )
-                    .with_redacted_details(json!({ "topic": other })));
+                    other => {
+                        return Err(CoreError::validation_failure(
+                            "native sampler fact runtime emitted undeclared output",
+                        )
+                        .with_redacted_details(json!({ "topic": other })));
+                    }
                 }
             }
-        }
-        Ok(facts)
+            Ok(facts)
+        })
     }
 
     fn publish_status(&mut self, status: &NativeSamplerRuntimeStatus) -> CommandResult<()> {
@@ -827,58 +727,269 @@ fn fact_topics_for(category: &NativeSamplerCategory) -> Vec<&'static str> {
     }
 }
 
-fn validate_native_fact_dag(input_topic: &str, output_topics: Vec<&str>) -> CommandResult<()> {
+fn endpoint_threat_output_topics() -> &'static [&'static str] {
+    &[
+        ENDPOINT_THREAT_CANDIDATE,
+        ENDPOINT_THREAT_FINDING,
+        ENDPOINT_THREAT_EVIDENCE,
+        ENDPOINT_THREAT_RISK_HINT,
+        ENDPOINT_VISIBILITY_ADVISORY,
+        ENDPOINT_THREAT_REJECTED,
+        GRAPH_HINT,
+        AUDIT_ENDPOINT_THREAT_ANALYSIS,
+    ]
+}
+
+fn status_for_detail_from_statuses(
+    read: &ReadOnlyCommandState,
+    statuses: &[NativeSamplerRuntimeStatus],
+    sampler_id: &str,
+) -> CommandResult<NativeSamplerRuntimeStatus> {
+    if let Some(status) = statuses
+        .iter()
+        .find(|status| status.sampler_id == sampler_id)
+        .cloned()
+    {
+        return Ok(status);
+    }
+    let detail = get_native_sampler_readiness_detail(read, sampler_id)?;
+    let runtime_state = if !detail.contract.sampler_implemented {
+        NativeSamplerRuntimeState::NotImplemented
+    } else if detail.review.readiness_state.is_blocked() {
+        NativeSamplerRuntimeState::ReadinessBlocked
+    } else if detail.review.permission_state == NativePermissionState::Revoked {
+        NativeSamplerRuntimeState::Revoked
+    } else if detail.review.allowed {
+        NativeSamplerRuntimeState::ReadyInactive
+    } else {
+        NativeSamplerRuntimeState::ReadinessBlocked
+    };
+    let provider = provider_status_for(&detail.contract.category);
+    let degraded_reason = match runtime_state {
+        NativeSamplerRuntimeState::NotImplemented => Some("sampler_not_implemented".to_string()),
+        NativeSamplerRuntimeState::ReadinessBlocked => {
+            Some("sampler_readiness_blocked".to_string())
+        }
+        NativeSamplerRuntimeState::Revoked => Some("authorization_revoked".to_string()),
+        _ => None,
+    }
+    .or(provider.degraded_reason);
+    let health_state = match runtime_state {
+        NativeSamplerRuntimeState::NotImplemented => NativeRuntimeHealthState::Unsupported,
+        NativeSamplerRuntimeState::ReadinessBlocked => NativeRuntimeHealthState::Degraded,
+        NativeSamplerRuntimeState::Revoked => NativeRuntimeHealthState::Revoked,
+        _ => NativeRuntimeHealthState::Idle,
+    };
+    let status = NativeSamplerRuntimeStatus {
+        sampler_id: detail.contract.sampler_id.clone(),
+        category: detail.contract.category.clone(),
+        capability_id: detail.contract.required_capability_id.clone(),
+        readiness_state: detail.review.readiness_state.clone(),
+        runtime_state,
+        permission_state: detail.review.permission_state.clone(),
+        provider_category: provider.provider_category,
+        platform_category: provider.platform_category,
+        provider_availability_state: provider.availability_state,
+        health_state,
+        degraded_reason,
+        missing_prerequisite_flags: missing_visibility_flags_for(&detail),
+        interval_sampling_enabled: false,
+        max_records_per_sample: DEFAULT_MAX_RECORDS,
+        max_bytes_per_sample: DEFAULT_MAX_BYTES,
+        timeout_millis: DEFAULT_TIMEOUT_MS,
+        queue_size_bound: QUEUE_SIZE_BOUND,
+        latest_batch_id: None,
+        latest_sample_time_bucket: None,
+        counters: NativeSamplerCounterSummary::empty(),
+        emitted_topics: vec![NATIVE_SAMPLER_RUNTIME_STATUS.to_string()],
+        fact_refs: Vec::new(),
+        evidence_refs: Vec::new(),
+        audit_refs: detail.review.audit_refs,
+        provenance_id: PROVENANCE_ID.to_string(),
+        redaction_status: RedactionStatus::Redacted,
+        telemetry_collection_active: false,
+        response_execution_allowed: false,
+        service_installation_started: false,
+        driver_loading_started: false,
+        host_mutation_performed: false,
+        automatic_llm_calls: false,
+    };
+    status.validate().map_err(contract_error)?;
+    Ok(status)
+}
+
+fn native_sampler_summary_from_parts(
+    statuses: Vec<NativeSamplerRuntimeStatus>,
+    batches: &[NativeSamplerRuntimeBatch],
+    audit_entries: &[NativeSamplerRuntimeAuditEntry],
+) -> CommandResult<NativeSamplerRuntimeSummary> {
+    let latest_batch_refs = batches
+        .iter()
+        .rev()
+        .take(sentinel_contracts::MAX_NATIVE_RUNTIME_BATCHES)
+        .map(|batch| batch.batch_id.clone())
+        .collect::<Vec<_>>();
+    let fact_refs = bounded_fact_refs(
+        batches
+            .iter()
+            .flat_map(|batch| batch.fact_refs.iter().cloned())
+            .collect(),
+    );
+    let evidence_refs = bounded_evidence_refs(
+        batches
+            .iter()
+            .flat_map(|batch| batch.evidence_refs.iter().cloned())
+            .collect(),
+    );
+    let audit_refs = audit_entries
+        .iter()
+        .rev()
+        .take(sentinel_contracts::MAX_NATIVE_SAMPLER_REFS)
+        .map(|entry| entry.audit_id.clone())
+        .collect::<Vec<_>>();
+    let service_records = batches
+        .iter()
+        .flat_map(|batch| batch.service_records.iter())
+        .collect::<Vec<_>>();
+    let process_records = batches
+        .iter()
+        .flat_map(|batch| batch.process_records.iter())
+        .collect::<Vec<_>>();
+    let summary = NativeSamplerRuntimeSummary {
+        runtime_count: statuses.len() as u32,
+        active_count: count_runtime(&statuses, NativeSamplerRuntimeState::Active),
+        paused_count: count_runtime(&statuses, NativeSamplerRuntimeState::Paused),
+        degraded_count: statuses
+            .iter()
+            .filter(|status| {
+                matches!(
+                    status.runtime_state,
+                    NativeSamplerRuntimeState::Degraded
+                        | NativeSamplerRuntimeState::ReadinessBlocked
+                        | NativeSamplerRuntimeState::Failed
+                )
+            })
+            .count() as u32,
+        stopped_count: count_runtime(&statuses, NativeSamplerRuntimeState::Stopped),
+        revoked_count: count_runtime(&statuses, NativeSamplerRuntimeState::Revoked),
+        latest_batch_refs,
+        fact_refs,
+        evidence_refs,
+        audit_refs,
+        service_category_counts: service_category_counts(&service_records),
+        service_state_counts: service_bucket_counts(
+            service_records
+                .iter()
+                .map(|record| format!("{:?}", record.service_state_bucket).to_ascii_lowercase()),
+        ),
+        startup_type_counts: service_bucket_counts(
+            service_records
+                .iter()
+                .map(|record| format!("{:?}", record.startup_type_bucket).to_ascii_lowercase()),
+        ),
+        process_category_counts: process_category_counts(process_records.iter().copied(), false),
+        parent_process_category_counts: process_category_counts(
+            process_records.iter().copied(),
+            true,
+        ),
+        process_relation_counts: process_bucket_counts(
+            process_records
+                .iter()
+                .map(|record| format!("{:?}", record.relation_category).to_ascii_lowercase()),
+        ),
+        execution_context_counts: process_bucket_counts(
+            process_records.iter().map(|record| {
+                format!("{:?}", record.execution_context_category).to_ascii_lowercase()
+            }),
+        ),
+        process_trust_counts: process_bucket_counts(
+            process_records
+                .iter()
+                .map(|record| format!("{:?}", record.trust_category).to_ascii_lowercase()),
+        ),
+        process_signedness_counts: process_bucket_counts(
+            process_records
+                .iter()
+                .map(|record| format!("{:?}", record.signedness_bucket).to_ascii_lowercase()),
+        ),
+        process_privilege_counts: process_bucket_counts(
+            process_records.iter().map(|record| {
+                format!("{:?}", record.privilege_context_category).to_ascii_lowercase()
+            }),
+        ),
+        process_lifecycle_counts: process_bucket_counts(
+            process_records
+                .iter()
+                .map(|record| format!("{:?}", record.lifecycle_state_bucket).to_ascii_lowercase()),
+        ),
+        quality_bucket: quality_bucket_for(&statuses, batches),
+        service_visibility_available: batches
+            .iter()
+            .any(|batch| !batch.service_records.is_empty()),
+        native_health_visibility_available: batches
+            .iter()
+            .any(|batch| batch.health_record.is_some()),
+        process_visibility_available: batches
+            .iter()
+            .any(|batch| !batch.process_records.is_empty()),
+        parent_process_visibility_available: batches.iter().any(|batch| {
+            batch
+                .process_records
+                .iter()
+                .any(|record| record.parent_process_category != NativeProcessCategory::Unknown)
+        }),
+        process_network_attribution_available: false,
+        packet_visibility_available: false,
+        response_execution_allowed: false,
+        edr_coverage_claimed: false,
+        automatic_llm_calls: false,
+        statuses,
+        generated_at: Timestamp::now(),
+    };
+    summary.validate().map_err(contract_error)?;
+    Ok(summary)
+}
+
+fn latest_native_sampler_batch(
+    batches: &[NativeSamplerRuntimeBatch],
+    sampler_id: &str,
+) -> CommandResult<Option<NativeSamplerRuntimeBatch>> {
+    validate_safe_request_id("native sampler id", sampler_id)?;
+    Ok(batches
+        .iter()
+        .rev()
+        .find(|batch| batch.sampler_id == sampler_id)
+        .cloned())
+}
+
+fn validate_native_fact_dag(
+    runtime_services: &RuntimeServices,
+    input_topic: &str,
+    output_topics: Vec<&str>,
+) -> CommandResult<()> {
     if output_topics.is_empty() {
         return Err(CoreError::validation_failure(
             "native sampler DAG requires declared fact outputs",
         ));
     }
-    let input = TopicName::new(input_topic).map_err(contract_error)?;
+    TopicName::new(input_topic).map_err(contract_error)?;
     let outputs = output_topics
-        .into_iter()
-        .map(TopicName::new)
+        .iter()
+        .map(|topic| TopicName::new(*topic))
         .collect::<Result<Vec<_>, _>>()
         .map_err(contract_error)?;
-    let mut dag =
-        PipelineDag::new("authorized_native_sampler_runtime").map_err(native_runtime_error)?;
-    let source_id = dag
-        .add_node(
-            PipelineNode::new(
-                "native_sampler_eventbus_source",
-                PipelineStage::Source,
-                StageBinding::metadata_only(Vec::new(), vec![input.clone()]),
-            )
-            .map_err(native_runtime_error)?,
-        )
-        .map_err(native_runtime_error)?;
-    let fact_runtime_id = dag
-        .add_node(
-            PipelineNode::new(
-                "native_sampler_static_fact_runtime",
-                PipelineStage::Detection,
-                StageBinding::metadata_only(vec![input], outputs),
-            )
-            .map_err(native_runtime_error)?
-            .depends_on(source_id),
-        )
-        .map_err(native_runtime_error)?;
-    let scheduler = Scheduler::new(SchedulerKind::Periodic);
-    let plan = scheduler.build_plan(&dag).map_err(native_runtime_error)?;
-    let mut completed = Vec::new();
-    while completed.len() < plan.steps.len() {
-        let decision = scheduler.decide_ready(&plan, &completed, 0, None);
-        let Some(node_id) = decision.ready_nodes.first() else {
-            return Err(CoreError::validation_failure(
-                "native sampler DAG did not produce a ready runtime node",
-            ));
-        };
-        completed.push(node_id.clone());
-    }
-    if !completed.contains(&fact_runtime_id) {
+    if outputs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != outputs.len()
+    {
         return Err(CoreError::validation_failure(
-            "native sampler DAG did not dispatch the static fact runtime",
+            "native sampler runtime requires unique declared fact outputs",
         ));
     }
+    runtime_services.validate_dag_route(input_topic, &output_topics)?;
     Ok(())
 }
 
@@ -892,6 +1003,7 @@ struct ProviderStatus {
 
 #[derive(Clone, Debug)]
 struct ServiceSample {
+    provider: ProviderStatus,
     records: Vec<NativeServiceMetadataRecord>,
     counters: NativeSamplerCounterSummary,
 }
@@ -900,14 +1012,6 @@ struct ServiceSample {
 struct ProcessSample {
     records: Vec<NativeProcessMetadataRecord>,
     counters: NativeSamplerCounterSummary,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ServiceAggregateKey {
-    category: NativeServiceCategory,
-    state: NativeServiceStateBucket,
-    startup: NativeServiceStartupTypeBucket,
-    trust: NativeServiceTrustCategory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -954,6 +1058,12 @@ trait NativeProcessCategoryProvider {
 #[cfg(windows)]
 fn provider_status_for(category: &NativeSamplerCategory) -> ProviderStatus {
     match category {
+        NativeSamplerCategory::NativeHealthProbeSampler => ProviderStatus {
+            provider_category: NativeProviderCategory::WindowsSystemHealthSnapshot,
+            platform_category: NativeRuntimePlatformCategory::Windows,
+            availability_state: NativeProviderAvailabilityState::Available,
+            degraded_reason: None,
+        },
         NativeSamplerCategory::ProcessMetadataSampler => ProviderStatus {
             provider_category: NativeProviderCategory::WindowsToolhelpProcessSnapshot,
             platform_category: NativeRuntimePlatformCategory::Windows,
@@ -981,23 +1091,22 @@ fn provider_status_for(_category: &NativeSamplerCategory) -> ProviderStatus {
 
 fn native_health_record(
     status: &NativeSamplerRuntimeStatus,
-    provider: &ProviderStatus,
+    sample: &WindowsNativeHealthSample,
     counters: &NativeSamplerCounterSummary,
 ) -> NativeHealthMetadataRecord {
     NativeHealthMetadataRecord {
         health_observation_id: NativeHealthObservationId::new_v4(),
         sampler_id: status.sampler_id.clone(),
-        provider_category: provider.provider_category.clone(),
-        platform_category: provider.platform_category.clone(),
-        provider_availability_state: provider.availability_state.clone(),
+        provider_category: sample.provider_category.clone(),
+        platform_category: sample.platform_category.clone(),
+        provider_availability_state: sample.availability_state.clone(),
         authorization_state: status.permission_state.clone(),
         runtime_state: status.runtime_state.clone(),
-        health_state: if provider.availability_state == NativeProviderAvailabilityState::Available {
-            NativeRuntimeHealthState::Healthy
-        } else {
-            NativeRuntimeHealthState::Degraded
-        },
-        degraded_reason: provider.degraded_reason.clone(),
+        health_state: sample.health_state.clone(),
+        resource_pressure_bucket: sample.resource_pressure_bucket.clone(),
+        uptime_bucket: sample.uptime_bucket.clone(),
+        freshness_bucket: sample.freshness_bucket.clone(),
+        degraded_reason: sample.degraded_reason.clone(),
         missing_prerequisite_flags: status.missing_prerequisite_flags.clone(),
         sample_duration_bucket: counters.duration_bucket.clone(),
         sampled_record_count_bucket: counters.sampled_record_count_bucket.clone(),
@@ -1010,157 +1119,82 @@ fn native_health_record(
         provenance_id: DataSourceId::new_v4().to_string(),
         audit_refs: status.audit_refs.clone(),
         redaction_status: RedactionStatus::Redacted,
-        quality_score: if provider.availability_state == NativeProviderAvailabilityState::Available
-        {
-            quality(0.74)
-        } else {
-            quality(0.35)
+        quality_score: match (
+            &sample.availability_state,
+            &sample.health_state,
+            &sample.freshness_bucket,
+        ) {
+            (
+                NativeProviderAvailabilityState::Available,
+                NativeRuntimeHealthState::Healthy,
+                NativeSampleFreshnessBucket::Current,
+            ) => quality(0.86),
+            (NativeProviderAvailabilityState::Available, _, _) => quality(0.68),
+            _ => quality(0.35),
         },
     }
 }
 
-#[cfg(windows)]
 fn sample_service_metadata(
     batch_id: NativeSamplerBatchId,
     request: &NativeSamplerRuntimeActionRequest,
     seen_generation_keys: &mut BTreeSet<String>,
 ) -> ServiceSample {
-    use std::ptr::{null, null_mut};
-    use std::slice;
-    use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
+    let sample = WindowsNativeServiceAdapter.sample(WindowsNativeServiceBounds {
+        max_records: request.max_records_per_sample,
+        max_bytes: request.max_bytes_per_sample,
+        timeout_millis: request.timeout_millis,
+        cancellation_requested: false,
+    });
+    let provider = ProviderStatus {
+        provider_category: sample.provider_category.clone(),
+        platform_category: sample.platform_category.clone(),
+        availability_state: sample.availability_state.clone(),
+        degraded_reason: sample.degraded_reason.clone(),
     };
-    use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
-        SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_STATE_ALL, SERVICE_WIN32,
-    };
-
     let mut counters = NativeSamplerCounterSummary::empty();
-    counters.bytes_processed_bucket = "metadata_only_low".to_string();
-    let mut aggregates = BTreeMap::<ServiceAggregateKey, u32>::new();
-    unsafe {
-        let scm = OpenSCManagerW(null(), null(), SC_MANAGER_ENUMERATE_SERVICE);
-        if scm.is_null() {
-            counters.rejected_record_count = 1;
-            counters.skipped_record_count_bucket = "single".to_string();
-            return ServiceSample {
-                records: Vec::new(),
-                counters,
-            };
-        }
-        let mut bytes_needed = 0u32;
-        let mut services_returned = 0u32;
-        let mut resume_handle = 0u32;
-        let _ = EnumServicesStatusExW(
-            scm,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_STATE_ALL,
-            null_mut(),
-            0,
-            &mut bytes_needed,
-            &mut services_returned,
-            &mut resume_handle,
-            null(),
-        );
-        let error = GetLastError();
-        if bytes_needed == 0
-            || !(error == ERROR_MORE_DATA || error == ERROR_INSUFFICIENT_BUFFER)
-            || bytes_needed > request.max_bytes_per_sample
-        {
-            CloseServiceHandle(scm);
-            counters.rejected_record_count = 1;
-            counters.skipped_record_count_bucket = "single".to_string();
-            counters.bytes_processed_bucket = if bytes_needed > request.max_bytes_per_sample {
-                "oversized_rejected".to_string()
-            } else {
-                "metadata_only_low".to_string()
-            };
-            return ServiceSample {
-                records: Vec::new(),
-                counters,
-            };
-        }
-        let mut buffer = vec![0u8; bytes_needed as usize];
-        let ok = EnumServicesStatusExW(
-            scm,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_STATE_ALL,
-            buffer.as_mut_ptr(),
-            bytes_needed,
-            &mut bytes_needed,
-            &mut services_returned,
-            &mut resume_handle,
-            null(),
-        );
-        if ok == 0 {
-            CloseServiceHandle(scm);
-            counters.rejected_record_count = 1;
-            counters.skipped_record_count_bucket = "single".to_string();
-            return ServiceSample {
-                records: Vec::new(),
-                counters,
-            };
-        }
-        let services = slice::from_raw_parts(
-            buffer.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW,
-            services_returned as usize,
-        );
-        for service in services
-            .iter()
-            .take(request.max_records_per_sample as usize)
-        {
-            let raw_name = wide_ptr_to_string(service.lpServiceName);
-            let raw_display = wide_ptr_to_string(service.lpDisplayName);
-            let category = classify_service(&raw_name, &raw_display);
-            let state = state_bucket(service.ServiceStatusProcess.dwCurrentState);
-            let startup = startup_bucket(scm, service.lpServiceName);
-            let trust = trust_category(&category);
-            let key = ServiceAggregateKey {
-                category,
-                state,
-                startup,
-                trust,
-            };
-            *aggregates.entry(key).or_insert(0) += 1;
-            counters.sampled_record_count = counters.sampled_record_count.saturating_add(1);
-        }
-        if services_returned > request.max_records_per_sample {
-            counters.skipped_record_count = services_returned - request.max_records_per_sample;
-        }
-        CloseServiceHandle(scm);
-    }
+    counters.provider_enabled_count = sample.provider_enabled_count;
+    counters.raw_record_count = sample.raw_record_count;
+    counters.schema_accepted_count = sample.schema_accepted_count;
+    counters.schema_rejected_count = sample.schema_rejected_count;
+    counters.rate_limited_count = sample.rate_limited_count;
+    counters.queue_dropped_count = sample.queue_dropped_count;
+    counters.normalized_record_count = sample.normalized_record_count;
+    counters.sampled_record_count = sample.schema_accepted_count;
+    counters.skipped_record_count = sample.skipped_record_count;
+    counters.malformed_record_count = sample.malformed_record_count;
+    counters.rejected_record_count = sample.rejected_record_count;
+    counters.timeout_count = sample.timeout_count;
     counters.sampled_record_count_bucket = counter_bucket(counters.sampled_record_count);
     counters.skipped_record_count_bucket = counter_bucket(counters.skipped_record_count);
-    counters.bytes_processed_bucket = "metadata_only_low".to_string();
-    let unknown = aggregates
-        .iter()
-        .filter(|(key, _)| key.category == NativeServiceCategory::Unknown)
-        .map(|(_, count)| *count)
-        .sum::<u32>();
-    counters.unknown_category_ratio_bucket = ratio_bucket(unknown, counters.sampled_record_count);
-    let records = aggregates
+    counters.bytes_processed_bucket = sample.bytes_processed_bucket;
+    counters.unknown_category_ratio_bucket = sample.unknown_category_ratio_bucket;
+    let records = sample
+        .aggregates
         .into_iter()
-        .map(|(key, count)| {
+        .map(|aggregate| {
             let generation_key = format!(
                 "service_metadata_sampler:{:?}:{:?}:{:?}:{:?}:{}",
-                key.category, key.state, key.startup, key.trust, CURRENT_SESSION_BUCKET
+                aggregate.service_category,
+                aggregate.service_state_bucket,
+                aggregate.startup_type_bucket,
+                aggregate.trust_category,
+                CURRENT_SESSION_BUCKET
             );
             let first_seen = seen_generation_keys.insert(generation_key);
-            let host_criticality_category = host_criticality(&key.category);
-            let category_unknown = key.category == NativeServiceCategory::Unknown;
+            let host_criticality_category = host_criticality(&aggregate.service_category);
+            let category_unknown = aggregate.service_category == NativeServiceCategory::Unknown;
             NativeServiceMetadataRecord {
                 service_observation_id: NativeServiceObservationId::new_v4(),
-                service_category: key.category,
-                service_state_bucket: key.state,
-                startup_type_bucket: key.startup,
-                trust_category: key.trust,
+                service_category: aggregate.service_category,
+                service_state_bucket: aggregate.service_state_bucket,
+                startup_type_bucket: aggregate.startup_type_bucket,
+                trust_category: aggregate.trust_category,
                 signedness_bucket: NativeSignednessBucket::NotChecked,
                 privilege_context_category: NativePrivilegeContextCategory::Unknown,
                 host_criticality_category,
                 first_seen_in_session: first_seen,
-                count_bucket: counter_bucket(count),
+                count_bucket: counter_bucket(aggregate.observation_count),
                 changed_state: false,
                 sampler_id: "service_metadata_sampler".to_string(),
                 sample_batch_id: batch_id.clone(),
@@ -1180,23 +1214,9 @@ fn sample_service_metadata(
             }
         })
         .collect::<Vec<_>>();
-    ServiceSample { records, counters }
-}
-
-#[cfg(not(windows))]
-fn sample_service_metadata(
-    _batch_id: NativeSamplerBatchId,
-    _request: &NativeSamplerRuntimeActionRequest,
-    _seen_generation_keys: &mut BTreeSet<String>,
-) -> ServiceSample {
-    let mut counters = NativeSamplerCounterSummary::empty();
-    counters.rejected_record_count = 1;
-    counters.skipped_record_count = 1;
-    counters.skipped_record_count_bucket = "single".to_string();
-    counters.bytes_processed_bucket = "none".to_string();
-    counters.unknown_category_ratio_bucket = "unknown".to_string();
     ServiceSample {
-        records: Vec::new(),
+        provider,
+        records,
         counters,
     }
 }
@@ -1272,6 +1292,17 @@ fn sample_process_metadata(
         ));
     }
 
+    if counters.provider_enabled_count == 0 && !records.is_empty() {
+        counters.provider_enabled_count = 1;
+    }
+    if counters.raw_record_count == 0 {
+        counters.raw_record_count = counters.sampled_record_count;
+    }
+    if counters.schema_accepted_count == 0 {
+        counters.schema_accepted_count = counters.sampled_record_count;
+    }
+    counters.normalized_record_count = records.len().min(u32::MAX as usize) as u32;
+    counters.sampled_record_count_bucket = counter_bucket(counters.sampled_record_count);
     counters.skipped_record_count_bucket = counter_bucket(counters.skipped_record_count);
     *previous_population = current_population;
     ProcessSample { records, counters }
@@ -1385,6 +1416,7 @@ impl NativeProcessCategoryProvider for WindowsToolhelpProcessCategoryProvider {
                     counters,
                 };
             }
+            counters.provider_enabled_count = 1;
             let mut entry: PROCESSENTRY32W = std::mem::zeroed();
             entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
             let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
@@ -1403,6 +1435,8 @@ impl NativeProcessCategoryProvider for WindowsToolhelpProcessCategoryProvider {
                     break;
                 }
                 let category = classify_process(&wide_array_to_string(&entry.szExeFile));
+                counters.raw_record_count = counters.raw_record_count.saturating_add(1);
+                counters.schema_accepted_count = counters.schema_accepted_count.saturating_add(1);
                 classified.push((entry.th32ProcessID, entry.th32ParentProcessID, category));
                 entry.szExeFile.fill(0);
                 has_entry = Process32NextW(snapshot, &mut entry) != 0;
@@ -1429,6 +1463,7 @@ impl NativeProcessCategoryProvider for WindowsToolhelpProcessCategoryProvider {
         }
         counters.sampled_record_count_bucket = counter_bucket(counters.sampled_record_count);
         counters.skipped_record_count_bucket = counter_bucket(counters.skipped_record_count);
+        counters.normalized_record_count = aggregates.len().min(u32::MAX as usize) as u32;
         counters.unknown_category_ratio_bucket =
             ratio_bucket(unknown_count, counters.sampled_record_count);
         counters.duration_bucket = duration_bucket(started.elapsed().as_millis() as u64);
@@ -1456,62 +1491,6 @@ impl NativeProcessCategoryProvider for UnsupportedProcessCategoryProvider {
             counters,
         }
     }
-}
-
-#[cfg(windows)]
-unsafe fn startup_bucket(
-    scm: windows_sys::Win32::System::Services::SC_HANDLE,
-    service_name: *const u16,
-) -> NativeServiceStartupTypeBucket {
-    use windows_sys::Win32::System::Services::{
-        CloseServiceHandle, OpenServiceW, QueryServiceConfigW, QUERY_SERVICE_CONFIGW,
-        SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_DISABLED,
-        SERVICE_QUERY_CONFIG, SERVICE_SYSTEM_START,
-    };
-    let handle = OpenServiceW(scm, service_name, SERVICE_QUERY_CONFIG);
-    if handle.is_null() {
-        return NativeServiceStartupTypeBucket::Unknown;
-    }
-    let mut needed = 0u32;
-    let _ = QueryServiceConfigW(handle, std::ptr::null_mut(), 0, &mut needed);
-    if needed == 0 || needed > 16_384 {
-        CloseServiceHandle(handle);
-        return NativeServiceStartupTypeBucket::Unknown;
-    }
-    let mut buffer = vec![0u8; needed as usize];
-    let ok = QueryServiceConfigW(
-        handle,
-        buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
-        needed,
-        &mut needed,
-    );
-    if ok == 0 {
-        CloseServiceHandle(handle);
-        return NativeServiceStartupTypeBucket::Unknown;
-    }
-    let config = &*(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-    let bucket = match config.dwStartType {
-        SERVICE_AUTO_START | SERVICE_BOOT_START | SERVICE_SYSTEM_START => {
-            NativeServiceStartupTypeBucket::Automatic
-        }
-        SERVICE_DEMAND_START => NativeServiceStartupTypeBucket::Manual,
-        SERVICE_DISABLED => NativeServiceStartupTypeBucket::Disabled,
-        _ => NativeServiceStartupTypeBucket::Unknown,
-    };
-    CloseServiceHandle(handle);
-    bucket
-}
-
-#[cfg(windows)]
-unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0usize;
-    while *ptr.add(len) != 0 && len < 256 {
-        len += 1;
-    }
-    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
 }
 
 #[cfg(windows)]
@@ -1620,6 +1599,11 @@ fn classify_process(raw_name: &str) -> NativeProcessCategory {
 #[cfg(windows)]
 fn matches_any(value: &str, allowlist: &[&str]) -> bool {
     allowlist.contains(&value)
+}
+
+#[cfg(windows)]
+fn contains_any(value: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| value.contains(marker))
 }
 
 fn process_relation_category(
@@ -1731,75 +1715,6 @@ fn process_session_context(category: &NativeProcessCategory) -> NativeSessionCon
     }
 }
 
-#[cfg(windows)]
-fn state_bucket(state: u32) -> NativeServiceStateBucket {
-    use windows_sys::Win32::System::Services::{
-        SERVICE_CONTINUE_PENDING, SERVICE_PAUSED, SERVICE_PAUSE_PENDING, SERVICE_RUNNING,
-        SERVICE_START_PENDING, SERVICE_STOPPED, SERVICE_STOP_PENDING,
-    };
-    match state {
-        SERVICE_RUNNING => NativeServiceStateBucket::Running,
-        SERVICE_STOPPED => NativeServiceStateBucket::Stopped,
-        SERVICE_PAUSED => NativeServiceStateBucket::Paused,
-        SERVICE_START_PENDING
-        | SERVICE_STOP_PENDING
-        | SERVICE_PAUSE_PENDING
-        | SERVICE_CONTINUE_PENDING => NativeServiceStateBucket::Transitional,
-        _ => NativeServiceStateBucket::Unknown,
-    }
-}
-
-#[cfg(windows)]
-fn classify_service(raw_name: &str, raw_display: &str) -> NativeServiceCategory {
-    let value = format!("{} {}", raw_name, raw_display).to_ascii_lowercase();
-    if contains_any(
-        &value,
-        &["windefend", "security", "wscsvc", "mpssvc", "sense"],
-    ) {
-        NativeServiceCategory::Security
-    } else if contains_any(&value, &["termservice", "winrm", "remote", "ssh"]) {
-        NativeServiceCategory::RemoteManagement
-    } else if contains_any(
-        &value,
-        &[
-            "dnscache", "dhcp", "netlogon", "nsi", "tcpip", "wlan", "network",
-        ],
-    ) {
-        NativeServiceCategory::Network
-    } else if contains_any(&value, &["wuauserv", "bits", "update", "trustedinstaller"]) {
-        NativeServiceCategory::Update
-    } else if contains_any(&value, &["vss", "stor", "disk", "defrag", "volume"]) {
-        NativeServiceCategory::Storage
-    } else if contains_any(
-        &value,
-        &[
-            "rpc", "eventlog", "plugplay", "profsvc", "dcom", "winmgmt", "schedule",
-        ],
-    ) {
-        NativeServiceCategory::OperatingSystemCore
-    } else if contains_any(&value, &["spooler", "msi", "app", "browser"]) {
-        NativeServiceCategory::ApplicationSupport
-    } else {
-        NativeServiceCategory::Unknown
-    }
-}
-
-#[cfg(windows)]
-fn contains_any(value: &str, markers: &[&str]) -> bool {
-    markers.iter().any(|marker| value.contains(marker))
-}
-
-fn trust_category(category: &NativeServiceCategory) -> NativeServiceTrustCategory {
-    match category {
-        NativeServiceCategory::OperatingSystemCore
-        | NativeServiceCategory::Update
-        | NativeServiceCategory::Storage => NativeServiceTrustCategory::OperatingSystemOwned,
-        NativeServiceCategory::Security => NativeServiceTrustCategory::SecurityRelevant,
-        NativeServiceCategory::Unknown => NativeServiceTrustCategory::Unknown,
-        _ => NativeServiceTrustCategory::ThirdPartyCategory,
-    }
-}
-
 fn host_criticality(category: &NativeServiceCategory) -> NativeHostCriticalityCategory {
     match category {
         NativeServiceCategory::OperatingSystemCore | NativeServiceCategory::Security => {
@@ -1889,30 +1804,43 @@ fn status_after_batch(
     batch: &NativeSamplerRuntimeBatch,
     telemetry_collection_started: bool,
 ) -> NativeSamplerRuntimeStatus {
-    status.runtime_state =
-        if batch.counters.rejected_record_count > 0 && !batch_has_metadata_records(batch) {
-            NativeSamplerRuntimeState::Degraded
-        } else {
-            NativeSamplerRuntimeState::Idle
-        };
-    status.health_state =
-        if batch.counters.rejected_record_count > 0 && !batch_has_metadata_records(batch) {
-            NativeRuntimeHealthState::Degraded
-        } else {
-            NativeRuntimeHealthState::Healthy
-        };
+    let provider_degraded = batch.counters.rejected_record_count > 0
+        && (batch.counters.normalized_record_count == 0 || !batch_has_metadata_records(batch));
+    status.runtime_state = if provider_degraded {
+        NativeSamplerRuntimeState::Degraded
+    } else {
+        NativeSamplerRuntimeState::Idle
+    };
+    status.health_state = batch
+        .health_record
+        .as_ref()
+        .map(|record| record.health_state.clone())
+        .unwrap_or_else(|| {
+            if provider_degraded {
+                NativeRuntimeHealthState::Degraded
+            } else {
+                NativeRuntimeHealthState::Healthy
+            }
+        });
     status.provider_category = batch.provider_category.clone();
     status.platform_category = batch.platform_category.clone();
-    status.provider_availability_state = provider_status_for(&batch.category).availability_state;
+    status.provider_availability_state = batch
+        .health_record
+        .as_ref()
+        .map(|record| record.provider_availability_state.clone())
+        .unwrap_or_else(|| provider_status_for(&batch.category).availability_state);
     status.latest_batch_id = Some(batch.batch_id.clone());
     status.latest_sample_time_bucket = Some(CURRENT_SESSION_BUCKET.to_string());
     status.counters = batch.counters.clone();
     status.telemetry_collection_active = telemetry_collection_started;
-    status.degraded_reason = if status.health_state == NativeRuntimeHealthState::Healthy {
-        None
-    } else {
-        Some("provider_degraded_or_unavailable".to_string())
-    };
+    status.degraded_reason = batch
+        .health_record
+        .as_ref()
+        .and_then(|record| record.degraded_reason.clone())
+        .or_else(|| {
+            (status.health_state != NativeRuntimeHealthState::Healthy)
+                .then(|| "provider_degraded_or_unavailable".to_string())
+        });
     status
 }
 
@@ -2390,6 +2318,148 @@ mod tests {
             },
         );
         assert!(implicit.is_err());
+    }
+
+    #[test]
+    fn service_sampler_lifecycle_emits_only_bounded_category_facts() {
+        let mut read = ReadOnlyCommandState::bootstrap().expect("read");
+        grant(&mut read, "service_metadata_visibility");
+        let mut runtime = NativeSamplerRuntime::from_read_state(&read);
+
+        runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::Activate,
+                ),
+            )
+            .expect("activate");
+        runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::Pause,
+                ),
+            )
+            .expect("pause");
+        runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::Resume,
+                ),
+            )
+            .expect("resume");
+        let sampled = runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::SampleNow,
+                ),
+            )
+            .expect("sample");
+
+        #[cfg(windows)]
+        {
+            let batch = sampled.latest_batch.as_ref().expect("service batch");
+            assert!(batch.counters.provider_enabled_count > 0);
+            assert!(batch.counters.raw_record_count > 0);
+            assert!(batch.counters.schema_accepted_count > 0);
+            assert!(batch.counters.normalized_record_count > 0);
+            assert!(!batch.service_records.is_empty());
+            assert!(batch.process_records.is_empty());
+            assert!(batch.health_record.is_none());
+            assert!(batch.counters.published_batch_count > 0);
+            assert!(batch.counters.eventbus_publication_count > 0);
+            assert!(batch.counters.dag_dispatch_count > 0);
+            assert!(batch.counters.plugin_runtime_invocation_count > 0);
+            assert!(batch.counters.facts_emitted_count > 0);
+            assert!(batch.counters.detector_consumer_invocation_count > 0);
+            assert!(batch.counters.detector_observations_consumed_count > 0);
+        }
+        assert!(read.security_facts.items.iter().all(|fact| {
+            fact.layer == sentinel_contracts::SecurityLayer::AuthorizedNativeService
+        }));
+        assert!(read.findings.items.is_empty());
+
+        let serialized = serde_json::to_string(&(
+            &read.native_sampler_runtime_statuses,
+            &read.native_sampler_runtime_batches,
+            &read.security_facts.items,
+        ))
+        .expect("serialize service runtime");
+        for forbidden in [
+            "service_name",
+            "display_name",
+            "executable_path",
+            "command_line",
+            "account_name",
+            "username",
+            "\"sid\"",
+            "\"pid\"",
+            "registry_path",
+            "credential",
+            "secret",
+        ] {
+            assert!(!serialized.to_ascii_lowercase().contains(forbidden));
+        }
+
+        runtime
+            .apply_action(
+                &mut read,
+                runtime_request("service_metadata_sampler", NativeSamplerRuntimeAction::Stop),
+            )
+            .expect("stop");
+        runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::Revoke,
+                ),
+            )
+            .expect("revoke");
+        assert!(runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::SampleNow,
+                ),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn service_sampler_no_overlap_guard_rejects_concurrent_sample() {
+        let mut read = ReadOnlyCommandState::bootstrap().expect("read");
+        grant(&mut read, "service_metadata_visibility");
+        let mut runtime = NativeSamplerRuntime::from_read_state(&read);
+        runtime
+            .apply_action(
+                &mut read,
+                runtime_request(
+                    "service_metadata_sampler",
+                    NativeSamplerRuntimeAction::Activate,
+                ),
+            )
+            .expect("activate");
+        runtime
+            .sampling_in_progress
+            .insert("service_metadata_sampler".to_string());
+
+        let overlapping = runtime.apply_action(
+            &mut read,
+            runtime_request(
+                "service_metadata_sampler",
+                NativeSamplerRuntimeAction::SampleNow,
+            ),
+        );
+        assert!(overlapping.is_err());
     }
 
     #[test]

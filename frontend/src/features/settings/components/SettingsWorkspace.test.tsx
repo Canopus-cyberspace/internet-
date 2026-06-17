@@ -89,6 +89,50 @@ describe("Settings workspace panels", () => {
     expect(markup).not.toContain("session_token service message");
   });
 
+  it("renders mutation authorization as narrow IP Helper execution without operation controls", () => {
+    const serviceStatus: ServiceStatusViewDto = {
+      connected: true,
+      degraded: false,
+      profile_mode: "service-owned",
+      local_core_status: "healthy",
+      elevated_service_status: "healthy",
+      ipc_status: "healthy",
+      storage_status: "healthy",
+      reduced_visibility: false,
+      privileged_actions_available: false,
+      capture_available: false,
+      mutation_authorization_status: {
+        schema_version: { major: 1, minor: 0, patch: 0 },
+        framework_state: "implemented_narrow_execution",
+        policy_catalog_version: { major: 1, minor: 0, patch: 0 },
+        supported_command_count: 35,
+        dry_run_only: false,
+        production_execution_enabled: true,
+        last_decision_category: "approved_for_execution",
+        denied_count_bucket: "zero",
+        expired_count_bucket: "zero",
+        replay_count_bucket: "zero",
+        caller_trust_ready: true,
+        ownership_runtime_ready: true,
+        degraded_reasons: [],
+        audit_refs: ["mutation_authorization_audit"],
+        provenance_id: "servicehost_mutation_authorization",
+        redaction_status: "redacted",
+      },
+      message_redacted: "Service-owned runtime is available",
+      generated_at: "pending",
+    };
+
+    const markup = renderToStaticMarkup(
+      <ServiceStatusPanel loading={false} serviceStatus={serviceStatus} />,
+    );
+
+    expect(markup).toContain("Mutation Authorization");
+    expect(markup).toContain("Mutation policy evaluation is available");
+    expect(markup).toContain("narrow execution enabled only for explicit IP Helper");
+    expect(markup).not.toContain("<button");
+  });
+
   it("renders machine-local capability status without raw system details", () => {
     const serviceStatus: ServiceStatusViewDto = {
       connected: false,
@@ -518,6 +562,68 @@ describe("Settings workspace panels", () => {
           response_execution_started: false,
           generated_at: "now",
         });
+        queryClient.setQueryData(queryKeys.settings.nativeSchedulerHostStatus, {
+          orchestrator_id: "session_native_scheduler_host",
+          controller_id: "native_scheduler_controller",
+          lifecycle_state: "stopped",
+          health_state: "stopped",
+          wake_state: "idle",
+          latest_wake_reason: "status_reconciliation",
+          enabled_sampler_count_bucket: "none",
+          eligible_sampler_count_bucket: "none",
+          next_wake_bucket: "not_running",
+          last_wake_bucket: null,
+          last_tick_ref: null,
+          latest_cycle_ref: null,
+          successful_wake_count_bucket: "none",
+          no_op_wake_count_bucket: "none",
+          degraded_wake_count_bucket: "none",
+          cancelled_wake_count_bucket: "none",
+          restart_count_bucket: "none",
+          manual_cycle_count_bucket: "none",
+          autonomous_cycle_count_bucket: "none",
+          watchdog_state: "stopped",
+          shutdown_state: "completed",
+          degraded_reason: null,
+          timer_task_active: false,
+          task_ownership_state: "released",
+          current_wait_state: "inactive",
+          pending_wake: false,
+          cancellation_state: "none",
+          join_state: "joined",
+          join_timeout_category: null,
+          shutdown_cleanup_status: "completed",
+          audit_refs: [],
+          provenance_id: "native_scheduler_host_orchestrator",
+          redaction_status: "redacted",
+          host_task_owned: false,
+          singleton_owner: true,
+          startup_auto_started: false,
+          os_service_started: false,
+          provider_direct_calls: false,
+          automatic_llm_calls: false,
+          response_execution_started: false,
+          generated_at: "now",
+        });
+        queryClient.setQueryData(queryKeys.settings.nativeSchedulerHostHealth, {
+          status: queryClient.getQueryData(
+            queryKeys.settings.nativeSchedulerHostStatus,
+          ),
+          latest_cycle: null,
+          latest_wake_reason: "status_reconciliation",
+          watchdog_state: "stopped",
+          shutdown_state: "completed",
+          delayed_wake_count_bucket: "none",
+          no_op_wake_count_bucket: "none",
+          degraded_wake_count_bucket: "none",
+          successful_wake_count_bucket: "none",
+          session_bound: true,
+          startup_auto_run: false,
+          os_service: false,
+          automatic_llm_calls: false,
+          response_execution_started: false,
+          generated_at: "now",
+        });
       }),
     );
 
@@ -537,6 +643,9 @@ describe("Settings workspace panels", () => {
     expect(markup).toContain("Missed samples");
     expect(markup).toContain("Retry summary");
     expect(markup).toContain("Report traceability");
+    expect(markup).toContain("Autonomous Host");
+    expect(markup).toContain("Start autonomous monitoring");
+    expect(markup).toContain("not an OS service");
     expect(markup).toContain("Readiness-approved");
     expect(markup).not.toContain("C:\\");
     expect(markup).not.toContain("session_token");

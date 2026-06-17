@@ -51,6 +51,7 @@ export const queryKeys = {
     evidenceQualityRecord: (qualityId: string) =>
       ["security", "quality", "record", qualityId] as const,
     investigationDrillDown: ["security", "investigation", "drill_down"] as const,
+    endpointThreat: ["security", "investigation", "endpoint_threat"] as const,
     hypothesisExplanation: (hypothesisId: string) =>
       ["security", "investigation", "hypothesis", hypothesisId] as const,
     baselineDrillDown: (baselineId: string) =>
@@ -84,6 +85,12 @@ export const queryKeys = {
       ["network", "tls", request ?? "default"] as const,
     processes: (request?: QueryRequestDto) =>
       ["network", "processes", request ?? "default"] as const,
+    providerController: ["network", "provider_controller"] as const,
+    providerStatuses: ["network", "provider_controller", "providers"] as const,
+    providerStatus: (providerId: string) =>
+      ["network", "provider_controller", "provider", providerId] as const,
+    providerVisibility: ["network", "provider_controller", "visibility"] as const,
+    providerFallbackPlan: ["network", "provider_controller", "fallback"] as const,
   },
   graph: {
     view: (graphType: string, scope: string) =>
@@ -145,6 +152,16 @@ export const queryKeys = {
       "operational",
     ] as const,
     nativeSchedulerStatus: ["settings", "native_scheduler", "status"] as const,
+    nativeSchedulerHostStatus: [
+      "settings",
+      "native_scheduler",
+      "host_status",
+    ] as const,
+    nativeSchedulerHostHealth: [
+      "settings",
+      "native_scheduler",
+      "host_health",
+    ] as const,
     nativeSamplerSchedules: ["settings", "native_scheduler", "schedules"] as const,
     nativeSamplerSchedule: (samplerId: string) =>
       ["settings", "native_scheduler", "schedule", samplerId] as const,

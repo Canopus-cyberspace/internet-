@@ -5,20 +5,342 @@
 //! content to callers.
 
 use sentinel_contracts::{
-    ServiceAdapterMode, ServiceCapabilityContext, ServiceCapabilityStatus, ServiceLimitationFlag,
-    ServiceReasonCode, Timestamp,
-};
-use sentinel_elevated_service::{
-    read_json_frame, write_json_frame, CaptureHealthResult, IpcError, IpcRequest, IpcResponse,
-    PingResult, ProcessSnapshotResult, ServiceCommand, StatusResult, DEFAULT_PIPE_NAME,
+    caller_verification::{
+        AllowedCommandClass, CallerVerificationReadStatus, CallerVerificationSummary,
+    },
+    provider_controller::NetworkProviderControllerStatus,
+    runtime_ownership::{RuntimeMode, RuntimeOwnershipSummary},
+    MutationAuthorizationDecision, MutationAuthorizationStatus, MutationExecutionReceipt,
+    MutationExecutionRequest, MutationIntent, SchemaVersion, ServiceAdapterMode,
+    ServiceCapabilityContext, ServiceCapabilityStatus, ServiceLimitationFlag, ServiceReadCommandId,
+    ServiceReadCommandRequest, ServiceReadCommandResponse, ServiceReasonCode, Timestamp,
 };
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Read, Write};
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
+
+pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\SentinelGuardIpc";
+pub const IPC_PROTOCOL_VERSION: u16 = 1;
+pub const RUNTIME_IPC_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_PAYLOAD_BYTES: usize = 48 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ServiceCommand {
+    Ping,
+    Status,
+    CaptureHealth,
+    ProcessSnapshot,
+    EvaluateMutationIntent,
+    ActivateIpHelper,
+    SampleIpHelperOnce,
+    StopIpHelper,
+    Read(ServiceReadCommandId),
+}
+
+impl ServiceCommand {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Status => "status",
+            Self::CaptureHealth => "capture_health",
+            Self::ProcessSnapshot => "process_snapshot",
+            Self::EvaluateMutationIntent => "evaluate_mutation_intent",
+            Self::ActivateIpHelper => "activate_ip_helper",
+            Self::SampleIpHelperOnce => "sample_ip_helper_once",
+            Self::StopIpHelper => "stop_ip_helper",
+            Self::Read(command) => command.as_str(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, IpcError> {
+        match value {
+            "ping" => Ok(Self::Ping),
+            "status" => Ok(Self::Status),
+            "capture_health" => Ok(Self::CaptureHealth),
+            "process_snapshot" => Ok(Self::ProcessSnapshot),
+            "evaluate_mutation_intent" => Ok(Self::EvaluateMutationIntent),
+            "activate_ip_helper" => Ok(Self::ActivateIpHelper),
+            "sample_ip_helper_once" => Ok(Self::SampleIpHelperOnce),
+            "stop_ip_helper" => Ok(Self::StopIpHelper),
+            _ => ServiceReadCommandId::parse(value)
+                .map(Self::Read)
+                .map_err(|_| IpcError {
+                    code: "COMMAND_NOT_ALLOWED".to_string(),
+                    message: "command is not allowlisted".to_string(),
+                    retryable: false,
+                }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcRequest<T = Value> {
+    pub id: String,
+    pub command: String,
+    pub params: T,
+    pub timestamp: Timestamp,
+}
+
+impl IpcRequest<Value> {
+    pub fn new(command: ServiceCommand, params: Value) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            command: command.as_str().to_string(),
+            params,
+            timestamp: Timestamp::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcClientHello {
+    pub message_type: String,
+    pub supported_protocol_versions: Vec<u16>,
+    pub schema_version: SchemaVersion,
+    pub client_nonce: String,
+    pub requested_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcServerHello {
+    pub message_type: String,
+    pub protocol_version: u16,
+    pub schema_version: SchemaVersion,
+    pub challenge_nonce: String,
+    pub server_nonce: String,
+    pub session_reference: String,
+    pub accepted_capabilities: Vec<String>,
+    pub max_frame_bytes: usize,
+    pub max_payload_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcClientVerify {
+    pub message_type: String,
+    pub protocol_version: u16,
+    pub schema_version: SchemaVersion,
+    pub session_reference: String,
+    pub client_nonce: String,
+    pub server_nonce: String,
+    pub challenge_nonce: String,
+    pub sequence_number: u64,
+    pub caller_kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcServerVerify {
+    pub message_type: String,
+    pub protocol_version: u16,
+    pub schema_version: SchemaVersion,
+    pub session_reference: String,
+    pub response_status: String,
+    pub caller_verification: CallerVerificationSummary,
+    pub session_nonce: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcEnvelope<T = Value> {
+    pub protocol_version: u16,
+    pub schema_version: SchemaVersion,
+    pub request_id: String,
+    pub session_reference: String,
+    pub client_nonce: String,
+    pub server_nonce: String,
+    pub sequence_number: u64,
+    pub command_id: String,
+    pub response_status: String,
+    pub payload: T,
+}
+
+impl IpcEnvelope<Value> {
+    pub fn request(session: &IpcSessionState, command: ServiceCommand, payload: Value) -> Self {
+        Self::request_with_sequence(session, command, payload, 1)
+    }
+
+    pub fn request_with_sequence(
+        session: &IpcSessionState,
+        command: ServiceCommand,
+        payload: Value,
+        sequence_number: u64,
+    ) -> Self {
+        Self {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            schema_version: RUNTIME_IPC_SCHEMA_VERSION,
+            request_id: Uuid::new_v4().to_string(),
+            session_reference: session.session_reference.clone(),
+            client_nonce: session.client_nonce.clone(),
+            server_nonce: session.server_nonce.clone(),
+            sequence_number,
+            command_id: command.as_str().to_string(),
+            response_status: "request".to_string(),
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IpcSessionState {
+    pub session_reference: String,
+    pub client_nonce: String,
+    pub server_nonce: String,
+    pub challenge_nonce: String,
+    pub caller_verification: CallerVerificationSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PingResult {
+    pub nonce: String,
+    pub service_uptime_ms: u64,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusResult {
+    pub service_status: String,
+    pub connected_clients: u32,
+    pub memory_usage_mb: f64,
+    pub pid: u32,
+    #[serde(default)]
+    pub runtime_ownership: Option<RuntimeMode>,
+    #[serde(default)]
+    pub runtime_ownership_status: Option<RuntimeOwnershipSummary>,
+    #[serde(default)]
+    pub runtime_protocol_version: Option<SchemaVersion>,
+    #[serde(default)]
+    pub runtime_schema_version: Option<SchemaVersion>,
+    #[serde(default)]
+    pub caller_verification_status: Option<CallerVerificationReadStatus>,
+    #[serde(default)]
+    pub mutation_authorization_status: Option<MutationAuthorizationStatus>,
+    #[serde(default)]
+    pub provider_controller_status: Option<NetworkProviderControllerStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureHealthResult {
+    pub capture_active: bool,
+    pub packets_observed: u64,
+    pub last_packet_at: Option<String>,
+    pub adapter_state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSnapshotResult {
+    pub processes: Vec<ProcessSnapshotEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSnapshotEntry {
+    pub pid: u32,
+    pub name: String,
+    pub path: String,
+    pub connections: Vec<ProcessConnectionEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessConnectionEntry {
+    pub local_addr: String,
+    pub remote_addr: String,
+    pub protocol: String,
+    pub state: String,
+}
+
+#[derive(Debug)]
+pub enum IpcFrameError {
+    Io(io::Error),
+    FrameTooLarge { len: usize, max: usize },
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for IpcFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "IPC frame IO failed: {error}"),
+            Self::FrameTooLarge { len, max } => {
+                write!(f, "IPC frame is too large: {len} > {max}")
+            }
+            Self::Json(error) => write!(f, "IPC frame JSON failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for IpcFrameError {}
+
+impl From<io::Error> for IpcFrameError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<serde_json::Error> for IpcFrameError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
+pub fn write_json_frame<W, T>(writer: &mut W, value: &T) -> Result<(), IpcFrameError>
+where
+    W: Write,
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value)?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(IpcFrameError::FrameTooLarge {
+            len: payload.len(),
+            max: MAX_FRAME_BYTES,
+        });
+    }
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(&payload)?;
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn read_json_frame<R, T>(reader: &mut R) -> Result<T, IpcFrameError>
+where
+    R: Read,
+    T: DeserializeOwned,
+{
+    let mut len_bytes = [0_u8; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(IpcFrameError::FrameTooLarge {
+            len,
+            max: MAX_FRAME_BYTES,
+        });
+    }
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok(serde_json::from_slice(&payload)?)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceIpcClientErrorKind {
@@ -343,6 +665,47 @@ impl ElevatedServiceIpcClient {
         self.send_request(ServiceCommand::ProcessSnapshot, params)
     }
 
+    pub fn read_command(
+        &self,
+        command_id: ServiceReadCommandId,
+        request: ServiceReadCommandRequest,
+    ) -> Result<ServiceReadCommandResponse, ServiceIpcClientError> {
+        let params = serde_json::to_value(request).map_err(ServiceIpcClientError::protocol)?;
+        self.send_request(ServiceCommand::Read(command_id), params)
+    }
+
+    pub fn evaluate_mutation_intent(
+        &self,
+        intent: MutationIntent,
+    ) -> Result<MutationAuthorizationDecision, ServiceIpcClientError> {
+        let params = serde_json::to_value(intent).map_err(ServiceIpcClientError::protocol)?;
+        self.send_request(ServiceCommand::EvaluateMutationIntent, params)
+    }
+
+    pub fn activate_ip_helper(
+        &self,
+        request: MutationExecutionRequest,
+    ) -> Result<MutationExecutionReceipt, ServiceIpcClientError> {
+        let params = serde_json::to_value(request).map_err(ServiceIpcClientError::protocol)?;
+        self.send_request(ServiceCommand::ActivateIpHelper, params)
+    }
+
+    pub fn sample_ip_helper_once(
+        &self,
+        request: MutationExecutionRequest,
+    ) -> Result<MutationExecutionReceipt, ServiceIpcClientError> {
+        let params = serde_json::to_value(request).map_err(ServiceIpcClientError::protocol)?;
+        self.send_request(ServiceCommand::SampleIpHelperOnce, params)
+    }
+
+    pub fn stop_ip_helper(
+        &self,
+        request: MutationExecutionRequest,
+    ) -> Result<MutationExecutionReceipt, ServiceIpcClientError> {
+        let params = serde_json::to_value(request).map_err(ServiceIpcClientError::protocol)?;
+        self.send_request(ServiceCommand::StopIpHelper, params)
+    }
+
     pub fn safe_capability_contexts(
         &self,
     ) -> Result<ServiceIpcCapabilityContextSnapshot, ServiceIpcClientError> {
@@ -396,17 +759,124 @@ impl ElevatedServiceIpcClient {
         T: DeserializeOwned,
     {
         let mut pipe = open_pipe(&self.pipe_name)?;
-        write_json_frame(&mut pipe, request).map_err(ServiceIpcClientError::protocol)?;
-        let response: IpcResponse<Value> =
+        let session = negotiate_ipc_session(&mut pipe)?;
+        let command =
+            ServiceCommand::parse(&request.command).map_err(ServiceIpcClientError::rejected)?;
+        let envelope = IpcEnvelope::request(&session, command, request.params.clone());
+        write_json_frame(&mut pipe, &envelope).map_err(ServiceIpcClientError::protocol)?;
+        let response: IpcEnvelope<Value> =
             read_json_frame(&mut pipe).map_err(ServiceIpcClientError::protocol)?;
-        if let Some(error) = response.error {
+        validate_response_envelope(&session, &envelope, &response)?;
+        if response.response_status == "error" {
+            let error: IpcError = serde_json::from_value(response.payload)
+                .map_err(ServiceIpcClientError::protocol)?;
             return Err(ServiceIpcClientError::rejected(error));
         }
-        let result = response.result.ok_or_else(|| {
-            ServiceIpcClientError::protocol("IPC response did not include result")
-        })?;
-        serde_json::from_value(result).map_err(ServiceIpcClientError::protocol)
+        serde_json::from_value(response.payload).map_err(ServiceIpcClientError::protocol)
     }
+}
+
+fn negotiate_ipc_session(
+    pipe: &mut std::fs::File,
+) -> Result<IpcSessionState, ServiceIpcClientError> {
+    let client_nonce = Uuid::new_v4().to_string();
+    let hello = IpcClientHello {
+        message_type: "client_hello".to_string(),
+        supported_protocol_versions: vec![IPC_PROTOCOL_VERSION],
+        schema_version: RUNTIME_IPC_SCHEMA_VERSION,
+        client_nonce: client_nonce.clone(),
+        requested_capabilities: vec![
+            "read_only_status".to_string(),
+            "read_only_canonical_snapshots".to_string(),
+        ],
+    };
+    write_json_frame(pipe, &hello).map_err(ServiceIpcClientError::protocol)?;
+    let server_hello: IpcServerHello =
+        read_json_frame(pipe).map_err(ServiceIpcClientError::protocol)?;
+    if server_hello.message_type != "server_hello"
+        || server_hello.protocol_version != IPC_PROTOCOL_VERSION
+        || server_hello.schema_version != RUNTIME_IPC_SCHEMA_VERSION
+    {
+        return Err(ServiceIpcClientError::protocol(
+            "service IPC protocol negotiation failed",
+        ));
+    }
+    if server_hello.max_frame_bytes > MAX_FRAME_BYTES
+        || server_hello.max_payload_bytes > MAX_PAYLOAD_BYTES
+    {
+        return Err(ServiceIpcClientError::protocol(
+            "service IPC negotiated unsafe size limits",
+        ));
+    }
+    let verify = IpcClientVerify {
+        message_type: "client_verify".to_string(),
+        protocol_version: IPC_PROTOCOL_VERSION,
+        schema_version: RUNTIME_IPC_SCHEMA_VERSION,
+        session_reference: server_hello.session_reference.clone(),
+        client_nonce: client_nonce.clone(),
+        server_nonce: server_hello.server_nonce.clone(),
+        challenge_nonce: server_hello.challenge_nonce.clone(),
+        sequence_number: 0,
+        caller_kind: "local_desktop".to_string(),
+    };
+    write_json_frame(pipe, &verify).map_err(ServiceIpcClientError::protocol)?;
+    let server_verify: IpcServerVerify =
+        read_json_frame(pipe).map_err(ServiceIpcClientError::protocol)?;
+    if server_verify.message_type != "server_verify"
+        || server_verify.response_status != "ok"
+        || server_verify.protocol_version != IPC_PROTOCOL_VERSION
+        || server_verify.schema_version != RUNTIME_IPC_SCHEMA_VERSION
+        || server_verify.session_reference != server_hello.session_reference
+    {
+        return Err(ServiceIpcClientError::protocol(
+            "service IPC caller verification failed",
+        ));
+    }
+    server_verify
+        .caller_verification
+        .validate()
+        .map_err(ServiceIpcClientError::protocol)?;
+    if !server_verify
+        .caller_verification
+        .permits_command_class(AllowedCommandClass::ReadStatus)
+    {
+        return Err(ServiceIpcClientError::protocol(
+            "service IPC caller verification did not permit read-only commands",
+        ));
+    }
+    Ok(IpcSessionState {
+        session_reference: server_hello.session_reference,
+        client_nonce,
+        server_nonce: server_hello.server_nonce,
+        challenge_nonce: server_hello.challenge_nonce,
+        caller_verification: server_verify.caller_verification,
+    })
+}
+
+fn validate_response_envelope(
+    session: &IpcSessionState,
+    request: &IpcEnvelope<Value>,
+    response: &IpcEnvelope<Value>,
+) -> Result<(), ServiceIpcClientError> {
+    if response.protocol_version != IPC_PROTOCOL_VERSION
+        || response.schema_version != RUNTIME_IPC_SCHEMA_VERSION
+        || response.request_id != request.request_id
+        || response.session_reference != session.session_reference
+        || response.client_nonce != session.client_nonce
+        || response.server_nonce != session.server_nonce
+        || response.sequence_number != request.sequence_number
+        || response.command_id != request.command_id
+    {
+        return Err(ServiceIpcClientError::protocol(
+            "service IPC response envelope validation failed",
+        ));
+    }
+    if !matches!(response.response_status.as_str(), "ok" | "error") {
+        return Err(ServiceIpcClientError::protocol(
+            "service IPC response status was invalid",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -467,9 +937,40 @@ fn service_capability_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_elevated_service::{
-        dispatch_json_request_for_tests, ServiceAuditLogger, ServiceCommandDispatcher,
+    use sentinel_contracts::{
+        caller_verification::{
+            CallerCategory, CallerVerificationState, ElevationCategory, LocalRemoteClassification,
+            SessionBindingState, TokenSuitabilityCategory, VerificationFreshnessBucket,
+            CALLER_VERIFICATION_SCHEMA_VERSION,
+        },
+        RedactionStatus,
     };
+
+    fn verified_test_summary() -> CallerVerificationSummary {
+        CallerVerificationSummary {
+            schema_version: CALLER_VERIFICATION_SCHEMA_VERSION,
+            verification_ref: "caller_verification_test_ref".to_string(),
+            caller_category: CallerCategory::InteractiveUser,
+            verification_state: CallerVerificationState::VerifiedInteractiveUser,
+            local_classification: LocalRemoteClassification::Local,
+            interactive_marker: true,
+            service_marker: false,
+            administrator_policy_marker: false,
+            token_suitability: TokenSuitabilityCategory::ImpersonationSuitable,
+            elevation_category: ElevationCategory::Standard,
+            session_binding_state: SessionBindingState::Bound,
+            freshness_bucket: VerificationFreshnessBucket::CurrentConnection,
+            allowed_command_classes: vec![
+                AllowedCommandClass::ReadStatus,
+                AllowedCommandClass::ReadCanonicalModels,
+            ],
+            degraded_reason: None,
+            audit_refs: vec!["caller_token_classified".to_string()],
+            provenance_id: "windows_named_pipe_impersonation".to_string(),
+            redaction_status: RedactionStatus::Redacted,
+            production_mutations_enabled: false,
+        }
+    }
 
     #[test]
     fn client_error_for_unreachable_service_is_retryable_and_degraded_safe() {
@@ -485,23 +986,111 @@ mod tests {
 
     #[test]
     fn service_wire_status_response_deserializes_for_client_contract() {
-        let mut dispatcher = ServiceCommandDispatcher::new(ServiceAuditLogger::with_path(
-            std::env::temp_dir().join("sentinel-guard-infra-service-test-audit.jsonl"),
-        ));
-        let response = dispatch_json_request_for_tests(
-            &mut dispatcher,
-            json!({
-                "id": "request-1",
-                "command": "status",
-                "params": {},
-                "timestamp": "2026-06-04T00:00:00Z"
-            }),
-        );
-        let status: StatusResult =
-            serde_json::from_value(response.result.expect("status result")).expect("decode");
+        let status: StatusResult = serde_json::from_value(json!({
+            "service_status": "running",
+            "connected_clients": 1,
+            "memory_usage_mb": 0.0,
+            "pid": std::process::id()
+        }))
+        .expect("decode");
 
         assert_eq!(status.service_status, "running");
         assert_eq!(status.pid, std::process::id());
+        assert!(status.runtime_ownership.is_none());
+    }
+
+    #[test]
+    fn service_ipc_status_accepts_runtime_ownership_negotiation_metadata() {
+        let status: StatusResult = serde_json::from_value(json!({
+            "service_status": "running",
+            "connected_clients": 1,
+            "memory_usage_mb": 0.0,
+            "pid": 0,
+            "runtime_ownership": "service_owned",
+            "runtime_protocol_version": { "major": 1, "minor": 0, "patch": 0 },
+            "runtime_schema_version": { "major": 1, "minor": 0, "patch": 0 }
+        }))
+        .expect("decode");
+
+        assert_eq!(status.runtime_ownership, Some(RuntimeMode::ServiceOwned));
+        assert_eq!(
+            status.runtime_protocol_version,
+            Some(RUNTIME_IPC_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            status.runtime_schema_version,
+            Some(RUNTIME_IPC_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn service_ipc_read_commands_are_allowlisted_for_client_envelopes() {
+        let session = IpcSessionState {
+            session_reference: "session-ref".to_string(),
+            client_nonce: "client-nonce".to_string(),
+            server_nonce: "server-nonce".to_string(),
+            challenge_nonce: "challenge-nonce".to_string(),
+            caller_verification: verified_test_summary(),
+        };
+
+        for command_id in ServiceReadCommandId::all() {
+            let command = ServiceCommand::Read(*command_id);
+            assert_eq!(
+                ServiceCommand::parse(command.as_str()).expect("read command parses"),
+                command
+            );
+            let envelope = IpcEnvelope::request(&session, command, json!({ "page_size": 1 }));
+            assert_eq!(envelope.command_id, command_id.as_str());
+            assert_eq!(envelope.response_status, "request");
+        }
+    }
+
+    #[test]
+    fn provider_controller_read_commands_are_read_only_ipc_only() {
+        for command_id in [
+            ServiceReadCommandId::GetProviderControllerStatus,
+            ServiceReadCommandId::ListNetworkProviderStatus,
+            ServiceReadCommandId::GetNetworkProviderStatus,
+            ServiceReadCommandId::GetNetworkVisibilitySummary,
+            ServiceReadCommandId::GetNetworkFallbackPlan,
+        ] {
+            let command = ServiceCommand::Read(command_id);
+            assert_eq!(
+                ServiceCommand::parse(command.as_str()).expect("provider read command parses"),
+                command
+            );
+            let request = IpcRequest::new(command, json!({ "page_size": 1 }));
+            assert_eq!(request.command, command_id.as_str());
+        }
+
+        for forbidden in [
+            "activate_provider",
+            "stop_provider",
+            "sample_provider",
+            "probe_npcap",
+            "start_capture_broker",
+            "change_provider_mode",
+        ] {
+            assert!(ServiceCommand::parse(forbidden).is_err());
+        }
+    }
+
+    #[test]
+    fn service_ipc_read_command_request_serializes_without_raw_cursor_or_secret_values() {
+        let request = ServiceReadCommandRequest {
+            page_size: Some(1),
+            continuation_token: Some("read_page_1".to_string()),
+        };
+        let params = serde_json::to_value(request).expect("serialize read request");
+        let serialized = serde_json::to_string(&params).expect("request json");
+        let lowered = serialized.to_ascii_lowercase();
+
+        assert!(lowered.contains("read_page_1"));
+        assert!(!lowered.contains("raw_db_cursor"));
+        assert!(!lowered.contains("select "));
+        assert!(!lowered.contains("runtime_handle"));
+        assert!(!lowered.contains("authorization_nonce"));
+        assert!(!lowered.contains("secret"));
     }
 
     #[test]
@@ -512,6 +1101,13 @@ mod tests {
                 connected_clients: 1,
                 memory_usage_mb: 0.0,
                 pid: 4242,
+                runtime_ownership: None,
+                runtime_ownership_status: None,
+                runtime_protocol_version: None,
+                runtime_schema_version: None,
+                caller_verification_status: None,
+                mutation_authorization_status: None,
+                provider_controller_status: None,
             },
             &CaptureHealthResult {
                 capture_active: false,

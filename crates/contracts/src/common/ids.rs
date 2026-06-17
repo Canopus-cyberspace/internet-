@@ -98,6 +98,7 @@ define_uuid_id!(HttpMetadataId);
 define_uuid_id!(AuthMetadataId);
 define_uuid_id!(SaasCloudMetadataId);
 define_uuid_id!(DeceptionEventId);
+define_uuid_id!(SdnControlPlaneMetadataId);
 define_uuid_id!(ProcessContextId);
 define_uuid_id!(UserSessionId);
 define_uuid_id!(FlowAttributionId);
@@ -164,6 +165,14 @@ define_uuid_id!(PipelineId);
 define_uuid_id!(ReplayId);
 define_uuid_id!(EntityId);
 define_uuid_id!(IntelligenceRecordId);
+define_uuid_id!(EndpointAnalysisInputId);
+define_uuid_id!(EndpointThreatCandidateId);
+define_uuid_id!(EndpointThreatFindingId);
+define_uuid_id!(EndpointThreatEvidenceId);
+define_uuid_id!(EndpointThreatRiskHintId);
+define_uuid_id!(EndpointVisibilityAdvisoryId);
+define_uuid_id!(EndpointRejectedCandidateId);
+define_uuid_id!(ReadModelSnapshotId);
 
 #[cfg(test)]
 mod tests {

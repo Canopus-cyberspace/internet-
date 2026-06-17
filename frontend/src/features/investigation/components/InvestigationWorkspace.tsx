@@ -21,6 +21,7 @@ import { useGraphViewQuery } from "../../graph/hooks";
 import {
   useAlertsQuery,
   useDurableBaselineSummaryQuery,
+  useEndpointThreatSummaryQuery,
   useFindingsQuery,
   useIncidentDetailQuery,
   useIncidentsQuery,
@@ -30,6 +31,7 @@ import {
   useGenerateLlmAlertStoryMutation,
   useLlmAlertStoryStatusQuery,
 } from "../../settings/hooks";
+import { EndpointThreatPanel } from "./EndpointThreatPanel";
 import { InvestigationDrillDownPanel } from "./InvestigationDrillDownPanel";
 import { NavigationContextPanel } from "../../navigation/components/NavigationContextPanel";
 import { useSelectionStore } from "../../../stores/selectionStore";
@@ -69,6 +71,7 @@ export function InvestigationWorkspace() {
   const incidentsQuery = useIncidentsQuery();
   const baselineSummaryQuery = useDurableBaselineSummaryQuery();
   const drillDownQuery = useInvestigationDrillDownSummaryQuery();
+  const endpointThreatQuery = useEndpointThreatSummaryQuery();
   const llmStatusQuery = useLlmAlertStoryStatusQuery();
   const generateStoryMutation = useGenerateLlmAlertStoryMutation();
   const selection = useInvestigationSelectionState();
@@ -154,6 +157,11 @@ export function InvestigationWorkspace() {
                 requested_by_redacted: "local_user",
               })
             }
+          />
+          <EndpointThreatPanel
+            error={endpointThreatQuery.isError}
+            loading={endpointThreatQuery.isLoading}
+            summary={endpointThreatQuery.data ?? null}
           />
           <NavigationContextPanel />
           <RiskBreakdownPanel detail={incidentDetail} row={selectedRow} />

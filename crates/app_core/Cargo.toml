@@ -8,6 +8,9 @@ license.workspace = true
 name = "sentinel_app_core"
 path = "src/lib.rs"
 
+[features]
+test-support = ["sentinel-capabilities/test-support"]
+
 [dependencies]
 sentinel-capabilities = { path = "../capabilities" }
 sentinel-contracts = { path = "../contracts" }
@@ -23,3 +26,4 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
+sentinel-capabilities = { path = "../capabilities", features = ["test-support"] }

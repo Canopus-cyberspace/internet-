@@ -20,6 +20,7 @@ import {
 import { LocalMetadataProxyPanel } from "./LocalMetadataProxyPanel";
 import { MetadataWatchPanel } from "./MetadataWatchPanel";
 import { PortableCaptureImportPanel } from "./PortableCaptureImportPanel";
+import { ProviderStatusPanel } from "./ProviderStatusPanel";
 
 type NetworkView = "flows" | "dns" | "tls" | "processes" | "assets";
 type NetworkKind = "flow" | "dns" | "tls" | "process" | "asset";
@@ -156,6 +157,7 @@ export function NetworkWorkspace() {
         />
       </main>
       <div className="network-side-stack">
+        <ProviderStatusPanel />
         <PortableCaptureImportPanel />
         <LocalMetadataProxyPanel />
         <MetadataWatchPanel />

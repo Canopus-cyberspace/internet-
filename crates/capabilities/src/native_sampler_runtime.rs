@@ -51,6 +51,11 @@ pub fn native_health_fact(
         health_time(),
     )?;
     fact.provider_service_category = Some("native_health".to_string());
+    fact.status_category = Some(
+        format!("resource_pressure_{:?}", health.resource_pressure_bucket).to_ascii_lowercase(),
+    );
+    fact.lifecycle_bucket = Some(format!("{:?}", health.uptime_bucket).to_ascii_lowercase());
+    fact.count_bucket = Some(format!("{:?}", health.freshness_bucket).to_ascii_lowercase());
     fact.confidence_hint = health.quality_score.clone();
     fact.provenance_id = sentinel_contracts::DataSourceId::parse_str(&health.provenance_id).ok();
     fact.redaction_status = health.redaction_status.clone();

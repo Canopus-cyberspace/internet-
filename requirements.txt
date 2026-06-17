@@ -1,0 +1,103 @@
+# ============================================================
+# Sentinel Guard — 开发与运行环境依赖
+# ============================================================
+# 本文件列出编译和运行 Sentinel Guard 所需的全部工具链与系统依赖。
+# 非 Python 项目，不能 pip install — 请按平台执行对应安装命令。
+# ============================================================
+
+# ============================================================
+# 1. Node.js（推荐 LTS，≥ 20.x）
+# ============================================================
+# 安装: https://nodejs.org 或 nvm-windows / fnm
+# node --version  → 应输出 v20.x 或 v22.x
+
+# ============================================================
+# 2. pnpm 包管理器（≥ 9.x）
+# ============================================================
+# npm install -g pnpm
+# pnpm --version  → 应输出 9.x 或 10.x
+
+# ============================================================
+# 3. Rust 工具链（edition 2021，stable）
+# ============================================================
+# curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# rustup default stable
+# rustc --version  → 应输出 ≥ 1.78.0
+# cargo --version
+
+# ============================================================
+# 4. Tauri 2 系统依赖 — Windows
+# ============================================================
+# Windows 10/11 自带 WebView2，无需额外安装。
+# 若为 Windows Server 或精简版，需安装:
+#   https://developer.microsoft.com/microsoft-edge/webview2
+# 需 Visual Studio Build Tools 或 Visual Studio（含 C++ 桌面开发负载）:
+#   https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022
+
+# ============================================================
+# 5. Tauri 2 系统依赖 — macOS
+# ============================================================
+# Xcode Command Line Tools:
+#   xcode-select --install
+
+# ============================================================
+# 6. Tauri 2 系统依赖 — Linux (Debian/Ubuntu)
+# ============================================================
+# sudo apt update && sudo apt install -y \
+#   libwebkit2gtk-4.1-dev \
+#   libgtk-3-dev \
+#   libayatana-appindicator3-dev \
+#   librsvg2-dev \
+#   libsoup-3.0-dev \
+#   libjavascriptcoregtk-4.1-dev \
+#   build-essential \
+#   curl \
+#   wget \
+#   file \
+#   libssl-dev \
+#   libgtksourceview-3.0-dev \
+#   libappindicator3-dev \
+#   patchelf
+
+# ============================================================
+# 7. 前端依赖安装（在项目根目录执行）
+# ============================================================
+# cd frontend && pnpm install
+# cd ../apps/desktop && pnpm install
+
+# ============================================================
+# 8. Rust 编译
+# ============================================================
+# cargo build --release     ← 生成 target/release/sentinel-guard-desktop.exe
+# cargo run                 ← 开发模式直接运行
+
+# ============================================================
+# 9. 完整一键启动（开发模式）
+# ============================================================
+# cd apps/desktop && pnpm tauri dev
+
+# ============================================================
+# 前端技术栈一览（pnpm install 自动安装）
+# ============================================================
+# react ^19.1          — UI 框架
+# vite ^6.3            — 构建工具
+# typescript ^5.8      — 类型检查
+# zustand ^5.0         — 状态管理
+# @tanstack/react-query ^5.80   — 数据请求/缓存
+# @tanstack/react-router ^1.120 — 路由
+# @xyflow/react ^12.0  — 图可视化 / Node Graph
+# lucide-react ^0.511  — 图标库
+# @tauri-apps/api ^2.5 — Tauri 桌面桥接
+# vitest ^3.2          — 单元测试
+
+# ============================================================
+# Rust 核心依赖一览（cargo build 自动拉取）
+# ============================================================
+# tauri 2              — 桌面框架
+# rusqlite 0.37        — 本地 SQLite
+# reqwest 0.12         — HTTP 客户端 (rustls-tls)
+# serde / serde_json   — 序列化
+# sha2                 — 哈希
+# chrono               — 时间处理
+# uuid                 — 唯一标识
+# windows-sys 0.59     — Windows API 绑定

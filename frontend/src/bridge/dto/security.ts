@@ -656,6 +656,129 @@ export interface EvidenceQualitySummaryDto {
   response_execution: boolean;
 }
 
+export interface EndpointAttackContextDto {
+  tactic_id: string;
+  technique_id: string;
+  attack_version: string;
+  confidence_bucket: string;
+  required_visibility: string[];
+  technique_observed: boolean;
+}
+
+export interface EndpointThreatFindingReadModelDto {
+  finding_id: Id;
+  candidate_ref: Id;
+  category: string;
+  detector_id: string;
+  detector_version: string;
+  evidence_refs: Id[];
+  endpoint_evidence_refs: Id[];
+  risk_hint_refs: Id[];
+  attack_refs: EndpointAttackContextDto[];
+  confidence_bucket: string;
+  uncertainty_bucket: string;
+  severity_bucket: string;
+  independent_source_count: number;
+  causal_claim: string;
+  summary_redacted: string;
+  missing_visibility_flags: string[];
+  evidence_quality_bucket: string;
+  correlation_quality_bucket: string;
+  provenance_id: Id;
+  redaction_status: string;
+}
+
+export interface EndpointThreatRejectedReadModelDto {
+  rejected_candidate_id: Id;
+  analysis_input_ref: Id;
+  category: string;
+  reason: string;
+  evidence_refs: Id[];
+  missing_visibility_flags: string[];
+  provenance_id: Id;
+  redaction_status: string;
+}
+
+export interface EndpointEvidenceCorrelationSummaryDto {
+  evidence_refs: Id[];
+  endpoint_evidence_refs: Id[];
+  portable_finding_refs: Id[];
+  hypothesis_refs: Id[];
+  baseline_refs: Id[];
+  risk_refs: Id[];
+  provenance_refs: Id[];
+}
+
+export interface EndpointThreatQualitySummaryDto {
+  detector_status: string;
+  evidence_quality_buckets: string[];
+  source_reliability_buckets: string[];
+  correlation_quality_buckets: string[];
+  redaction_statuses: string[];
+  freshness_categories: string[];
+}
+
+export interface EndpointBaselineSupportSummaryDto {
+  baseline_refs: Id[];
+  support_bucket: string;
+}
+
+export interface EndpointMissingVisibilitySummaryDto {
+  missing_visibility_flags: string[];
+  degraded_reasons: string[];
+}
+
+export interface EndpointRiskHintReadModelDto {
+  risk_hint_id: Id;
+  finding_ref?: Id | null;
+  candidate_ref?: Id | null;
+  category: string;
+  risk_bucket: string;
+  confidence_bucket: string;
+  evidence_refs: Id[];
+  risk_refs: Id[];
+  provenance_id: Id;
+  redaction_status: string;
+}
+
+export interface EndpointVisibilityAdvisoryReadModelDto {
+  advisory_id: Id;
+  analysis_input_ref?: Id | null;
+  category: string;
+  missing_visibility_flags: string[];
+  confidence_cap: string;
+  evidence_refs: Id[];
+  provenance_id: Id;
+  redaction_status: string;
+}
+
+export interface EndpointThreatAnalysisSummaryDto {
+  generated_at: string;
+  detector_status: string;
+  candidate_count: number;
+  finding_count: number;
+  evidence_count: number;
+  risk_hint_count: number;
+  advisory_count: number;
+  rejected_count: number;
+  graph_ref_count: number;
+  findings: EndpointThreatFindingReadModelDto[];
+  rejected_candidates: EndpointThreatRejectedReadModelDto[];
+  evidence_correlation: EndpointEvidenceCorrelationSummaryDto;
+  quality: EndpointThreatQualitySummaryDto;
+  baseline_support: EndpointBaselineSupportSummaryDto;
+  missing_visibility: EndpointMissingVisibilitySummaryDto;
+  risk_hints: EndpointRiskHintReadModelDto[];
+  attack_context: EndpointAttackContextDto[];
+  graph_refs: Id[];
+  report_refs: Id[];
+  export_refs: Id[];
+  visibility_advisories: EndpointVisibilityAdvisoryReadModelDto[];
+  degraded_reasons: string[];
+  automatic_llm_calls: boolean;
+  response_execution_started: boolean;
+}
+
 export interface FindingStateMutationRequestDto extends MutationReasonDto {
   finding_id: Id;
 }

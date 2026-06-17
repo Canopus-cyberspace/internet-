@@ -2863,6 +2863,7 @@ dependencies = [
  "reqwest 0.12.28",
  "sentinel-app-core",
  "sentinel-contracts",
+ "sentinel-infrastructure",
  "sentinel-platform",
  "sentinel-storage",
  "serde",
@@ -2873,28 +2874,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "sentinel-guard-elevated"
-version = "0.1.0"
-dependencies = [
- "sentinel-contracts",
- "sentinel-platform",
- "serde",
- "serde_json",
- "uuid",
- "windows-service",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "sentinel-infrastructure"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "sentinel-contracts",
- "sentinel-guard-elevated",
  "serde",
  "serde_json",
  "sha2",
+ "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2905,6 +2894,20 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "sentinel-service-host"
+version = "0.1.0"
+dependencies = [
+ "sentinel-app-core",
+ "sentinel-contracts",
+ "sentinel-platform",
+ "serde",
+ "serde_json",
+ "uuid",
+ "windows-service",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

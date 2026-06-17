@@ -34,7 +34,7 @@ pub trait PluginLifecycle {
     }
 }
 
-pub trait InternalPlugin: PluginLifecycle {
+pub trait InternalPlugin: PluginLifecycle + Send {
     fn manifest(&self) -> &PluginManifest;
 
     fn capability_manifest(&self) -> Option<&CapabilityManifest> {

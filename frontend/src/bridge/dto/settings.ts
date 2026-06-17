@@ -464,6 +464,22 @@ export interface NativeSamplerActivationPreviewDto {
 }
 
 export interface NativeSamplerCounterSummaryDto {
+  provider_enabled_count: number;
+  raw_record_count: number;
+  schema_accepted_count: number;
+  schema_rejected_count: number;
+  rate_limited_count: number;
+  queue_dropped_count: number;
+  normalized_record_count: number;
+  published_batch_count: number;
+  eventbus_publication_count: number;
+  dag_dispatch_count: number;
+  plugin_runtime_invocation_count: number;
+  observations_consumed_count: number;
+  facts_emitted_count: number;
+  detector_consumer_invocation_count: number;
+  detector_observations_consumed_count: number;
+  detector_output_count: number;
   sampled_record_count: number;
   sampled_record_count_bucket: string;
   skipped_record_count: number;
@@ -522,6 +538,9 @@ export interface NativeHealthMetadataRecordDto {
   authorization_state: string;
   runtime_state: string;
   health_state: string;
+  resource_pressure_bucket: string;
+  uptime_bucket: string;
+  freshness_bucket: string;
   degraded_reason?: string | null;
   missing_prerequisite_flags: string[];
   sample_duration_bucket: string;
@@ -1108,4 +1127,215 @@ export interface NativeSchedulerActionResultDto {
   sample_requested: false;
   automatic_llm_calls: false;
   response_execution_started: false;
+}
+
+export type NativeSchedulerHostLifecycleStateDto =
+  | "disabled"
+  | "ready"
+  | "starting"
+  | "running"
+  | "paused"
+  | "degraded"
+  | "stopping"
+  | "stopped"
+  | "revoked"
+  | "failed";
+
+export type NativeSchedulerHostHealthStateDto =
+  | "healthy"
+  | "idle"
+  | "paused"
+  | "delayed"
+  | "degraded"
+  | "unresponsive"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+export type NativeSchedulerHostWakeStateDto =
+  | "idle"
+  | "waiting"
+  | "due"
+  | "woken"
+  | "cancelled"
+  | "no_eligible_samplers";
+
+export type NativeSchedulerHostWakeReasonDto =
+  | "sampler_due"
+  | "schedule_enabled"
+  | "schedule_disabled"
+  | "schedule_changed"
+  | "schedule_updated"
+  | "permission_changed"
+  | "permission_revoked"
+  | "sampler_state_changed"
+  | "sampler_activated"
+  | "sampler_paused"
+  | "sampler_resumed"
+  | "sampler_stopped"
+  | "retry_due"
+  | "manual_wake"
+  | "controller_paused"
+  | "controller_resumed"
+  | "status_reconciliation"
+  | "session_cleanup"
+  | "stop_requested"
+  | "shutdown_requested"
+  | "revoked"
+  | "cancellation";
+
+export type NativeSchedulerCycleOriginDto =
+  | "manual"
+  | "autonomous"
+  | "recovery"
+  | "test_fixture";
+
+export type NativeSchedulerHostWatchdogStateDto =
+  | "healthy"
+  | "idle"
+  | "paused"
+  | "delayed"
+  | "degraded"
+  | "unresponsive"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+export type NativeSchedulerHostShutdownStateDto =
+  | "none"
+  | "requested"
+  | "cancelling"
+  | "completed"
+  | "timed_out";
+
+export type NativeSchedulerHostActionDto =
+  | "preview_start"
+  | "start"
+  | "pause"
+  | "resume"
+  | "wake_now"
+  | "stop"
+  | "refresh_status"
+  | "clear_inactive_state";
+
+export interface NativeSchedulerHostStatusDto {
+  orchestrator_id: string;
+  controller_id: string;
+  lifecycle_state: NativeSchedulerHostLifecycleStateDto;
+  health_state: NativeSchedulerHostHealthStateDto;
+  wake_state: NativeSchedulerHostWakeStateDto;
+  latest_wake_reason?: NativeSchedulerHostWakeReasonDto | null;
+  enabled_sampler_count_bucket: string;
+  eligible_sampler_count_bucket: string;
+  next_wake_bucket: string;
+  last_wake_bucket?: string | null;
+  last_tick_ref?: string | null;
+  latest_cycle_ref?: string | null;
+  successful_wake_count_bucket: string;
+  no_op_wake_count_bucket: string;
+  degraded_wake_count_bucket: string;
+  cancelled_wake_count_bucket: string;
+  restart_count_bucket: string;
+  manual_cycle_count_bucket: string;
+  autonomous_cycle_count_bucket: string;
+  watchdog_state: NativeSchedulerHostWatchdogStateDto;
+  shutdown_state: NativeSchedulerHostShutdownStateDto;
+  degraded_reason?: string | null;
+  timer_task_active: boolean;
+  task_ownership_state: string;
+  current_wait_state: string;
+  pending_wake: boolean;
+  cancellation_state: string;
+  join_state: string;
+  join_timeout_category?: string | null;
+  shutdown_cleanup_status: string;
+  audit_refs: string[];
+  provenance_id: string;
+  redaction_status: string;
+  host_task_owned: boolean;
+  singleton_owner: boolean;
+  startup_auto_started: false;
+  os_service_started: false;
+  provider_direct_calls: false;
+  automatic_llm_calls: false;
+  response_execution_started: false;
+  generated_at: string;
+}
+
+export interface NativeSchedulerHostCycleSummaryDto {
+  host_cycle_id: string;
+  orchestrator_id: string;
+  controller_id: string;
+  cycle_origin: NativeSchedulerCycleOriginDto;
+  wake_reason: NativeSchedulerHostWakeReasonDto;
+  lifecycle_state: NativeSchedulerHostLifecycleStateDto;
+  health_state: NativeSchedulerHostHealthStateDto;
+  wake_state: NativeSchedulerHostWakeStateDto;
+  scheduler_cycle_ref?: string | null;
+  tick_invoked: boolean;
+  no_due_work: boolean;
+  degraded: boolean;
+  cancelled: boolean;
+  cycle_gate_busy: boolean;
+  emitted_topics: string[];
+  audit_refs: string[];
+  provenance_id: string;
+  redaction_status: string;
+  provider_direct_calls: false;
+  automatic_llm_calls: false;
+  response_execution_started: false;
+  generated_at: string;
+}
+
+export interface NativeSchedulerHostAuditEntryDto {
+  audit_id: string;
+  action: NativeSchedulerHostActionDto;
+  resulting_lifecycle_state: NativeSchedulerHostLifecycleStateDto;
+  wake_reason?: NativeSchedulerHostWakeReasonDto | null;
+  time_bucket: string;
+  provenance_id: string;
+  summary_redacted: string;
+}
+
+export interface NativeSchedulerHostStartPreviewDto {
+  status: NativeSchedulerHostStatusDto;
+  start_allowed: boolean;
+  blocked_reason?: string | null;
+  task_created: false;
+  tick_invoked: false;
+  provider_direct_calls: false;
+  automatic_llm_calls: false;
+  response_execution_started: false;
+  boundary_summary_redacted: string;
+}
+
+export interface NativeSchedulerHostActionResultDto {
+  status: NativeSchedulerHostStatusDto;
+  latest_host_cycle?: NativeSchedulerHostCycleSummaryDto | null;
+  audit_entry: NativeSchedulerHostAuditEntryDto;
+  emitted_topics: string[];
+  preview_only: false;
+  task_created: boolean;
+  tick_invoked: boolean;
+  provider_direct_calls: false;
+  automatic_llm_calls: false;
+  response_execution_started: false;
+}
+
+export interface NativeSchedulerHostHealthSummaryDto {
+  status: NativeSchedulerHostStatusDto;
+  latest_cycle?: NativeSchedulerHostCycleSummaryDto | null;
+  latest_wake_reason?: NativeSchedulerHostWakeReasonDto | null;
+  watchdog_state: NativeSchedulerHostWatchdogStateDto;
+  shutdown_state: NativeSchedulerHostShutdownStateDto;
+  delayed_wake_count_bucket: string;
+  no_op_wake_count_bucket: string;
+  degraded_wake_count_bucket: string;
+  successful_wake_count_bucket: string;
+  session_bound: true;
+  startup_auto_run: false;
+  os_service: false;
+  automatic_llm_calls: false;
+  response_execution_started: false;
+  generated_at: string;
 }

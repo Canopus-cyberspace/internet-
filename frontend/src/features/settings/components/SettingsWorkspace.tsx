@@ -49,6 +49,8 @@ import {
   useNativeSamplerReadinessSummaryQuery,
   useNativeSamplerRuntimeSummaryQuery,
   useNativeSchedulerOperationalSummaryQuery,
+  useNativeSchedulerHostHealthQuery,
+  useNativeSchedulerHostStatusQuery,
   useNativeSchedulerSummaryQuery,
   useFutureSecurityFactMappingSummaryQuery,
   useMissingEndpointVisibilitySummaryQuery,
@@ -58,6 +60,12 @@ import {
   useApplyNativeSchedulerActionMutation,
   usePreviewNativeSamplerActivationMutation,
   usePreviewNativeSchedulerEnablementMutation,
+  usePreviewNativeSchedulerHostStartMutation,
+  useStartNativeSchedulerHostMutation,
+  usePauseNativeSchedulerHostMutation,
+  useResumeNativeSchedulerHostMutation,
+  useWakeNativeSchedulerHostMutation,
+  useStopNativeSchedulerHostMutation,
   usePreviewNativePermissionRequestMutation,
   useUpdateNativePermissionMutation,
   useUpdateLlmAlertStorySettingsMutation,
@@ -1517,6 +1525,14 @@ function NativeSamplerRuntimeRow({
         {stringifySafe(status.fact_refs.length)}; latest batch{" "}
         {status.latest_batch_id ? "available" : "none"}.
       </small>
+      <small>
+        Source {status.counters.provider_enabled_count}; raw{" "}
+        {status.counters.raw_record_count}; normalized{" "}
+        {status.counters.normalized_record_count}; batches{" "}
+        {status.counters.published_batch_count}; EventBus{" "}
+        {status.counters.eventbus_publication_count}; downstream consumed{" "}
+        {status.counters.detector_observations_consumed_count}.
+      </small>
       <div className="settings-action-row">
         <button
           type="button"
@@ -1589,10 +1605,21 @@ function NativeSamplerRuntimeRow({
 function NativeContinuousSamplingPanel() {
   const schedulerQuery = useNativeSchedulerSummaryQuery();
   const operationalQuery = useNativeSchedulerOperationalSummaryQuery();
+  const hostStatusQuery = useNativeSchedulerHostStatusQuery();
+  const hostHealthQuery = useNativeSchedulerHostHealthQuery();
   const previewMutation = usePreviewNativeSchedulerEnablementMutation();
   const actionMutation = useApplyNativeSchedulerActionMutation();
+  const hostPreviewMutation = usePreviewNativeSchedulerHostStartMutation();
+  const hostStartMutation = useStartNativeSchedulerHostMutation();
+  const hostPauseMutation = usePauseNativeSchedulerHostMutation();
+  const hostResumeMutation = useResumeNativeSchedulerHostMutation();
+  const hostWakeMutation = useWakeNativeSchedulerHostMutation();
+  const hostStopMutation = useStopNativeSchedulerHostMutation();
   const scheduler = schedulerQuery.data;
   const operational = operationalQuery.data;
+  const hostStatus = hostStatusQuery.data;
+  const hostHealth = hostHealthQuery.data;
+  const latestHostCycle = hostHealth?.latest_cycle;
   const status = operational?.status ?? scheduler?.status;
   const latestBackpressure =
     operational?.backpressure_summary ?? scheduler?.latest_cycle?.backpressure;
@@ -1602,6 +1629,13 @@ function NativeContinuousSamplingPanel() {
     operational?.missed_sample_summary ?? scheduler?.latest_cycle?.missed_sample;
   const retrySummary = operational?.retry_summary;
   const pending = previewMutation.isPending || actionMutation.isPending;
+  const hostPending =
+    hostPreviewMutation.isPending ||
+    hostStartMutation.isPending ||
+    hostPauseMutation.isPending ||
+    hostResumeMutation.isPending ||
+    hostWakeMutation.isPending ||
+    hostStopMutation.isPending;
 
   const act = (action: NativeSchedulerActionDto, samplerId?: string) => {
     actionMutation.mutate({
@@ -1823,6 +1857,250 @@ function NativeContinuousSamplingPanel() {
         <button type="button" disabled={pending} onClick={() => act("refresh_status")}>
           Refresh status
         </button>
+      </div>
+      <div className="settings-subpanel">
+        <div className="analysis-panel-header">
+          <strong>Autonomous Host</strong>
+          <Radio size={14} aria-hidden="true" />
+        </div>
+        <div className="settings-warning-banner">
+          <ShieldCheck size={15} aria-hidden="true" />
+          <span>
+            Session-bound autonomous monitoring starts only by explicit user action.
+            It is not an OS service, does not auto-run on startup, does not execute
+            responses, does not auto-restart, and never calls LLM providers
+            automatically.
+          </span>
+        </div>
+        <div className="settings-status-grid">
+          <SettingsStatusRow
+            row={{
+              label: "Host lifecycle",
+              value: humanize(hostStatus?.lifecycle_state ?? "disabled"),
+              detail: `Scheduler configured: ${status?.periodic_sampling_enabled ? "yes" : "no"}; controller running: ${status?.controller_state === "running" ? "yes" : "no"}; host owned: ${hostStatus?.host_task_owned ? "yes" : "no"}.`,
+              tone:
+                hostStatus?.lifecycle_state === "running"
+                  ? "warning"
+                  : hostStatus?.lifecycle_state === "degraded" ||
+                      hostStatus?.lifecycle_state === "failed" ||
+                      hostStatus?.lifecycle_state === "revoked"
+                    ? "blocked"
+                    : hostStatus?.lifecycle_state === "paused"
+                      ? "neutral"
+                      : "ok",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Timer task",
+              value: hostStatus?.timer_task_active ? "Active" : "Inactive",
+              detail: `Ownership ${humanize(hostStatus?.task_ownership_state ?? "released")}; wait ${humanize(hostStatus?.current_wait_state ?? "inactive")}; pending wake ${hostStatus?.pending_wake ? "yes" : "no"}.`,
+              tone: hostStatus?.timer_task_active
+                ? "ok"
+                : hostStatus?.lifecycle_state === "running"
+                  ? "warning"
+                  : "neutral",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Host health",
+              value: humanize(hostStatus?.health_state ?? "stopped"),
+              detail: `Watchdog ${humanize(hostStatus?.watchdog_state ?? "stopped")}; shutdown ${humanize(hostStatus?.shutdown_state ?? "completed")}.`,
+              tone:
+                hostStatus?.health_state === "healthy" ||
+                hostStatus?.health_state === "idle"
+                  ? "ok"
+                  : hostStatus?.health_state === "delayed" ||
+                      hostStatus?.health_state === "degraded"
+                    ? "warning"
+                    : hostStatus?.health_state === "failed" ||
+                        hostStatus?.health_state === "unresponsive"
+                      ? "blocked"
+                      : "neutral",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Shutdown join",
+              value: humanize(hostStatus?.join_state ?? "joined"),
+              detail: `Cancellation ${humanize(hostStatus?.cancellation_state ?? "none")}; cleanup ${humanize(hostStatus?.shutdown_cleanup_status ?? "completed")}; timeout ${humanize(hostStatus?.join_timeout_category ?? "none")}.`,
+              tone:
+                hostStatus?.join_state === "timed_out" ||
+                hostStatus?.join_timeout_category
+                  ? "blocked"
+                  : hostStatus?.join_state === "joining"
+                    ? "warning"
+                    : "neutral",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Wake state",
+              value: humanize(hostStatus?.wake_state ?? "idle"),
+              detail: `Reason ${humanize(hostStatus?.latest_wake_reason ?? "status_reconciliation")}; next ${humanize(hostStatus?.next_wake_bucket ?? "not_running")}; last ${humanize(hostStatus?.last_wake_bucket ?? "none")}.`,
+              tone: hostStatus?.wake_state === "woken" ? "ok" : "neutral",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Eligible samplers",
+              value: humanize(hostStatus?.eligible_sampler_count_bucket ?? "none"),
+              detail: `Enabled ${humanize(hostStatus?.enabled_sampler_count_bucket ?? "none")}; valid activated schedule rows are required before Start.`,
+              tone:
+                hostStatus?.eligible_sampler_count_bucket === "none"
+                  ? "neutral"
+                  : "ok",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Latest autonomous cycle",
+              value: latestHostCycle?.scheduler_cycle_ref
+                ? "Scheduler tick ref"
+                : latestHostCycle?.cycle_gate_busy
+                  ? "Gate busy"
+                  : "No cycle",
+              detail: `Origin ${humanize(latestHostCycle?.cycle_origin ?? "autonomous")}; tick invoked ${latestHostCycle?.tick_invoked ? "yes" : "no"}; no-due ${latestHostCycle?.no_due_work ? "yes" : "no"}.`,
+              tone:
+                latestHostCycle?.degraded || latestHostCycle?.cycle_gate_busy
+                  ? "warning"
+                  : latestHostCycle?.scheduler_cycle_ref
+                    ? "ok"
+                    : "neutral",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Cycle counts",
+              value: `Auto ${humanize(hostStatus?.autonomous_cycle_count_bucket ?? "none")}`,
+              detail: `Manual ${humanize(hostStatus?.manual_cycle_count_bucket ?? "none")}; success ${humanize(hostStatus?.successful_wake_count_bucket ?? "none")}; no-op ${humanize(hostStatus?.no_op_wake_count_bucket ?? "none")}.`,
+              tone: "neutral",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Wake quality",
+              value: `Delayed ${humanize(hostHealth?.delayed_wake_count_bucket ?? "none")}`,
+              detail: `Degraded ${humanize(hostStatus?.degraded_wake_count_bucket ?? "none")}; cancelled ${humanize(hostStatus?.cancelled_wake_count_bucket ?? "none")}; restarts ${humanize(hostStatus?.restart_count_bucket ?? "none")}.`,
+              tone:
+                hostStatus?.degraded_wake_count_bucket === "none"
+                  ? "ok"
+                  : "warning",
+            }}
+          />
+          <SettingsStatusRow
+            row={{
+              label: "Boundary markers",
+              value:
+                hostStatus?.startup_auto_started ||
+                hostStatus?.os_service_started ||
+                hostStatus?.provider_direct_calls ||
+                hostStatus?.automatic_llm_calls ||
+                hostStatus?.response_execution_started
+                  ? "Unexpected"
+                  : "Clean",
+              detail: "Session-bound only; no startup auto-run, OS service, direct provider calls, response execution, or automatic LLM calls.",
+              tone:
+                hostStatus?.startup_auto_started ||
+                hostStatus?.os_service_started ||
+                hostStatus?.provider_direct_calls ||
+                hostStatus?.automatic_llm_calls ||
+                hostStatus?.response_execution_started
+                  ? "blocked"
+                  : "ok",
+            }}
+          />
+        </div>
+        <div className="settings-action-row">
+          <button
+            type="button"
+            disabled={hostPending}
+            onClick={() => hostPreviewMutation.mutate()}
+          >
+            Preview start
+          </button>
+          <button
+            type="button"
+            disabled={
+              hostPending ||
+              hostStatus?.lifecycle_state === "running" ||
+              status?.controller_state !== "running"
+            }
+            onClick={() => hostStartMutation.mutate()}
+          >
+            Start autonomous monitoring
+          </button>
+          <button
+            type="button"
+            disabled={hostPending || hostStatus?.lifecycle_state !== "running"}
+            onClick={() => hostPauseMutation.mutate()}
+          >
+            Pause host
+          </button>
+          <button
+            type="button"
+            disabled={hostPending || hostStatus?.lifecycle_state !== "paused"}
+            onClick={() => hostResumeMutation.mutate()}
+          >
+            Resume host
+          </button>
+          <button
+            type="button"
+            disabled={hostPending || hostStatus?.lifecycle_state !== "running"}
+            onClick={() => hostWakeMutation.mutate()}
+          >
+            Wake now
+          </button>
+          <button
+            type="button"
+            disabled={
+              hostPending ||
+              hostStatus?.lifecycle_state === "stopped" ||
+              hostStatus?.lifecycle_state === "disabled"
+            }
+            onClick={() => hostStopMutation.mutate()}
+          >
+            Stop host
+          </button>
+        </div>
+        {hostPreviewMutation.data ? (
+          <p className="settings-message">
+            Autonomous start{" "}
+            {hostPreviewMutation.data.start_allowed ? "is eligible" : "is blocked"}:{" "}
+            {humanize(hostPreviewMutation.data.blocked_reason ?? "ready")}. Preview
+            created no task and invoked no tick.
+          </p>
+        ) : null}
+        {hostStartMutation.data ||
+        hostPauseMutation.data ||
+        hostResumeMutation.data ||
+        hostWakeMutation.data ||
+        hostStopMutation.data ? (
+          <p className="settings-message">
+            Host lifecycle is{" "}
+            {humanize(
+              (
+                hostStopMutation.data ??
+                hostWakeMutation.data ??
+                hostResumeMutation.data ??
+                hostPauseMutation.data ??
+                hostStartMutation.data
+              )?.status.lifecycle_state ?? "disabled",
+            )}
+            ; latest action remains bounded and response/LLM side effects are disabled.
+          </p>
+        ) : null}
+        {hostStatusQuery.isLoading ||
+        hostStatusQuery.isError ||
+        hostHealthQuery.isLoading ||
+        hostHealthQuery.isError ? (
+          <SettingsReadModelNotice
+            error={hostStatusQuery.isError || hostHealthQuery.isError}
+            loading={hostStatusQuery.isLoading || hostHealthQuery.isLoading}
+            readModel="native scheduler host orchestration"
+          />
+        ) : null}
       </div>
       <div className="settings-capability-status">
         {(scheduler?.schedules ?? []).map((schedule) => (
@@ -2068,6 +2346,11 @@ export function ServiceStatusPanel({
           <SettingsStatusRow key={row.label} row={row} />
         ))}
       </div>
+      {serviceStatus.mutation_authorization_status ? (
+        <MutationAuthorizationPanel
+          status={serviceStatus.mutation_authorization_status}
+        />
+      ) : null}
       {error ? (
         <SettingsReadModelNotice
           error
@@ -2084,6 +2367,76 @@ export function ServiceStatusPanel({
       )}
       <p className="settings-message">{stringifySafe(serviceStatus.message_redacted)}</p>
     </section>
+  );
+}
+
+function MutationAuthorizationPanel({
+  status,
+}: {
+  readonly status: NonNullable<
+    ServiceStatusViewDto["mutation_authorization_status"]
+  >;
+}) {
+  const rows: SettingRow[] = [
+    {
+      label: "Framework",
+      value: humanize(status.framework_state),
+      tone: ["implemented_dry_run", "implemented_narrow_execution"].includes(
+        status.framework_state,
+      )
+        ? "ok"
+        : "warning",
+    },
+    {
+      label: "Supported commands",
+      value: String(status.supported_command_count),
+      tone: "neutral",
+    },
+    {
+      label: "Dry-run only",
+      value: status.dry_run_only ? "Yes" : "No",
+      tone: status.dry_run_only ? "ok" : "warning",
+    },
+    {
+      label: "Production execution",
+      value: status.production_execution_enabled ? "Narrow IP Helper only" : "Disabled",
+      tone: status.production_execution_enabled ? "warning" : "ok",
+    },
+    {
+      label: "Last decision",
+      value: status.last_decision_category
+        ? humanize(status.last_decision_category)
+        : "None",
+      tone: "neutral",
+    },
+    {
+      label: "Caller trust",
+      value: status.caller_trust_ready ? "Ready" : "Unavailable",
+      tone: status.caller_trust_ready ? "ok" : "warning",
+    },
+    {
+      label: "Runtime ownership",
+      value: status.ownership_runtime_ready ? "Ready" : "Unavailable",
+      tone: status.ownership_runtime_ready ? "ok" : "warning",
+    },
+  ];
+  return (
+    <div className="settings-capability-status" aria-label="Mutation Authorization">
+      <div className="analysis-panel-header">
+        <strong>Mutation Authorization</strong>
+        <Lock size={15} aria-hidden="true" />
+      </div>
+      <div className="settings-status-grid">
+        {rows.map((row) => (
+          <SettingsStatusRow key={row.label} row={row} />
+        ))}
+      </div>
+      <p className="settings-message">
+        Caller verification is active. Mutation policy evaluation is available
+        with narrow execution enabled only for explicit IP Helper activate,
+        sample once, and stop commands.
+      </p>
+    </div>
   );
 }
 

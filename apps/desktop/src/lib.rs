@@ -14,23 +14,28 @@ use sentinel_app_core::{
     self as core, AlertEscalationResult, AlertStreamUpdate, ApplyRuntimeProfileRequest,
     CapabilityOverview, CaptureStatusUpdate, ComponentDetail, ComponentSummary,
     CreateResponsePlanRequest, DisableForensicModeRequest, EnableForensicModeRequest,
-    EscalateAlertRequest, ExportHistoryRecord, ExportPolicyViolation, ExportReportMutationResult,
-    ExportReportRequest, FindingStateMutationRequest, FindingStateMutationResult, FixtureRunner,
+    EndpointThreatAnalysisSummary, EscalateAlertRequest, ExportHistoryRecord,
+    ExportPolicyViolation, ExportReportMutationResult, ExportReportRequest,
+    FindingStateMutationRequest, FindingStateMutationResult, FixtureRunner,
     GenerateIncidentReportRequest, GenerateLlmAlertStoryRequest, GraphUpdateStreamUpdate,
     GraphViewRequest, HealthStreamUpdate, IncidentDetailView, IncidentStatusMutationRequest,
     IncidentStatusMutationResult, IncidentStreamUpdate, LocalProxyMetadataProviderStatus,
     LocalProxyMetadataStartRequest, MetricStreamUpdate, MutationCommandState, MutationReceipt,
-    PluginCatalogView, PluginLifecycleMutationResult, PluginLifecycleRequest,
-    PortableCaptureImportConfirmation, PortableCaptureImportFileRequest,
+    NativeSchedulerHostTimerRuntimeUpdate, PluginCatalogView, PluginLifecycleMutationResult,
+    PluginLifecycleRequest, PortableCaptureImportConfirmation, PortableCaptureImportFileRequest,
     PortableCaptureImportPreview, PortableCaptureImportResult, PreparedPortableCaptureImport,
     PrivacyWarningUpdate, ReadOnlyCommandState, ReportExportHistoryQuery, ReportGenerationResult,
     ReportProgressUpdate, ResponseApprovalMutationRequest, ResponseApprovalMutationResult,
     ResponsePlanMutationResult, ResponseStatusUpdate, RollbackResponseActionRequest,
     RollbackResponseActionResult, ServiceStatusUpdate, ServiceStatusView, SettingsMutationResult,
     StreamEventEnvelope, TauriEventDispatcher, UpdatePrivacyPolicyRequest,
-    UpdateResponsePolicyRequest,
+    UpdateResponsePolicyRequest, NATIVE_SCHEDULER_HOST_JOIN_TIMEOUT_MILLIS,
 };
 use sentinel_contracts::{
+    runtime_ownership::{
+        RuntimeMode, RuntimeOwnershipSummary, RUNTIME_OWNERSHIP_PROTOCOL_VERSION,
+        RUNTIME_OWNERSHIP_SCHEMA_VERSION,
+    },
     session_export::{
         ExportConfirmation as ExplicitExportConfirmation,
         ExportHistoryEntry as ExplicitExportHistoryEntry, ExportPreview as ExplicitExportPreview,
@@ -57,12 +62,23 @@ use sentinel_contracts::{
     NativeSamplerRuntimeActionRequest, NativeSamplerRuntimeActionResult, NativeSamplerRuntimeBatch,
     NativeSamplerRuntimeStatus, NativeSamplerRuntimeSummary, NativeSamplerScheduleStatus,
     NativeSchedulerActionRequest, NativeSchedulerActionResult, NativeSchedulerCycleSummary,
-    NativeSchedulerEnablementPreview, NativeSchedulerOperationalSummary, NativeSchedulerStatus,
-    NativeSchedulerSummary, NativeSchedulerTickRequest, NativeVisibilitySummary,
-    NavigationResolution, NavigationResolveRequest, PageRequest, PageResponse, PluginId,
-    PluginManifest, PortableCaptureInputSourceType, QueryRequest, Report, ReportId, ResponsePlan,
-    RuntimeProfile, SecurityFact, SessionId, SourceReliabilityExplanation,
-    SourceReliabilitySummary, TimelineDrillDownDetail, Timestamp, TlsObservation, TraceId,
+    NativeSchedulerEnablementPreview, NativeSchedulerHostActionResult,
+    NativeSchedulerHostHealthState, NativeSchedulerHostHealthSummary,
+    NativeSchedulerHostLifecycleState, NativeSchedulerHostShutdownState,
+    NativeSchedulerHostStartPreview, NativeSchedulerHostStatus, NativeSchedulerHostWakeReason,
+    NativeSchedulerHostWakeState, NativeSchedulerHostWatchdogState,
+    NativeSchedulerOperationalSummary, NativeSchedulerStatus, NativeSchedulerSummary,
+    NativeSchedulerTickRequest, NativeVisibilitySummary, NavigationResolution,
+    NavigationResolveRequest, NetworkFallbackPlan, NetworkProviderControllerStatus,
+    NetworkProviderStatus, NetworkVisibilitySummary, PageRequest, PageResponse, PluginId,
+    PluginManifest, PortableCaptureInputSourceType, QueryRequest, ReadModelSnapshotFreshness,
+    ReadModelSnapshotId, RedactionStatus, Report, ReportId, ResponsePlan, RuntimeProfile,
+    SecurityFact, ServiceReadCommandId, ServiceReadCommandRequest, ServiceReadCommandResponse,
+    SessionId, SourceReliabilityExplanation, SourceReliabilitySummary, TimelineDrillDownDetail,
+    Timestamp, TlsObservation, TraceId,
+};
+use sentinel_infrastructure::service_ipc::{
+    ElevatedServiceIpcClient, ServiceIpcClientError, StatusResult as ServiceIpcStatusResult,
 };
 use sentinel_platform::{component::ComponentId, ObservabilityHealthStatus};
 use sentinel_storage::{
@@ -70,6 +86,7 @@ use sentinel_storage::{
     SessionRootResolver, SqliteStoreFactory, StorageError, CAPTURE_IMPORT_PREVIEW_FILE_PREFIX,
     CAPTURE_IMPORT_PREVIEW_FILE_SUFFIX, PORTABLE_PROFILE_MARKER_FILE_NAME,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -78,7 +95,9 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process,
-    sync::Mutex,
+    sync::{Arc, Condvar, Mutex},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager, State};
 
@@ -114,6 +133,7 @@ pub const READ_ONLY_COMMAND_NAMES: &[&str] = &[
     "list_evidence_quality_records",
     "get_evidence_quality_record",
     "get_investigation_drill_down_summary",
+    "get_endpoint_threat_summary",
     "resolve_navigation_reference",
     "get_hypothesis_explanation_detail",
     "get_baseline_drill_down_detail",
@@ -169,6 +189,13 @@ pub const READ_ONLY_COMMAND_NAMES: &[&str] = &[
     "get_native_scheduler_operational_summary",
     "list_native_scheduler_cycles",
     "get_latest_native_scheduler_cycle",
+    "get_native_scheduler_host_status",
+    "get_native_scheduler_host_health",
+    "get_provider_controller_status",
+    "list_network_provider_status",
+    "get_network_provider_status",
+    "get_network_visibility_summary",
+    "get_network_fallback_plan",
     "get_portable_preferences",
 ];
 
@@ -217,6 +244,12 @@ pub const MUTATION_COMMAND_NAMES: &[&str] = &[
     "preview_native_scheduler_enablement",
     "apply_native_scheduler_action",
     "tick_native_scheduler",
+    "preview_native_scheduler_host_start",
+    "start_native_scheduler_host",
+    "pause_native_scheduler_host",
+    "resume_native_scheduler_host",
+    "wake_native_scheduler_host",
+    "stop_native_scheduler_host",
     "run_demo_story",
     "save_portable_preferences",
     "shutdown_app",
@@ -237,6 +270,764 @@ pub const STREAM_EVENT_NAMES: &[&str] = &[
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const DETACHED_PANE_CLOSED_EVENT: &str = "detached_pane_closed";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopRuntimeConstructionGate {
+    pub runtime_mode: RuntimeMode,
+    pub production_runtime_allowed: bool,
+    pub portable_fallback_allowed: bool,
+    pub native_runtime_allowed: bool,
+    pub blocked_reason: Option<String>,
+}
+
+pub fn evaluate_desktop_runtime_construction_gate(
+    runtime_mode: RuntimeMode,
+    explicit_portable_fallback: bool,
+) -> CommandResult<DesktopRuntimeConstructionGate> {
+    let mut gate = DesktopRuntimeConstructionGate {
+        runtime_mode,
+        production_runtime_allowed: false,
+        portable_fallback_allowed: false,
+        native_runtime_allowed: false,
+        blocked_reason: None,
+    };
+    match runtime_mode {
+        RuntimeMode::ServiceOwned => {
+            core::desktop_runtime_creation_gate(runtime_mode)?;
+        }
+        RuntimeMode::PortableInProcess => {
+            gate.portable_fallback_allowed = explicit_portable_fallback;
+            gate.production_runtime_allowed = explicit_portable_fallback;
+            if !explicit_portable_fallback {
+                gate.blocked_reason = Some("portable_fallback_not_authorized".to_string());
+            }
+        }
+        RuntimeMode::ProtocolIncompatible => {
+            gate.blocked_reason = Some("protocol_incompatible".to_string());
+        }
+        RuntimeMode::ServiceUnavailable | RuntimeMode::ServiceDegraded => {
+            gate.portable_fallback_allowed = explicit_portable_fallback;
+            gate.production_runtime_allowed = explicit_portable_fallback;
+            if !explicit_portable_fallback {
+                gate.blocked_reason =
+                    Some("service_unavailable_explicit_fallback_required".to_string());
+            }
+        }
+        RuntimeMode::Unresolved
+        | RuntimeMode::OwnershipTransitionPending
+        | RuntimeMode::ShutdownInProgress
+        | RuntimeMode::Failed => {
+            gate.blocked_reason = Some("runtime_ownership_not_available".to_string());
+        }
+    }
+    Ok(gate)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopRuntimeOwnershipStatus {
+    pub runtime_mode: RuntimeMode,
+    pub service_connected: bool,
+    pub service_client_state: String,
+    pub service_protocol_valid: bool,
+    pub service_schema_valid: bool,
+    pub explicit_portable_fallback: bool,
+    pub duplicate_ownership_ruled_out: bool,
+    pub cached_read_models_stale: bool,
+    pub bounded_reconnect_attempts: u8,
+    pub local_runtime_created: bool,
+    pub local_native_runtime_created: bool,
+    pub desktop_scheduler_host_owned: bool,
+    pub frontend_bridge_exposed: bool,
+    pub mutation_trust_reason: String,
+    pub reason: Option<String>,
+    pub runtime_ownership_status: Option<RuntimeOwnershipSummary>,
+}
+
+impl DesktopRuntimeOwnershipStatus {
+    fn service_owned(summary: RuntimeOwnershipSummary) -> Self {
+        Self {
+            runtime_mode: RuntimeMode::ServiceOwned,
+            service_connected: true,
+            service_client_state: "connected".to_string(),
+            service_protocol_valid: true,
+            service_schema_valid: true,
+            explicit_portable_fallback: false,
+            duplicate_ownership_ruled_out: false,
+            cached_read_models_stale: false,
+            bounded_reconnect_attempts: 0,
+            local_runtime_created: false,
+            local_native_runtime_created: false,
+            desktop_scheduler_host_owned: false,
+            frontend_bridge_exposed: true,
+            mutation_trust_reason: "production_ipc_mutation_trust_not_implemented".to_string(),
+            reason: None,
+            runtime_ownership_status: Some(summary),
+        }
+    }
+
+    fn portable_fallback() -> Self {
+        Self {
+            runtime_mode: RuntimeMode::PortableInProcess,
+            service_connected: false,
+            service_client_state: "explicit_portable_fallback".to_string(),
+            service_protocol_valid: false,
+            service_schema_valid: false,
+            explicit_portable_fallback: true,
+            duplicate_ownership_ruled_out: true,
+            cached_read_models_stale: false,
+            bounded_reconnect_attempts: 0,
+            local_runtime_created: true,
+            local_native_runtime_created: false,
+            desktop_scheduler_host_owned: false,
+            frontend_bridge_exposed: true,
+            mutation_trust_reason: "portable_default_local_actions_only".to_string(),
+            reason: Some("explicit_portable_fallback_selected".to_string()),
+            runtime_ownership_status: None,
+        }
+    }
+
+    fn service_unavailable(reason: impl Into<String>, explicit_portable_fallback: bool) -> Self {
+        if explicit_portable_fallback {
+            return Self::portable_fallback();
+        }
+        Self {
+            runtime_mode: RuntimeMode::ServiceUnavailable,
+            service_connected: false,
+            service_client_state: "unavailable".to_string(),
+            service_protocol_valid: false,
+            service_schema_valid: false,
+            explicit_portable_fallback: false,
+            duplicate_ownership_ruled_out: false,
+            cached_read_models_stale: true,
+            bounded_reconnect_attempts: 0,
+            local_runtime_created: false,
+            local_native_runtime_created: false,
+            desktop_scheduler_host_owned: false,
+            frontend_bridge_exposed: true,
+            mutation_trust_reason: "production_ipc_mutation_trust_not_implemented".to_string(),
+            reason: Some(reason.into()),
+            runtime_ownership_status: None,
+        }
+    }
+
+    fn protocol_incompatible(reason: impl Into<String>) -> Self {
+        Self {
+            runtime_mode: RuntimeMode::ProtocolIncompatible,
+            service_connected: true,
+            service_client_state: "protocol_incompatible".to_string(),
+            service_protocol_valid: false,
+            service_schema_valid: false,
+            explicit_portable_fallback: false,
+            duplicate_ownership_ruled_out: false,
+            cached_read_models_stale: true,
+            bounded_reconnect_attempts: 0,
+            local_runtime_created: false,
+            local_native_runtime_created: false,
+            desktop_scheduler_host_owned: false,
+            frontend_bridge_exposed: true,
+            mutation_trust_reason: "production_ipc_mutation_trust_not_implemented".to_string(),
+            reason: Some(reason.into()),
+            runtime_ownership_status: None,
+        }
+    }
+
+    fn service_degraded(reason: impl Into<String>) -> Self {
+        Self {
+            runtime_mode: RuntimeMode::ServiceDegraded,
+            service_connected: true,
+            service_client_state: "degraded".to_string(),
+            service_protocol_valid: true,
+            service_schema_valid: true,
+            explicit_portable_fallback: false,
+            duplicate_ownership_ruled_out: false,
+            cached_read_models_stale: true,
+            bounded_reconnect_attempts: 0,
+            local_runtime_created: false,
+            local_native_runtime_created: false,
+            desktop_scheduler_host_owned: false,
+            frontend_bridge_exposed: true,
+            mutation_trust_reason: "production_ipc_mutation_trust_not_implemented".to_string(),
+            reason: Some(reason.into()),
+            runtime_ownership_status: None,
+        }
+    }
+
+    fn mark_disconnected(&mut self) {
+        if self.runtime_mode == RuntimeMode::ServiceOwned {
+            self.runtime_mode = RuntimeMode::ServiceDegraded;
+            self.service_connected = false;
+            self.service_client_state = "reconnect_pending".to_string();
+            self.cached_read_models_stale = true;
+            self.bounded_reconnect_attempts =
+                self.bounded_reconnect_attempts.saturating_add(1).min(3);
+            self.reason = Some("service_connection_lost_cached_models_stale".to_string());
+        }
+        self.local_runtime_created = false;
+        self.local_native_runtime_created = false;
+        self.desktop_scheduler_host_owned = false;
+    }
+
+    pub fn local_core_allowed(&self) -> bool {
+        self.runtime_mode == RuntimeMode::PortableInProcess && self.explicit_portable_fallback
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DesktopRuntimeOwnershipState {
+    status: Arc<Mutex<DesktopRuntimeOwnershipStatus>>,
+}
+
+impl DesktopRuntimeOwnershipState {
+    pub fn new(status: DesktopRuntimeOwnershipStatus) -> Self {
+        Self {
+            status: Arc::new(Mutex::new(status)),
+        }
+    }
+
+    pub fn status(&self) -> CommandResult<DesktopRuntimeOwnershipStatus> {
+        self.status
+            .lock()
+            .map_err(|_| runtime_ownership_state_lock_error())
+            .map(|status| status.clone())
+    }
+
+    pub fn runtime_mode(&self) -> CommandResult<RuntimeMode> {
+        Ok(self.status()?.runtime_mode)
+    }
+
+    pub fn local_core_allowed(&self) -> CommandResult<bool> {
+        Ok(self.status()?.local_core_allowed())
+    }
+
+    pub fn mark_service_disconnected(&self) -> CommandResult<DesktopRuntimeOwnershipStatus> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| runtime_ownership_state_lock_error())?;
+        status.mark_disconnected();
+        Ok(status.clone())
+    }
+
+    pub fn replace_after_reconnect(
+        &self,
+        mut next_status: DesktopRuntimeOwnershipStatus,
+    ) -> CommandResult<DesktopRuntimeOwnershipStatus> {
+        next_status.local_runtime_created = false;
+        next_status.local_native_runtime_created = false;
+        next_status.desktop_scheduler_host_owned = false;
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| runtime_ownership_state_lock_error())?;
+        *status = next_status;
+        Ok(status.clone())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopPresentationConnectionState {
+    Connected,
+    Disconnected,
+    ReconnectPending,
+    ProtocolIncompatible,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopPresentationCacheSideEffects {
+    pub event_bus_publications: u32,
+    pub dag_runs: u32,
+    pub plugin_runtime_invocations: u32,
+    pub detector_runs: u32,
+    pub fusion_recomputes: u32,
+    pub risk_recomputes: u32,
+    pub attack_recomputes: u32,
+    pub canonical_baseline_updates: u32,
+    pub storage_writer_acquired: bool,
+    pub scheduler_started: bool,
+    pub sampler_activated: bool,
+    pub provider_calls: u32,
+    pub automatic_reports: u32,
+    pub llm_calls: u32,
+}
+
+impl DesktopPresentationCacheSideEffects {
+    pub fn all_zero(&self) -> bool {
+        self.event_bus_publications == 0
+            && self.dag_runs == 0
+            && self.plugin_runtime_invocations == 0
+            && self.detector_runs == 0
+            && self.fusion_recomputes == 0
+            && self.risk_recomputes == 0
+            && self.attack_recomputes == 0
+            && self.canonical_baseline_updates == 0
+            && !self.storage_writer_acquired
+            && !self.scheduler_started
+            && !self.sampler_activated
+            && self.provider_calls == 0
+            && self.automatic_reports == 0
+            && self.llm_calls == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopPresentationCacheRecord {
+    pub snapshot_ref: ReadModelSnapshotId,
+    pub command_id: ServiceReadCommandId,
+    pub ownership_epoch: u64,
+    pub received_time_bucket: Timestamp,
+    pub freshness_state: ReadModelSnapshotFreshness,
+    pub source_owner: String,
+    pub connection_state: DesktopPresentationConnectionState,
+    pub degraded_reason: Option<String>,
+    pub redaction_status: RedactionStatus,
+    pub canonical: bool,
+    pub superseded: bool,
+    pub truncated: bool,
+    pub item_count: usize,
+}
+
+impl DesktopPresentationCacheRecord {
+    fn from_service_response(
+        response: &ServiceReadCommandResponse,
+        source_owner: &str,
+        connection_state: DesktopPresentationConnectionState,
+    ) -> CommandResult<Self> {
+        response
+            .validate_with_declaration(&sentinel_contracts::service_read_command_declaration(
+                response.command_id,
+            ))
+            .map_err(|error| presentation_cache_error("read_command_response_invalid", error))?;
+        Ok(Self {
+            snapshot_ref: response.snapshot_id.clone(),
+            command_id: response.command_id,
+            ownership_epoch: response.ownership_epoch,
+            received_time_bucket: Timestamp::now(),
+            freshness_state: response.freshness_state,
+            source_owner: source_owner.to_string(),
+            connection_state,
+            degraded_reason: response.degraded_reason.clone(),
+            redaction_status: response.redaction_status.clone(),
+            canonical: false,
+            superseded: false,
+            truncated: response.truncated,
+            item_count: response.items.len(),
+        })
+    }
+
+    fn mark_stale(&mut self, connection_state: DesktopPresentationConnectionState) {
+        self.freshness_state = ReadModelSnapshotFreshness::Stale;
+        self.connection_state = connection_state;
+        self.degraded_reason = Some("snapshot_stale".to_string());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopPresentationCacheSnapshot {
+    pub canonical: bool,
+    pub source_owner: String,
+    pub connection_state: DesktopPresentationConnectionState,
+    pub snapshot_freshness_state: ReadModelSnapshotFreshness,
+    pub ownership_epoch: Option<u64>,
+    pub records: Vec<DesktopPresentationCacheRecord>,
+    pub superseded_records: Vec<DesktopPresentationCacheRecord>,
+    pub selected_ui_filters: Vec<String>,
+    pub current_navigation_state: Option<String>,
+    pub degraded_reasons: Vec<String>,
+    pub reconnect_pending: bool,
+    pub redaction_status: RedactionStatus,
+    pub side_effects: DesktopPresentationCacheSideEffects,
+}
+
+#[derive(Clone, Debug)]
+pub struct DesktopPresentationCache {
+    inner: Arc<Mutex<DesktopPresentationCacheSnapshot>>,
+}
+
+impl DesktopPresentationCache {
+    pub fn from_ownership_status(status: &DesktopRuntimeOwnershipStatus) -> Self {
+        let (connection_state, freshness_state, degraded_reasons, reconnect_pending) =
+            match status.runtime_mode {
+                RuntimeMode::ServiceOwned => (
+                    DesktopPresentationConnectionState::Connected,
+                    ReadModelSnapshotFreshness::Fresh,
+                    Vec::new(),
+                    false,
+                ),
+                RuntimeMode::ProtocolIncompatible => (
+                    DesktopPresentationConnectionState::ProtocolIncompatible,
+                    ReadModelSnapshotFreshness::Unavailable,
+                    vec![
+                        "protocol_incompatible".to_string(),
+                        "canonical_owner_unavailable".to_string(),
+                        "portable_fallback_requires_explicit_validation".to_string(),
+                    ],
+                    false,
+                ),
+                RuntimeMode::ServiceDegraded | RuntimeMode::ServiceUnavailable => (
+                    DesktopPresentationConnectionState::ReconnectPending,
+                    ReadModelSnapshotFreshness::Stale,
+                    disconnected_cache_reasons(),
+                    true,
+                ),
+                _ => (
+                    DesktopPresentationConnectionState::Disconnected,
+                    ReadModelSnapshotFreshness::Unavailable,
+                    vec!["canonical_owner_unavailable".to_string()],
+                    false,
+                ),
+            };
+        Self {
+            inner: Arc::new(Mutex::new(DesktopPresentationCacheSnapshot {
+                canonical: false,
+                source_owner: "service_host".to_string(),
+                connection_state,
+                snapshot_freshness_state: freshness_state,
+                ownership_epoch: status
+                    .runtime_ownership_status
+                    .as_ref()
+                    .map(|summary| summary.ownership_epoch),
+                records: Vec::new(),
+                superseded_records: Vec::new(),
+                selected_ui_filters: Vec::new(),
+                current_navigation_state: None,
+                degraded_reasons,
+                reconnect_pending,
+                redaction_status: RedactionStatus::Redacted,
+                side_effects: DesktopPresentationCacheSideEffects::default(),
+            })),
+        }
+    }
+
+    pub fn snapshot(&self) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        self.inner
+            .lock()
+            .map_err(|_| presentation_cache_lock_error())
+            .map(|snapshot| snapshot.clone())
+    }
+
+    pub fn install_service_snapshot(
+        &self,
+        response: ServiceReadCommandResponse,
+    ) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        let mut snapshot = self
+            .inner
+            .lock()
+            .map_err(|_| presentation_cache_lock_error())?;
+        cache_service_response(&mut snapshot, response)?;
+        Ok(snapshot.clone())
+    }
+
+    pub fn mark_disconnected(&self) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        let mut snapshot = self
+            .inner
+            .lock()
+            .map_err(|_| presentation_cache_lock_error())?;
+        snapshot.connection_state = DesktopPresentationConnectionState::ReconnectPending;
+        snapshot.snapshot_freshness_state = ReadModelSnapshotFreshness::Stale;
+        snapshot.reconnect_pending = true;
+        snapshot.degraded_reasons = disconnected_cache_reasons();
+        for record in &mut snapshot.records {
+            record.mark_stale(DesktopPresentationConnectionState::ReconnectPending);
+        }
+        Ok(snapshot.clone())
+    }
+
+    pub fn mark_protocol_incompatible(
+        &self,
+        reason: impl Into<String>,
+    ) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        let mut snapshot = self
+            .inner
+            .lock()
+            .map_err(|_| presentation_cache_lock_error())?;
+        snapshot.connection_state = DesktopPresentationConnectionState::ProtocolIncompatible;
+        snapshot.snapshot_freshness_state = ReadModelSnapshotFreshness::Unavailable;
+        snapshot.reconnect_pending = false;
+        snapshot.degraded_reasons = vec![
+            reason.into(),
+            "canonical_owner_unavailable".to_string(),
+            "portable_fallback_requires_explicit_validation".to_string(),
+        ];
+        for record in &mut snapshot.records {
+            record.mark_stale(DesktopPresentationConnectionState::ProtocolIncompatible);
+        }
+        Ok(snapshot.clone())
+    }
+
+    pub fn replace_after_reconnect(
+        &self,
+        ownership_status: &DesktopRuntimeOwnershipStatus,
+        responses: Vec<ServiceReadCommandResponse>,
+    ) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        if ownership_status.runtime_mode != RuntimeMode::ServiceOwned {
+            return self.mark_protocol_incompatible(
+                ownership_status
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "runtime_owner_not_service_owned".to_string()),
+            );
+        }
+        let summary = ownership_status
+            .runtime_ownership_status
+            .as_ref()
+            .ok_or_else(|| {
+                presentation_cache_policy_error("service_owned_runtime_summary_missing")
+            })?;
+        let expected_epoch = summary.ownership_epoch;
+        if expected_epoch == 0 {
+            return Err(presentation_cache_policy_error(
+                "service_owned_runtime_epoch_missing",
+            ));
+        }
+        if responses.is_empty() {
+            return Err(presentation_cache_policy_error(
+                "fresh_service_snapshots_required",
+            ));
+        }
+        if responses
+            .iter()
+            .any(|response| response.ownership_epoch != expected_epoch)
+        {
+            return Err(presentation_cache_policy_error(
+                "service_snapshot_epoch_mismatch",
+            ));
+        }
+
+        let mut snapshot = self
+            .inner
+            .lock()
+            .map_err(|_| presentation_cache_lock_error())?;
+        if snapshot.ownership_epoch != Some(expected_epoch) {
+            supersede_current_records(&mut snapshot);
+            snapshot.ownership_epoch = Some(expected_epoch);
+        }
+        snapshot.connection_state = DesktopPresentationConnectionState::Connected;
+        snapshot.snapshot_freshness_state = ReadModelSnapshotFreshness::Fresh;
+        snapshot.source_owner = "service_host".to_string();
+        snapshot.reconnect_pending = false;
+        snapshot.degraded_reasons.clear();
+        for response in responses {
+            cache_service_response(&mut snapshot, response)?;
+        }
+        Ok(snapshot.clone())
+    }
+}
+
+fn cache_service_response(
+    snapshot: &mut DesktopPresentationCacheSnapshot,
+    response: ServiceReadCommandResponse,
+) -> CommandResult<()> {
+    let record = DesktopPresentationCacheRecord::from_service_response(
+        &response,
+        "service_host",
+        snapshot.connection_state,
+    )?;
+    if let Some(epoch) = snapshot.ownership_epoch {
+        if epoch != record.ownership_epoch {
+            supersede_current_records(snapshot);
+            snapshot.ownership_epoch = Some(record.ownership_epoch);
+        }
+    } else {
+        snapshot.ownership_epoch = Some(record.ownership_epoch);
+    }
+    snapshot
+        .records
+        .retain(|existing| existing.command_id != record.command_id);
+    snapshot.records.push(record);
+    snapshot
+        .records
+        .sort_by_key(|record| (record.ownership_epoch, record.command_id));
+    snapshot.snapshot_freshness_state = snapshot
+        .records
+        .iter()
+        .map(|record| record.freshness_state)
+        .max()
+        .unwrap_or(ReadModelSnapshotFreshness::Unavailable);
+    snapshot.redaction_status = RedactionStatus::Redacted;
+    snapshot.canonical = false;
+    Ok(())
+}
+
+fn supersede_current_records(snapshot: &mut DesktopPresentationCacheSnapshot) {
+    for mut record in snapshot.records.drain(..) {
+        record.superseded = true;
+        record.mark_stale(DesktopPresentationConnectionState::Connected);
+        snapshot.superseded_records.push(record);
+    }
+}
+
+fn disconnected_cache_reasons() -> Vec<String> {
+    vec![
+        "service_disconnected".to_string(),
+        "snapshot_stale".to_string(),
+        "canonical_owner_unavailable".to_string(),
+        "reconnect_pending".to_string(),
+        "portable_fallback_requires_explicit_validation".to_string(),
+    ]
+}
+
+pub fn evaluate_desktop_runtime_construction_gate_for_status(
+    status: &DesktopRuntimeOwnershipStatus,
+    explicit_portable_fallback: bool,
+) -> CommandResult<DesktopRuntimeConstructionGate> {
+    if status.local_core_allowed() {
+        return evaluate_desktop_runtime_construction_gate(RuntimeMode::PortableInProcess, true);
+    }
+    let mut gate = DesktopRuntimeConstructionGate {
+        runtime_mode: status.runtime_mode,
+        production_runtime_allowed: false,
+        portable_fallback_allowed: false,
+        native_runtime_allowed: false,
+        blocked_reason: status.reason.clone(),
+    };
+    if explicit_portable_fallback {
+        if status.duplicate_ownership_ruled_out {
+            gate.runtime_mode = RuntimeMode::PortableInProcess;
+            gate.production_runtime_allowed = true;
+            gate.portable_fallback_allowed = true;
+            gate.blocked_reason = None;
+        } else {
+            gate.blocked_reason = Some("duplicate_ownership_not_ruled_out".to_string());
+        }
+    } else if matches!(
+        status.runtime_mode,
+        RuntimeMode::ServiceDegraded
+            | RuntimeMode::ServiceUnavailable
+            | RuntimeMode::ProtocolIncompatible
+    ) {
+        gate.blocked_reason = Some("portable_fallback_requires_explicit_validation".to_string());
+    } else if status.runtime_mode == RuntimeMode::ServiceOwned {
+        gate.blocked_reason = Some("service_owned_runtime_active".to_string());
+    }
+    Ok(gate)
+}
+
+pub fn negotiate_desktop_runtime_ownership(
+    service_status: Result<ServiceIpcStatusResult, ServiceIpcClientError>,
+    explicit_portable_fallback: bool,
+) -> DesktopRuntimeOwnershipStatus {
+    match service_status {
+        Ok(status) => negotiate_desktop_runtime_ownership_from_status(status),
+        Err(error) => DesktopRuntimeOwnershipStatus::service_unavailable(
+            match error.kind {
+                sentinel_infrastructure::service_ipc::ServiceIpcClientErrorKind::Protocol => {
+                    "service_protocol_error"
+                }
+                sentinel_infrastructure::service_ipc::ServiceIpcClientErrorKind::PermissionDenied => {
+                    "service_permission_denied"
+                }
+                sentinel_infrastructure::service_ipc::ServiceIpcClientErrorKind::Rejected => {
+                    "service_rejected"
+                }
+                sentinel_infrastructure::service_ipc::ServiceIpcClientErrorKind::Timeout => {
+                    "service_timeout"
+                }
+                sentinel_infrastructure::service_ipc::ServiceIpcClientErrorKind::Unreachable => {
+                    "service_unreachable"
+                }
+            },
+            explicit_portable_fallback,
+        ),
+    }
+}
+
+pub fn negotiate_desktop_runtime_ownership_from_status(
+    status: ServiceIpcStatusResult,
+) -> DesktopRuntimeOwnershipStatus {
+    let Some(summary) = status.runtime_ownership_status else {
+        return DesktopRuntimeOwnershipStatus::service_degraded(
+            "service_status_missing_runtime_ownership",
+        );
+    };
+    let protocol_valid = status
+        .runtime_protocol_version
+        .as_ref()
+        .is_some_and(|version| version == &RUNTIME_OWNERSHIP_PROTOCOL_VERSION)
+        && summary.protocol_version == RUNTIME_OWNERSHIP_PROTOCOL_VERSION;
+    let schema_valid = status
+        .runtime_schema_version
+        .as_ref()
+        .is_some_and(|version| version == &RUNTIME_OWNERSHIP_SCHEMA_VERSION)
+        && summary.schema_version == RUNTIME_OWNERSHIP_SCHEMA_VERSION;
+    if !protocol_valid || !schema_valid {
+        return DesktopRuntimeOwnershipStatus::protocol_incompatible(
+            "runtime_protocol_or_schema_incompatible",
+        );
+    }
+    if status.runtime_ownership != Some(RuntimeMode::ServiceOwned)
+        || summary.runtime_mode != RuntimeMode::ServiceOwned
+    {
+        return DesktopRuntimeOwnershipStatus::service_degraded(
+            "service_runtime_not_service_owned",
+        );
+    }
+    if summary.validate().is_err() {
+        return DesktopRuntimeOwnershipStatus::protocol_incompatible(
+            "runtime_ownership_status_validation_failed",
+        );
+    }
+    DesktopRuntimeOwnershipStatus::service_owned(summary)
+}
+
+pub struct DesktopStartupRuntimeAssembly {
+    pub runtime_ownership: DesktopRuntimeOwnershipState,
+    pub read_state: DesktopReadState,
+    pub mutation_state: DesktopMutationState,
+    pub storage_state: DesktopStorageState,
+    pub service_status: ServiceStatusView,
+}
+
+pub fn assemble_desktop_startup_runtime(
+    startup_config: DemoStartupConfig,
+    ownership_status: DesktopRuntimeOwnershipStatus,
+) -> CommandResult<DesktopStartupRuntimeAssembly> {
+    let runtime_ownership = DesktopRuntimeOwnershipState::new(ownership_status);
+    let ownership_snapshot = runtime_ownership.status()?;
+    let storage_state = bootstrap_storage_state_for_runtime(startup_config, &ownership_snapshot);
+    let service_status = service_status_for_runtime(&storage_state, &ownership_snapshot);
+    let (read_state, mutation_state) = if ownership_snapshot.local_core_allowed() {
+        evaluate_desktop_runtime_construction_gate(RuntimeMode::PortableInProcess, true)?;
+        let mutation_core = core::RuntimeContainerBuilder::for_portable_fallback(true)
+            .build_portable_mutation_state()?;
+        let read_core = mutation_core
+            .read_state()
+            .clone()
+            .with_service_status(service_status.clone());
+        (
+            DesktopReadState::from_core_with_runtime_state(
+                read_core,
+                service_status.clone(),
+                runtime_ownership.clone(),
+            ),
+            DesktopMutationState::from_core_with_runtime_state(
+                mutation_core,
+                runtime_ownership.clone(),
+            ),
+        )
+    } else {
+        (
+            DesktopReadState::service_client_only(
+                service_status.clone(),
+                runtime_ownership.clone(),
+            ),
+            DesktopMutationState::service_client_only(runtime_ownership.clone()),
+        )
+    };
+
+    Ok(DesktopStartupRuntimeAssembly {
+        runtime_ownership,
+        read_state,
+        mutation_state,
+        storage_state,
+        service_status,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DetachedPaneConfig {
@@ -525,6 +1316,12 @@ pub fn read_only_invoke_handler<R: tauri::Runtime>(
         list_evidence_quality_records,
         get_evidence_quality_record,
         get_investigation_drill_down_summary,
+        get_endpoint_threat_summary,
+        get_provider_controller_status,
+        list_network_provider_status,
+        get_network_provider_status,
+        get_network_visibility_summary,
+        get_network_fallback_plan,
         resolve_navigation_reference,
         get_hypothesis_explanation_detail,
         get_baseline_drill_down_detail,
@@ -636,45 +1433,229 @@ pub fn mutation_invoke_handler<R: tauri::Runtime>(
 
 #[derive(Debug)]
 pub struct DesktopReadState {
-    core: Mutex<ReadOnlyCommandState>,
+    core: Option<Arc<Mutex<ReadOnlyCommandState>>>,
+    runtime_ownership: DesktopRuntimeOwnershipState,
+    service_status_cache: Arc<Mutex<ServiceStatusView>>,
+    presentation_cache: DesktopPresentationCache,
 }
 
 impl DesktopReadState {
+    #[cfg(test)]
     pub fn bootstrap() -> CommandResult<Self> {
+        let service_status = ServiceStatusView::reduced_visibility();
+        let ownership_status = DesktopRuntimeOwnershipStatus::portable_fallback();
+        let runtime_ownership = DesktopRuntimeOwnershipState::new(ownership_status.clone());
         Ok(Self {
-            core: Mutex::new(ReadOnlyCommandState::bootstrap()?),
+            core: Some(Arc::new(Mutex::new(ReadOnlyCommandState::bootstrap()?))),
+            runtime_ownership,
+            service_status_cache: Arc::new(Mutex::new(service_status)),
+            presentation_cache: DesktopPresentationCache::from_ownership_status(&ownership_status),
         })
     }
 
+    #[cfg(test)]
     pub fn bootstrap_with_service_status(service_status: ServiceStatusView) -> CommandResult<Self> {
+        Self::bootstrap_local_with_runtime_state(
+            service_status,
+            DesktopRuntimeOwnershipState::new(DesktopRuntimeOwnershipStatus::portable_fallback()),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn bootstrap_local_with_runtime_state(
+        service_status: ServiceStatusView,
+        runtime_ownership: DesktopRuntimeOwnershipState,
+    ) -> CommandResult<Self> {
+        let ownership_status = runtime_ownership.status()?;
         Ok(Self {
-            core: Mutex::new(
-                ReadOnlyCommandState::bootstrap()?.with_service_status(service_status),
-            ),
+            core: Some(Arc::new(Mutex::new(
+                ReadOnlyCommandState::bootstrap()?.with_service_status(service_status.clone()),
+            ))),
+            runtime_ownership,
+            service_status_cache: Arc::new(Mutex::new(service_status)),
+            presentation_cache: DesktopPresentationCache::from_ownership_status(&ownership_status),
         })
     }
 
     pub fn from_core(core: ReadOnlyCommandState) -> Self {
+        let ownership_status = DesktopRuntimeOwnershipStatus::portable_fallback();
+        let runtime_ownership = DesktopRuntimeOwnershipState::new(ownership_status.clone());
         Self {
-            core: Mutex::new(core),
+            core: Some(Arc::new(Mutex::new(core))),
+            runtime_ownership,
+            service_status_cache: Arc::new(Mutex::new(ServiceStatusView::reduced_visibility())),
+            presentation_cache: DesktopPresentationCache::from_ownership_status(&ownership_status),
         }
+    }
+
+    pub fn from_core_with_runtime_state(
+        core: ReadOnlyCommandState,
+        service_status: ServiceStatusView,
+        runtime_ownership: DesktopRuntimeOwnershipState,
+    ) -> Self {
+        let ownership_status = runtime_ownership.status().unwrap_or_else(|_| {
+            DesktopRuntimeOwnershipStatus::service_unavailable(
+                "runtime_ownership_status_unavailable",
+                false,
+            )
+        });
+        Self {
+            core: Some(Arc::new(Mutex::new(core))),
+            runtime_ownership,
+            service_status_cache: Arc::new(Mutex::new(service_status)),
+            presentation_cache: DesktopPresentationCache::from_ownership_status(&ownership_status),
+        }
+    }
+
+    pub fn service_client_only(
+        service_status: ServiceStatusView,
+        runtime_ownership: DesktopRuntimeOwnershipState,
+    ) -> Self {
+        let ownership_status = runtime_ownership.status().unwrap_or_else(|_| {
+            DesktopRuntimeOwnershipStatus::service_unavailable(
+                "runtime_ownership_status_unavailable",
+                false,
+            )
+        });
+        Self {
+            core: None,
+            runtime_ownership,
+            service_status_cache: Arc::new(Mutex::new(service_status)),
+            presentation_cache: DesktopPresentationCache::from_ownership_status(&ownership_status),
+        }
+    }
+
+    pub fn shared_core(&self) -> Arc<Mutex<ReadOnlyCommandState>> {
+        Arc::clone(
+            self.core
+                .as_ref()
+                .expect("desktop local core unavailable in service-owned mode"),
+        )
+    }
+
+    pub fn runtime_ownership_status(&self) -> CommandResult<DesktopRuntimeOwnershipStatus> {
+        self.runtime_ownership.status()
+    }
+
+    pub fn local_core_available(&self) -> bool {
+        self.core.is_some()
+    }
+
+    pub fn presentation_cache_snapshot(&self) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        self.presentation_cache.snapshot()
+    }
+
+    pub fn install_service_snapshot(
+        &self,
+        response: ServiceReadCommandResponse,
+    ) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        self.presentation_cache.install_service_snapshot(response)
+    }
+
+    pub fn refresh_presentation_cache_from_service_client(
+        &self,
+        client: &ElevatedServiceIpcClient,
+    ) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        let ownership = negotiate_desktop_runtime_ownership(client.status(), false);
+        if ownership.runtime_mode != RuntimeMode::ServiceOwned {
+            return self.reconnect_service_snapshots(ownership, Vec::new());
+        }
+        let responses = ServiceReadCommandId::all()
+            .iter()
+            .map(|command| {
+                client
+                    .read_command(*command, ServiceReadCommandRequest::default())
+                    .map_err(|error| service_ipc_read_error(*command, error))
+            })
+            .collect::<CommandResult<Vec<_>>>()?;
+        self.reconnect_service_snapshots(ownership, responses)
+    }
+
+    pub fn reconnect_service_snapshots(
+        &self,
+        ownership_status: DesktopRuntimeOwnershipStatus,
+        responses: Vec<ServiceReadCommandResponse>,
+    ) -> CommandResult<DesktopPresentationCacheSnapshot> {
+        let replaced = self
+            .runtime_ownership
+            .replace_after_reconnect(ownership_status.clone())?;
+        let cache = self
+            .presentation_cache
+            .replace_after_reconnect(&replaced, responses)?;
+        let mut cached_status = self
+            .service_status_cache
+            .lock()
+            .map_err(|_| read_state_lock_error())?;
+        cached_status.connected = replaced.service_connected;
+        cached_status.degraded = replaced.runtime_mode != RuntimeMode::ServiceOwned;
+        cached_status.reason = replaced.reason.clone();
+        cached_status.elevated_service_status = if replaced.service_connected {
+            ObservabilityHealthStatus::Healthy
+        } else {
+            ObservabilityHealthStatus::Disconnected
+        };
+        cached_status.ipc_status = if replaced.runtime_mode == RuntimeMode::ProtocolIncompatible {
+            ObservabilityHealthStatus::Degraded
+        } else if replaced.service_connected {
+            ObservabilityHealthStatus::Healthy
+        } else {
+            ObservabilityHealthStatus::Disconnected
+        };
+        cached_status.reduced_visibility = replaced.runtime_mode != RuntimeMode::ServiceOwned;
+        cached_status.message_redacted = if replaced.runtime_mode == RuntimeMode::ServiceOwned {
+            "ServiceHost snapshots refreshed; desktop cache remains non-canonical".to_string()
+        } else {
+            "ServiceHost reconnect did not produce compatible snapshots; no local native runtime was created"
+                .to_string()
+        };
+        cached_status.generated_at = Timestamp::now();
+        Ok(cache)
+    }
+
+    pub fn mark_service_disconnected(&self) -> CommandResult<DesktopRuntimeOwnershipStatus> {
+        let status = self.runtime_ownership.mark_service_disconnected()?;
+        self.presentation_cache.mark_disconnected()?;
+        let mut cached = self
+            .service_status_cache
+            .lock()
+            .map_err(|_| read_state_lock_error())?;
+        cached.connected = false;
+        cached.degraded = true;
+        cached.reason = Some("service_connection_lost_cached_models_stale".to_string());
+        cached.elevated_service_status = ObservabilityHealthStatus::Disconnected;
+        cached.ipc_status = ObservabilityHealthStatus::Disconnected;
+        cached.reduced_visibility = true;
+        cached.message_redacted =
+            "ServiceHost connection lost; cached read models are stale and no local native runtime was created"
+                .to_string();
+        cached.generated_at = Timestamp::now();
+        Ok(status)
     }
 
     pub fn with_core<T>(
         &self,
         read: impl FnOnce(&ReadOnlyCommandState) -> CommandResult<T>,
     ) -> CommandResult<T> {
-        let core = self.core.lock().map_err(|_| read_state_lock_error())?;
+        let Some(core) = &self.core else {
+            return Err(desktop_read_model_unavailable_error());
+        };
+        let core = core.lock().map_err(|_| read_state_lock_error())?;
         read(&core)
     }
 
     pub fn snapshot_core(&self) -> CommandResult<ReadOnlyCommandState> {
-        let core = self.core.lock().map_err(|_| read_state_lock_error())?;
+        let Some(core) = &self.core else {
+            return Err(desktop_read_model_unavailable_error());
+        };
+        let core = core.lock().map_err(|_| read_state_lock_error())?;
         Ok(core.clone())
     }
 
     pub fn replace_core(&self, read_state: ReadOnlyCommandState) -> CommandResult<()> {
-        let mut core = self.core.lock().map_err(|_| read_state_lock_error())?;
+        let Some(core) = &self.core else {
+            return Ok(());
+        };
+        let mut core = core.lock().map_err(|_| read_state_lock_error())?;
         *core = read_state;
         Ok(())
     }
@@ -683,7 +1664,10 @@ impl DesktopReadState {
         &self,
         read_model: core::DemoStoryReadModel,
     ) -> CommandResult<ReadOnlyCommandState> {
-        let mut core = self.core.lock().map_err(|_| read_state_lock_error())?;
+        let Some(core) = &self.core else {
+            return Err(desktop_read_model_unavailable_error());
+        };
+        let mut core = core.lock().map_err(|_| read_state_lock_error())?;
         let updated = read_model.into_read_state(core.clone());
         *core = updated.clone();
         Ok(updated)
@@ -849,6 +1833,33 @@ impl DesktopReadState {
         &self,
     ) -> CommandResult<InvestigationDrillDownSummary> {
         self.with_core(core::get_investigation_drill_down_summary)
+    }
+
+    pub fn get_endpoint_threat_summary(&self) -> CommandResult<EndpointThreatAnalysisSummary> {
+        self.with_core(core::get_endpoint_threat_summary)
+    }
+
+    pub fn get_provider_controller_status(&self) -> CommandResult<NetworkProviderControllerStatus> {
+        self.with_core(core::get_provider_controller_status)
+    }
+
+    pub fn list_network_provider_status(&self) -> CommandResult<Vec<NetworkProviderStatus>> {
+        self.with_core(core::list_network_provider_status)
+    }
+
+    pub fn get_network_provider_status(
+        &self,
+        provider_id: String,
+    ) -> CommandResult<NetworkProviderStatus> {
+        self.with_core(|core| core::get_network_provider_status(core, provider_id))
+    }
+
+    pub fn get_network_visibility_summary(&self) -> CommandResult<NetworkVisibilitySummary> {
+        self.with_core(core::get_network_visibility_summary)
+    }
+
+    pub fn get_network_fallback_plan(&self) -> CommandResult<NetworkFallbackPlan> {
+        self.with_core(core::get_network_fallback_plan)
     }
 
     pub fn resolve_navigation_reference(
@@ -1041,14 +2052,29 @@ impl DesktopReadState {
     }
 
     pub fn get_service_status(&self) -> CommandResult<ServiceStatusView> {
-        self.with_core(core::get_service_status)
+        if self.core.is_some() {
+            return self.with_core(core::get_service_status);
+        }
+        self.service_status_cache
+            .lock()
+            .map_err(|_| read_state_lock_error())
+            .map(|status| status.clone())
     }
 
     pub fn search_service_status(
         &self,
         request: QueryRequest,
     ) -> CommandResult<PageResponse<ServiceStatusView>> {
-        self.with_core(|core| core::search_service_status(core, request))
+        if self.core.is_some() {
+            return self.with_core(|core| core::search_service_status(core, request));
+        }
+        let status = self.get_service_status()?;
+        Ok(PageResponse::from_request(
+            vec![status],
+            &request.page,
+            None,
+            false,
+        ))
     }
 
     pub fn list_authorized_native_capabilities(
@@ -1185,36 +2211,103 @@ impl DesktopReadState {
     ) -> CommandResult<Option<NativeSchedulerCycleSummary>> {
         self.with_core(core::get_latest_native_scheduler_cycle)
     }
+
+    pub fn get_native_scheduler_host_status(&self) -> CommandResult<NativeSchedulerHostStatus> {
+        self.with_core(core::get_native_scheduler_host_status)
+    }
+
+    pub fn get_native_scheduler_host_health(
+        &self,
+    ) -> CommandResult<NativeSchedulerHostHealthSummary> {
+        self.with_core(core::get_native_scheduler_host_health)
+    }
 }
 
 pub struct DesktopMutationState {
-    core: Mutex<MutationCommandState>,
+    core: Option<Arc<Mutex<MutationCommandState>>>,
+    runtime_ownership: DesktopRuntimeOwnershipState,
 }
 
 impl DesktopMutationState {
+    #[cfg(test)]
     pub fn bootstrap() -> CommandResult<Self> {
         Ok(Self {
-            core: Mutex::new(MutationCommandState::bootstrap()?),
+            core: Some(Arc::new(Mutex::new(MutationCommandState::bootstrap()?))),
+            runtime_ownership: DesktopRuntimeOwnershipState::new(
+                DesktopRuntimeOwnershipStatus::portable_fallback(),
+            ),
         })
     }
 
     pub fn from_core(core: MutationCommandState) -> Self {
         Self {
-            core: Mutex::new(core),
+            core: Some(Arc::new(Mutex::new(core))),
+            runtime_ownership: DesktopRuntimeOwnershipState::new(
+                DesktopRuntimeOwnershipStatus::portable_fallback(),
+            ),
         }
+    }
+
+    pub fn from_core_with_runtime_state(
+        core: MutationCommandState,
+        runtime_ownership: DesktopRuntimeOwnershipState,
+    ) -> Self {
+        Self {
+            core: Some(Arc::new(Mutex::new(core))),
+            runtime_ownership,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn bootstrap_local_with_runtime_state(
+        runtime_ownership: DesktopRuntimeOwnershipState,
+    ) -> CommandResult<Self> {
+        Ok(Self {
+            core: Some(Arc::new(Mutex::new(MutationCommandState::bootstrap()?))),
+            runtime_ownership,
+        })
+    }
+
+    pub fn service_client_only(runtime_ownership: DesktopRuntimeOwnershipState) -> Self {
+        Self {
+            core: None,
+            runtime_ownership,
+        }
+    }
+
+    pub fn shared_core(&self) -> Arc<Mutex<MutationCommandState>> {
+        Arc::clone(
+            self.core
+                .as_ref()
+                .expect("desktop mutation core unavailable in service-owned mode"),
+        )
+    }
+
+    pub fn runtime_ownership_status(&self) -> CommandResult<DesktopRuntimeOwnershipStatus> {
+        self.runtime_ownership.status()
+    }
+
+    pub fn local_core_available(&self) -> bool {
+        self.core.is_some()
     }
 
     pub fn with_core<T>(
         &self,
         mutation: impl FnOnce(&mut MutationCommandState) -> CommandResult<T>,
     ) -> CommandResult<T> {
-        let mut core = self.core.lock().map_err(|_| mutation_state_lock_error())?;
+        let Some(core) = &self.core else {
+            return Err(desktop_mutation_unavailable_error());
+        };
+        let mut core = core.lock().map_err(|_| mutation_state_lock_error())?;
         mutation(&mut core)
     }
 
     pub fn replace_from_read_state(&self, read_state: ReadOnlyCommandState) -> CommandResult<()> {
-        let mut core = self.core.lock().map_err(|_| mutation_state_lock_error())?;
-        *core = MutationCommandState::from_read_state(read_state)?;
+        let Some(core) = &self.core else {
+            return Ok(());
+        };
+        let mut core = core.lock().map_err(|_| mutation_state_lock_error())?;
+        core.replace_read_state_preserving_runtime(read_state)?;
         Ok(())
     }
 
@@ -1366,6 +2459,32 @@ impl DesktopMutationState {
         self.with_core(|state| state.tick_native_scheduler(request))
     }
 
+    pub fn preview_native_scheduler_host_start(
+        &self,
+    ) -> CommandResult<NativeSchedulerHostStartPreview> {
+        self.with_core(|state| state.preview_native_scheduler_host_start())
+    }
+
+    pub fn start_native_scheduler_host(&self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.with_core(|state| state.start_native_scheduler_host())
+    }
+
+    pub fn pause_native_scheduler_host(&self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.with_core(|state| state.pause_native_scheduler_host())
+    }
+
+    pub fn resume_native_scheduler_host(&self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.with_core(|state| state.resume_native_scheduler_host())
+    }
+
+    pub fn wake_native_scheduler_host(&self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.with_core(|state| state.wake_native_scheduler_host())
+    }
+
+    pub fn stop_native_scheduler_host(&self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.with_core(|state| state.stop_native_scheduler_host())
+    }
+
     pub fn get_local_metadata_proxy_status(
         &self,
     ) -> CommandResult<LocalProxyMetadataProviderStatus> {
@@ -1471,6 +2590,592 @@ impl DesktopMutationState {
     ) -> CommandResult<MutationReceipt<SettingsMutationResult>> {
         self.with_core(|state| core::disable_forensic_mode(state, request))
     }
+}
+
+#[derive(Debug, Default)]
+pub struct DesktopNativeSchedulerHostTaskState {
+    slot: Mutex<NativeSchedulerHostTaskSlot>,
+}
+
+#[derive(Debug, Default)]
+struct NativeSchedulerHostTaskSlot {
+    handle: Option<JoinHandle<()>>,
+    signal: Option<Arc<NativeSchedulerHostTaskSignal>>,
+    session_ordinal: u64,
+}
+
+#[derive(Debug)]
+struct NativeSchedulerHostTaskSignal {
+    state: Mutex<NativeSchedulerHostTaskSignalState>,
+    wake: Condvar,
+}
+
+#[derive(Debug)]
+struct NativeSchedulerHostTaskSignalState {
+    cancelled: bool,
+    pending_wake: bool,
+    reason: NativeSchedulerHostWakeReason,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NativeSchedulerHostWakeOutcome {
+    Cancelled(NativeSchedulerHostWakeReason),
+    Woken(NativeSchedulerHostWakeReason),
+    TimedOut,
+}
+
+impl Default for NativeSchedulerHostTaskSignalState {
+    fn default() -> Self {
+        Self {
+            cancelled: false,
+            pending_wake: false,
+            reason: NativeSchedulerHostWakeReason::StatusReconciliation,
+        }
+    }
+}
+
+impl NativeSchedulerHostTaskSignal {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(NativeSchedulerHostTaskSignalState::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn notify(&self, reason: NativeSchedulerHostWakeReason) -> CommandResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| native_scheduler_host_task_error("wake_signal_unavailable"))?;
+        if !state.cancelled {
+            state.pending_wake = true;
+            state.reason = reason;
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn cancel(&self, reason: NativeSchedulerHostWakeReason) -> CommandResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| native_scheduler_host_task_error("wake_signal_unavailable"))?;
+        state.cancelled = true;
+        state.pending_wake = true;
+        state.reason = reason;
+        self.wake.notify_all();
+        Ok(())
+    }
+
+    fn wait(&self, duration: Duration) -> CommandResult<NativeSchedulerHostWakeOutcome> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| native_scheduler_host_task_error("wake_signal_unavailable"))?;
+        if state.cancelled {
+            return Ok(NativeSchedulerHostWakeOutcome::Cancelled(
+                state.reason.clone(),
+            ));
+        }
+        if state.pending_wake {
+            state.pending_wake = false;
+            return Ok(NativeSchedulerHostWakeOutcome::Woken(state.reason.clone()));
+        }
+        let (mut state, timeout) = self
+            .wake
+            .wait_timeout(state, duration)
+            .map_err(|_| native_scheduler_host_task_error("wake_signal_unavailable"))?;
+        if state.cancelled {
+            return Ok(NativeSchedulerHostWakeOutcome::Cancelled(
+                state.reason.clone(),
+            ));
+        }
+        if state.pending_wake {
+            state.pending_wake = false;
+            return Ok(NativeSchedulerHostWakeOutcome::Woken(state.reason.clone()));
+        }
+        if timeout.timed_out() {
+            Ok(NativeSchedulerHostWakeOutcome::TimedOut)
+        } else {
+            Ok(NativeSchedulerHostWakeOutcome::Woken(
+                NativeSchedulerHostWakeReason::StatusReconciliation,
+            ))
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.pending_wake)
+            .unwrap_or(false)
+    }
+}
+
+impl DesktopNativeSchedulerHostTaskState {
+    pub fn ensure_started(
+        &self,
+        read_core: Arc<Mutex<ReadOnlyCommandState>>,
+        mutation_core: Arc<Mutex<MutationCommandState>>,
+    ) -> CommandResult<bool> {
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| native_scheduler_host_task_error("task_slot_unavailable"))?;
+        if let Some(handle) = slot.handle.as_ref() {
+            if !handle.is_finished() {
+                if let Some(signal) = &slot.signal {
+                    signal.notify(NativeSchedulerHostWakeReason::StatusReconciliation)?;
+                }
+                return Ok(false);
+            }
+        }
+        if let Some(handle) = slot.handle.take() {
+            let _ = handle.join();
+            slot.signal = None;
+        }
+
+        slot.session_ordinal = slot.session_ordinal.saturating_add(1);
+        let session_ordinal = slot.session_ordinal;
+        let signal = Arc::new(NativeSchedulerHostTaskSignal::new());
+        let task_signal = Arc::clone(&signal);
+        let handle = thread::Builder::new()
+            .name("sentinel_native_scheduler_host".to_string())
+            .spawn(move || {
+                let failure_read_core = Arc::clone(&read_core);
+                let failure_mutation_core = Arc::clone(&mutation_core);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_native_scheduler_host_task(
+                        read_core,
+                        mutation_core,
+                        task_signal,
+                        session_ordinal,
+                    )
+                }));
+                if outcome.is_err() {
+                    eprintln!(
+                        "NATIVE_SCHEDULER_HOST_WARN failure_category=task_panic session_bucket=current_session"
+                    );
+                    let _ = record_native_scheduler_host_task_update(
+                        &failure_read_core,
+                        &failure_mutation_core,
+                        host_task_update(
+                            Some(NativeSchedulerHostLifecycleState::Failed),
+                            false,
+                            "failed",
+                            "failed",
+                            false,
+                            "none",
+                            "joined",
+                            "completed",
+                            Some(NativeSchedulerHostWakeState::Cancelled),
+                            Some(NativeSchedulerHostHealthState::Failed),
+                            Some(NativeSchedulerHostWatchdogState::Failed),
+                            None,
+                            Some(NativeSchedulerHostWakeReason::StatusReconciliation),
+                            Some("task_panic"),
+                        ),
+                    );
+                }
+            })
+            .map_err(|_| native_scheduler_host_task_error("task_creation_failed"))?;
+        slot.signal = Some(signal);
+        slot.handle = Some(handle);
+        Ok(true)
+    }
+
+    pub fn notify(&self, reason: NativeSchedulerHostWakeReason) -> CommandResult<()> {
+        let slot = self
+            .slot
+            .lock()
+            .map_err(|_| native_scheduler_host_task_error("task_slot_unavailable"))?;
+        if let Some(signal) = &slot.signal {
+            signal.notify(reason)?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_and_join(&self, reason: NativeSchedulerHostWakeReason) -> CommandResult<bool> {
+        let (signal, handle) = {
+            let mut slot = self
+                .slot
+                .lock()
+                .map_err(|_| native_scheduler_host_task_error("task_slot_unavailable"))?;
+            let signal = slot.signal.clone();
+            let handle = slot.handle.take();
+            (signal, handle)
+        };
+
+        if let Some(signal) = &signal {
+            signal.cancel(reason)?;
+        }
+
+        let Some(handle) = handle else {
+            let mut slot = self
+                .slot
+                .lock()
+                .map_err(|_| native_scheduler_host_task_error("task_slot_unavailable"))?;
+            slot.signal = None;
+            return Ok(false);
+        };
+
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(
+                NATIVE_SCHEDULER_HOST_JOIN_TIMEOUT_MILLIS,
+            ))
+            .unwrap_or_else(Instant::now);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        if handle.is_finished() {
+            let _ = handle.join();
+            let mut slot = self
+                .slot
+                .lock()
+                .map_err(|_| native_scheduler_host_task_error("task_slot_unavailable"))?;
+            slot.signal = None;
+            Ok(true)
+        } else {
+            let mut slot = self
+                .slot
+                .lock()
+                .map_err(|_| native_scheduler_host_task_error("task_slot_unavailable"))?;
+            slot.handle = Some(handle);
+            slot.signal = signal;
+            Err(CoreError::new(
+                ErrorCode::Timeout,
+                "native scheduler host task join timed out",
+            )
+            .with_severity(ErrorSeverity::Warning)
+            .with_redacted_details(json!({
+                "failure_category": "host_join_timeout",
+                "session_bucket": "current_session"
+            })))
+        }
+    }
+}
+
+fn run_native_scheduler_host_task(
+    read_core: Arc<Mutex<ReadOnlyCommandState>>,
+    mutation_core: Arc<Mutex<MutationCommandState>>,
+    signal: Arc<NativeSchedulerHostTaskSignal>,
+    _session_ordinal: u64,
+) {
+    let started_at = Instant::now();
+    let _ = record_native_scheduler_host_task_update(
+        &read_core,
+        &mutation_core,
+        host_task_update(
+            None,
+            true,
+            "owned",
+            "starting",
+            true,
+            "none",
+            "not_joining",
+            "not_requested",
+            Some(NativeSchedulerHostWakeState::Waiting),
+            Some(NativeSchedulerHostHealthState::Idle),
+            Some(NativeSchedulerHostWatchdogState::Idle),
+            Some(NativeSchedulerHostShutdownState::None),
+            Some(NativeSchedulerHostWakeReason::StatusReconciliation),
+            None,
+        ),
+    );
+
+    loop {
+        let elapsed_millis = millis_since(started_at);
+        let plan = match with_native_scheduler_host_mutation(&read_core, &mutation_core, |state| {
+            state.native_scheduler_host_wait_plan(elapsed_millis)
+        }) {
+            Ok(plan) => plan,
+            Err(_) => {
+                let _ = record_native_scheduler_host_task_update(
+                    &read_core,
+                    &mutation_core,
+                    host_task_update(
+                        Some(NativeSchedulerHostLifecycleState::Failed),
+                        false,
+                        "failed",
+                        "failed",
+                        false,
+                        "none",
+                        "joined",
+                        "completed",
+                        Some(NativeSchedulerHostWakeState::Cancelled),
+                        Some(NativeSchedulerHostHealthState::Failed),
+                        Some(NativeSchedulerHostWatchdogState::Failed),
+                        None,
+                        Some(NativeSchedulerHostWakeReason::StatusReconciliation),
+                        Some("timer_reconciliation_failed"),
+                    ),
+                );
+                break;
+            }
+        };
+
+        let status = with_native_scheduler_host_read(&read_core, |read| {
+            core::get_native_scheduler_host_status(read)
+        });
+        if let Ok(status) = status {
+            if matches!(
+                status.lifecycle_state,
+                NativeSchedulerHostLifecycleState::Stopped
+                    | NativeSchedulerHostLifecycleState::Disabled
+                    | NativeSchedulerHostLifecycleState::Revoked
+                    | NativeSchedulerHostLifecycleState::Failed
+            ) {
+                break;
+            }
+        }
+
+        if plan.due_now {
+            invoke_native_scheduler_host_timer_tick(
+                &read_core,
+                &mutation_core,
+                plan.wake_reason,
+                signal.pending(),
+            );
+            continue;
+        }
+
+        let _ = record_native_scheduler_host_task_update(
+            &read_core,
+            &mutation_core,
+            host_task_update(
+                None,
+                true,
+                "owned",
+                &plan.wait_state,
+                signal.pending(),
+                "none",
+                "not_joining",
+                "not_requested",
+                Some(if plan.eligible_sampler_count == 0 {
+                    NativeSchedulerHostWakeState::NoEligibleSamplers
+                } else {
+                    NativeSchedulerHostWakeState::Waiting
+                }),
+                Some(if plan.wait_state == "paused" {
+                    NativeSchedulerHostHealthState::Paused
+                } else if plan.eligible_sampler_count == 0 {
+                    NativeSchedulerHostHealthState::Idle
+                } else {
+                    NativeSchedulerHostHealthState::Healthy
+                }),
+                Some(if plan.wait_state == "paused" {
+                    NativeSchedulerHostWatchdogState::Paused
+                } else if plan.eligible_sampler_count == 0 {
+                    NativeSchedulerHostWatchdogState::Idle
+                } else {
+                    NativeSchedulerHostWatchdogState::Healthy
+                }),
+                Some(NativeSchedulerHostShutdownState::None),
+                Some(NativeSchedulerHostWakeReason::StatusReconciliation),
+                None,
+            ),
+        );
+
+        let wait = Duration::from_millis(plan.wait_millis);
+        match signal.wait(wait) {
+            Ok(NativeSchedulerHostWakeOutcome::TimedOut) => {
+                if plan.wait_state == "timer_sleep_until_due" {
+                    invoke_native_scheduler_host_timer_tick(
+                        &read_core,
+                        &mutation_core,
+                        NativeSchedulerHostWakeReason::SamplerDue,
+                        signal.pending(),
+                    );
+                }
+            }
+            Ok(NativeSchedulerHostWakeOutcome::Woken(reason)) => {
+                let _ = record_native_scheduler_host_task_update(
+                    &read_core,
+                    &mutation_core,
+                    host_task_update(
+                        None,
+                        true,
+                        "owned",
+                        "woken_for_reconciliation",
+                        signal.pending(),
+                        "none",
+                        "not_joining",
+                        "not_requested",
+                        Some(NativeSchedulerHostWakeState::Woken),
+                        Some(NativeSchedulerHostHealthState::Idle),
+                        Some(NativeSchedulerHostWatchdogState::Idle),
+                        None,
+                        Some(reason),
+                        None,
+                    ),
+                );
+            }
+            Ok(NativeSchedulerHostWakeOutcome::Cancelled(reason)) => {
+                let _ = record_native_scheduler_host_task_update(
+                    &read_core,
+                    &mutation_core,
+                    host_task_update(
+                        None,
+                        true,
+                        "owned",
+                        "cancelling",
+                        false,
+                        "cancelling",
+                        "joining",
+                        "requested",
+                        Some(NativeSchedulerHostWakeState::Cancelled),
+                        Some(NativeSchedulerHostHealthState::Stopping),
+                        Some(NativeSchedulerHostWatchdogState::Stopping),
+                        Some(NativeSchedulerHostShutdownState::Cancelling),
+                        Some(reason),
+                        None,
+                    ),
+                );
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = record_native_scheduler_host_task_update(
+        &read_core,
+        &mutation_core,
+        host_task_update(
+            None,
+            false,
+            "released",
+            "exited",
+            false,
+            "cancelled",
+            "joined",
+            "completed",
+            Some(NativeSchedulerHostWakeState::Cancelled),
+            Some(NativeSchedulerHostHealthState::Stopped),
+            Some(NativeSchedulerHostWatchdogState::Stopped),
+            Some(NativeSchedulerHostShutdownState::Completed),
+            Some(NativeSchedulerHostWakeReason::Cancellation),
+            None,
+        ),
+    );
+}
+
+fn invoke_native_scheduler_host_timer_tick(
+    read_core: &Arc<Mutex<ReadOnlyCommandState>>,
+    mutation_core: &Arc<Mutex<MutationCommandState>>,
+    reason: NativeSchedulerHostWakeReason,
+    pending_wake: bool,
+) {
+    let _ = record_native_scheduler_host_task_update(
+        read_core,
+        mutation_core,
+        host_task_update(
+            None,
+            true,
+            "owned",
+            "running_tick",
+            pending_wake,
+            "none",
+            "not_joining",
+            "not_requested",
+            Some(NativeSchedulerHostWakeState::Due),
+            Some(NativeSchedulerHostHealthState::Healthy),
+            Some(NativeSchedulerHostWatchdogState::Healthy),
+            None,
+            Some(reason.clone()),
+            None,
+        ),
+    );
+    let _ = with_native_scheduler_host_mutation(read_core, mutation_core, |state| {
+        state.wake_native_scheduler_host_for_timer(reason)
+    });
+}
+
+fn with_native_scheduler_host_mutation<T>(
+    read_core: &Arc<Mutex<ReadOnlyCommandState>>,
+    mutation_core: &Arc<Mutex<MutationCommandState>>,
+    mutation: impl FnOnce(&mut MutationCommandState) -> CommandResult<T>,
+) -> CommandResult<T> {
+    let (result, snapshot) = {
+        let mut state = mutation_core
+            .lock()
+            .map_err(|_| mutation_state_lock_error())?;
+        let result = mutation(&mut state)?;
+        let snapshot = state.read_state().clone();
+        (result, snapshot)
+    };
+    let mut read = read_core.lock().map_err(|_| read_state_lock_error())?;
+    *read = snapshot;
+    Ok(result)
+}
+
+fn with_native_scheduler_host_read<T>(
+    read_core: &Arc<Mutex<ReadOnlyCommandState>>,
+    read: impl FnOnce(&ReadOnlyCommandState) -> CommandResult<T>,
+) -> CommandResult<T> {
+    let state = read_core.lock().map_err(|_| read_state_lock_error())?;
+    read(&state)
+}
+
+fn record_native_scheduler_host_task_update(
+    read_core: &Arc<Mutex<ReadOnlyCommandState>>,
+    mutation_core: &Arc<Mutex<MutationCommandState>>,
+    update: NativeSchedulerHostTimerRuntimeUpdate,
+) -> CommandResult<()> {
+    with_native_scheduler_host_mutation(read_core, mutation_core, |state| {
+        state.record_native_scheduler_host_timer_update(update)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn host_task_update(
+    lifecycle_state: Option<NativeSchedulerHostLifecycleState>,
+    timer_task_active: bool,
+    task_ownership_state: &str,
+    current_wait_state: &str,
+    pending_wake: bool,
+    cancellation_state: &str,
+    join_state: &str,
+    shutdown_cleanup_status: &str,
+    wake_state: Option<NativeSchedulerHostWakeState>,
+    health_state: Option<NativeSchedulerHostHealthState>,
+    watchdog_state: Option<NativeSchedulerHostWatchdogState>,
+    shutdown_state: Option<NativeSchedulerHostShutdownState>,
+    latest_wake_reason: Option<NativeSchedulerHostWakeReason>,
+    degraded_reason: Option<&str>,
+) -> NativeSchedulerHostTimerRuntimeUpdate {
+    NativeSchedulerHostTimerRuntimeUpdate {
+        lifecycle_state,
+        timer_task_active,
+        task_ownership_state: task_ownership_state.to_string(),
+        current_wait_state: current_wait_state.to_string(),
+        pending_wake,
+        cancellation_state: cancellation_state.to_string(),
+        join_state: join_state.to_string(),
+        join_timeout_category: None,
+        shutdown_cleanup_status: shutdown_cleanup_status.to_string(),
+        wake_state,
+        health_state,
+        watchdog_state,
+        shutdown_state,
+        latest_wake_reason,
+        degraded_reason: degraded_reason.map(ToString::to_string),
+    }
+}
+
+fn millis_since(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn native_scheduler_host_task_error(reason: &'static str) -> CoreError {
+    CoreError::new(
+        ErrorCode::InternalError,
+        "native scheduler host task operation failed",
+    )
+    .with_severity(ErrorSeverity::Warning)
+    .with_redacted_details(json!({
+        "failure_category": reason,
+        "session_bucket": "current_session"
+    }))
 }
 
 #[derive(Debug)]
@@ -1684,6 +3389,11 @@ pub struct DesktopStorageState {
     runtime: Option<DatabaseRuntime>,
     degraded_reason_redacted: Option<String>,
     profile_mode: String,
+    storage_owner_state: String,
+    storage_owner_category: String,
+    canonical_writer: bool,
+    desktop_cache_canonical: bool,
+    llm_key_transferred_to_service: bool,
     machine_local_capability_status: Option<core::CapabilityStatusSummary>,
 }
 
@@ -1694,10 +3404,16 @@ impl DesktopStorageState {
             .profile_mode
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
+        let storage_ownership = runtime.storage_ownership_status();
         Self {
             runtime: Some(runtime),
             degraded_reason_redacted: None,
             profile_mode,
+            storage_owner_state: storage_ownership.writer_state_str().to_string(),
+            storage_owner_category: storage_ownership.owner_category_str().to_string(),
+            canonical_writer: storage_ownership.canonical_writer,
+            desktop_cache_canonical: false,
+            llm_key_transferred_to_service: storage_ownership.llm_key_transferred,
             machine_local_capability_status: None,
         }
     }
@@ -1714,6 +3430,28 @@ impl DesktopStorageState {
             runtime: None,
             degraded_reason_redacted: Some(reason.into()),
             profile_mode: profile_mode.into(),
+            storage_owner_state: "degraded".to_string(),
+            storage_owner_category: "none".to_string(),
+            canonical_writer: false,
+            desktop_cache_canonical: false,
+            llm_key_transferred_to_service: false,
+            machine_local_capability_status: None,
+        }
+    }
+
+    pub fn service_owned_presentation_cache(
+        reason: impl Into<String>,
+        profile_mode: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime: None,
+            degraded_reason_redacted: Some(reason.into()),
+            profile_mode: profile_mode.into(),
+            storage_owner_state: "service_owned".to_string(),
+            storage_owner_category: "service_host".to_string(),
+            canonical_writer: false,
+            desktop_cache_canonical: false,
+            llm_key_transferred_to_service: false,
             machine_local_capability_status: None,
         }
     }
@@ -1738,6 +3476,26 @@ impl DesktopStorageState {
 
     pub fn runtime(&self) -> Option<&DatabaseRuntime> {
         self.runtime.as_ref()
+    }
+
+    pub fn storage_owner_state(&self) -> &str {
+        &self.storage_owner_state
+    }
+
+    pub fn storage_owner_category(&self) -> &str {
+        &self.storage_owner_category
+    }
+
+    pub fn canonical_writer(&self) -> bool {
+        self.canonical_writer
+    }
+
+    pub fn desktop_cache_canonical(&self) -> bool {
+        self.desktop_cache_canonical
+    }
+
+    pub fn llm_key_transferred_to_service(&self) -> bool {
+        self.llm_key_transferred_to_service
     }
 
     pub fn get_graph_view(
@@ -1995,9 +3753,94 @@ fn read_state_lock_error() -> CoreError {
     .with_severity(ErrorSeverity::Critical)
     .with_trace_id(TraceId::new_v4())
     .with_redacted_details(json!({
-        "context": "desktop_read_state",
-        "reason_redacted": "read state lock poisoned"
+    "context": "desktop_read_state",
+    "reason_redacted": "read state lock poisoned"
     }))
+}
+
+fn presentation_cache_lock_error() -> CoreError {
+    CoreError::new(
+        ErrorCode::InternalError,
+        "desktop presentation cache is unavailable",
+    )
+    .with_severity(ErrorSeverity::Critical)
+    .with_trace_id(TraceId::new_v4())
+    .with_redacted_details(json!({
+        "context": "desktop_presentation_cache",
+        "reason_redacted": "presentation cache lock poisoned"
+    }))
+}
+
+fn presentation_cache_policy_error(reason: &'static str) -> CoreError {
+    CoreError::new(ErrorCode::PolicyDenial, "presentation_cache_unavailable")
+        .with_severity(ErrorSeverity::Warning)
+        .with_trace_id(TraceId::new_v4())
+        .with_redacted_details(json!({
+            "context": "desktop_presentation_cache",
+            "reason": reason,
+            "reason_category": reason
+        }))
+}
+
+fn presentation_cache_error(reason: &'static str, error: impl std::fmt::Display) -> CoreError {
+    CoreError::new(ErrorCode::ValidationFailure, "presentation_cache_invalid")
+        .with_severity(ErrorSeverity::Warning)
+        .with_trace_id(TraceId::new_v4())
+        .with_redacted_details(json!({
+            "context": "desktop_presentation_cache",
+            "reason": reason,
+            "error_redacted": error.to_string()
+        }))
+}
+
+fn service_ipc_read_error(
+    command_id: ServiceReadCommandId,
+    error: ServiceIpcClientError,
+) -> CoreError {
+    CoreError::new(
+        ErrorCode::ServiceUnavailable,
+        "service_read_command_unavailable",
+    )
+    .with_severity(ErrorSeverity::Warning)
+    .with_trace_id(TraceId::new_v4())
+    .with_redacted_details(json!({
+        "command_id": command_id.as_str(),
+        "error_code": error.code,
+        "error_redacted": error.message_redacted
+    }))
+}
+
+fn runtime_ownership_state_lock_error() -> CoreError {
+    CoreError::new(
+        ErrorCode::InternalError,
+        "desktop runtime ownership state is unavailable",
+    )
+    .with_severity(ErrorSeverity::Critical)
+    .with_trace_id(TraceId::new_v4())
+    .with_redacted_details(json!({
+        "context": "desktop_runtime_ownership_state",
+        "reason_redacted": "runtime ownership state lock poisoned"
+    }))
+}
+
+fn desktop_read_model_unavailable_error() -> CoreError {
+    CoreError::new(ErrorCode::ServiceUnavailable, "read_model_unavailable")
+        .with_severity(ErrorSeverity::Warning)
+        .with_trace_id(TraceId::new_v4())
+        .with_redacted_details(json!({
+            "reason": "service_owned_read_model_ipc_not_implemented",
+            "reason_category": "service_owned_read_model_ipc_not_implemented"
+        }))
+}
+
+fn desktop_mutation_unavailable_error() -> CoreError {
+    CoreError::new(ErrorCode::UnsupportedOperation, "mutation_unavailable")
+        .with_severity(ErrorSeverity::Warning)
+        .with_trace_id(TraceId::new_v4())
+        .with_redacted_details(json!({
+            "reason": "production_ipc_mutation_trust_not_implemented",
+            "reason_category": "production_ipc_mutation_trust_not_implemented"
+        }))
 }
 
 fn storage_read_error(context: &'static str, error: StorageError) -> CoreError {
@@ -2139,16 +3982,6 @@ fn tauri_emit_error(error: tauri::Error, envelope: &StreamEventEnvelope) -> Core
         "event_type": envelope.event_type,
         "error_redacted": error.to_string()
     }))
-}
-
-fn service_status_join_error(error: impl ToString) -> CoreError {
-    CoreError::new(ErrorCode::InternalError, "service status probe task failed")
-        .with_severity(ErrorSeverity::Error)
-        .with_trace_id(TraceId::new_v4())
-        .with_redacted_details(json!({
-            "context": "service_status_ipc_probe",
-            "error_redacted": error.to_string()
-        }))
 }
 
 fn detached_pane_id_from_label(label: &str) -> Option<&'static str> {
@@ -2410,6 +4243,49 @@ fn get_investigation_drill_down_summary(
 }
 
 #[tauri::command]
+fn get_endpoint_threat_summary(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<EndpointThreatAnalysisSummary> {
+    state.get_endpoint_threat_summary()
+}
+
+#[tauri::command]
+fn get_provider_controller_status(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<NetworkProviderControllerStatus> {
+    state.get_provider_controller_status()
+}
+
+#[tauri::command]
+fn list_network_provider_status(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<Vec<NetworkProviderStatus>> {
+    state.list_network_provider_status()
+}
+
+#[tauri::command]
+fn get_network_provider_status(
+    state: State<'_, DesktopReadState>,
+    provider_id: String,
+) -> CommandResult<NetworkProviderStatus> {
+    state.get_network_provider_status(provider_id)
+}
+
+#[tauri::command]
+fn get_network_visibility_summary(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<NetworkVisibilitySummary> {
+    state.get_network_visibility_summary()
+}
+
+#[tauri::command]
+fn get_network_fallback_plan(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<NetworkFallbackPlan> {
+    state.get_network_fallback_plan()
+}
+
+#[tauri::command]
 fn resolve_navigation_reference(
     state: State<'_, DesktopReadState>,
     request: NavigationResolveRequest,
@@ -2639,10 +4515,7 @@ fn search_runtime_profiles(
 async fn get_service_status(
     state: State<'_, DesktopReadState>,
 ) -> CommandResult<ServiceStatusView> {
-    let core_snapshot = state.snapshot_core()?;
-    tauri::async_runtime::spawn_blocking(move || core::get_service_status(&core_snapshot))
-        .await
-        .map_err(service_status_join_error)?
+    state.get_service_status()
 }
 
 #[tauri::command]
@@ -2829,6 +4702,20 @@ fn get_latest_native_scheduler_cycle(
 }
 
 #[tauri::command]
+fn get_native_scheduler_host_status(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<NativeSchedulerHostStatus> {
+    state.get_native_scheduler_host_status()
+}
+
+#[tauri::command]
+fn get_native_scheduler_host_health(
+    state: State<'_, DesktopReadState>,
+) -> CommandResult<NativeSchedulerHostHealthSummary> {
+    state.get_native_scheduler_host_health()
+}
+
+#[tauri::command]
 fn get_portable_preferences(
     storage: State<'_, DesktopStorageState>,
 ) -> CommandResult<BTreeMap<String, serde_json::Value>> {
@@ -2855,10 +4742,12 @@ fn preview_native_permission_request(
 fn update_native_permission(
     read_state: State<'_, DesktopReadState>,
     mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
     request: NativePermissionActionRequest,
 ) -> CommandResult<NativePermissionActionResult> {
     let result = mutation_state.update_native_permission(request)?;
     sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    host_task_state.notify(NativeSchedulerHostWakeReason::PermissionChanged)?;
     Ok(result)
 }
 
@@ -2874,10 +4763,12 @@ fn preview_native_sampler_activation(
 fn apply_native_sampler_runtime_action(
     read_state: State<'_, DesktopReadState>,
     mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
     request: NativeSamplerRuntimeActionRequest,
 ) -> CommandResult<NativeSamplerRuntimeActionResult> {
     let result = mutation_state.apply_native_sampler_runtime_action(request)?;
     sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    host_task_state.notify(NativeSchedulerHostWakeReason::SamplerStateChanged)?;
     Ok(result)
 }
 
@@ -2893,10 +4784,12 @@ fn preview_native_scheduler_enablement(
 fn apply_native_scheduler_action(
     read_state: State<'_, DesktopReadState>,
     mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
     request: NativeSchedulerActionRequest,
 ) -> CommandResult<NativeSchedulerActionResult> {
     let result = mutation_state.apply_native_scheduler_action(request)?;
     sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    host_task_state.notify(NativeSchedulerHostWakeReason::ScheduleChanged)?;
     Ok(result)
 }
 
@@ -2907,6 +4800,80 @@ fn tick_native_scheduler(
     request: NativeSchedulerTickRequest,
 ) -> CommandResult<NativeSchedulerCycleSummary> {
     let result = mutation_state.tick_native_scheduler(request)?;
+    sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn preview_native_scheduler_host_start(
+    state: State<'_, DesktopMutationState>,
+) -> CommandResult<NativeSchedulerHostStartPreview> {
+    state.preview_native_scheduler_host_start()
+}
+
+#[tauri::command]
+fn start_native_scheduler_host(
+    read_state: State<'_, DesktopReadState>,
+    mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
+) -> CommandResult<NativeSchedulerHostActionResult> {
+    let result = mutation_state.start_native_scheduler_host()?;
+    sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    if matches!(
+        result.status.lifecycle_state,
+        NativeSchedulerHostLifecycleState::Running
+    ) {
+        host_task_state.ensure_started(read_state.shared_core(), mutation_state.shared_core())?;
+        host_task_state.notify(NativeSchedulerHostWakeReason::StatusReconciliation)?;
+        sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn pause_native_scheduler_host(
+    read_state: State<'_, DesktopReadState>,
+    mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
+) -> CommandResult<NativeSchedulerHostActionResult> {
+    let result = mutation_state.pause_native_scheduler_host()?;
+    sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    host_task_state.notify(NativeSchedulerHostWakeReason::ControllerPaused)?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn resume_native_scheduler_host(
+    read_state: State<'_, DesktopReadState>,
+    mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
+) -> CommandResult<NativeSchedulerHostActionResult> {
+    let result = mutation_state.resume_native_scheduler_host()?;
+    sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    host_task_state.notify(NativeSchedulerHostWakeReason::ControllerResumed)?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn wake_native_scheduler_host(
+    read_state: State<'_, DesktopReadState>,
+    mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
+) -> CommandResult<NativeSchedulerHostActionResult> {
+    let result = mutation_state.wake_native_scheduler_host()?;
+    sync_read_state_from_mutation(&read_state, &mutation_state)?;
+    host_task_state.notify(NativeSchedulerHostWakeReason::ManualWake)?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn stop_native_scheduler_host(
+    read_state: State<'_, DesktopReadState>,
+    mutation_state: State<'_, DesktopMutationState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
+) -> CommandResult<NativeSchedulerHostActionResult> {
+    host_task_state.stop_and_join(NativeSchedulerHostWakeReason::StopRequested)?;
+    let result = mutation_state.stop_native_scheduler_host()?;
     sync_read_state_from_mutation(&read_state, &mutation_state)?;
     Ok(result)
 }
@@ -2963,6 +4930,9 @@ fn sync_read_state_from_mutation(
     read_state: &DesktopReadState,
     mutation_state: &DesktopMutationState,
 ) -> CommandResult<()> {
+    if !read_state.local_core_available() || !mutation_state.local_core_available() {
+        return Ok(());
+    }
     read_state.replace_core(mutation_state.snapshot_read_state()?)
 }
 
@@ -3809,6 +5779,9 @@ fn shutdown_app(
     export_state: State<'_, DesktopExplicitExportState>,
     import_state: State<'_, DesktopPortableCaptureImportState>,
     llm_state: State<'_, DesktopLlmAlertStoryState>,
+    mutation_state: State<'_, DesktopMutationState>,
+    read_state: State<'_, DesktopReadState>,
+    host_task_state: State<'_, DesktopNativeSchedulerHostTaskState>,
 ) -> CommandResult<()> {
     if export_state.has_pending_or_active()? {
         return Err(explicit_export_error(
@@ -3819,6 +5792,9 @@ fn shutdown_app(
         ));
     }
     import_state.discard_all_pending()?;
+    host_task_state.stop_and_join(NativeSchedulerHostWakeReason::ShutdownRequested)?;
+    let _ = mutation_state.stop_native_scheduler_host();
+    sync_read_state_from_mutation(&read_state, &mutation_state)?;
     llm_state.clear_session()?;
     storage.end_session();
     process::exit(0);
@@ -3831,29 +5807,36 @@ fn shutdown_app(
 pub fn run() {
     let startup_config = DemoStartupConfig::detect();
     StartupAuditRecord::from_config(&startup_config).log_to_console();
-    let storage_state = bootstrap_storage_state(startup_config.clone());
-    let service_status = service_status_for_storage(&storage_state);
-
-    let read_state = bootstrap_state_or_exit(
-        "read state",
-        DesktopReadState::bootstrap_with_service_status(service_status),
+    let service_probe = ElevatedServiceIpcClient::default().status();
+    let ownership_status =
+        negotiate_desktop_runtime_ownership(service_probe, startup_config.is_portable());
+    let startup_assembly = bootstrap_state_or_exit(
+        "desktop runtime ownership",
+        assemble_desktop_startup_runtime(startup_config.clone(), ownership_status),
     );
-    let mutation_state =
-        bootstrap_state_or_exit("mutation state", DesktopMutationState::bootstrap());
+    let runtime_ownership_state = startup_assembly.runtime_ownership;
+    let storage_state = startup_assembly.storage_state;
+    let read_state = startup_assembly.read_state;
+    let mutation_state = startup_assembly.mutation_state;
     let event_state = bootstrap_state_or_exit("event state", DesktopEventState::bootstrap());
     let llm_alert_story_state = bootstrap_state_or_exit(
         "llm alert story state",
         DesktopLlmAlertStoryState::bootstrap(&storage_state),
     );
 
-    if startup_config.is_demo() {
+    if startup_config.is_demo() && read_state.local_core_available() {
         bootstrap_state_or_exit(
             "demo story replay",
             install_demo_story(&read_state, &mutation_state, &storage_state),
         );
+    } else if startup_config.is_demo() {
+        eprintln!(
+            "STARTUP_WARN component=demo_story reason=service_owned_runtime_no_local_demo_replay"
+        );
     }
 
     let app = tauri::Builder::default()
+        .manage(runtime_ownership_state)
         .manage(read_state)
         .manage(mutation_state)
         .manage(event_state)
@@ -3861,19 +5844,27 @@ pub fn run() {
         .manage(llm_alert_story_state)
         .manage(DesktopExplicitExportState::default())
         .manage(DesktopPortableCaptureImportState::default())
+        .manage(DesktopNativeSchedulerHostTaskState::default())
         .setup(|app| {
-            let storage_state = app.state::<DesktopStorageState>();
-            if storage_state.machine_local_capability_status().is_some() {
-                let status = service_status_for_storage(&storage_state);
-                if let Err(error) = app
-                    .state::<DesktopEventState>()
-                    .emit_service_status_stream(app.handle(), ServiceStatusUpdate::from(&status))
-                {
+            let read_state = app.state::<DesktopReadState>();
+            let status = match read_state.get_service_status() {
+                Ok(status) => status,
+                Err(error) => {
                     eprintln!(
-                        "STARTUP_WARN component=capability_status_stream error_code={:?} message={}",
+                        "STARTUP_WARN component=service_status_cache error_code={:?} message={}",
                         error.error_code, error.message
                     );
+                    return Ok(());
                 }
+            };
+            if let Err(error) = app
+                .state::<DesktopEventState>()
+                .emit_service_status_stream(app.handle(), ServiceStatusUpdate::from(&status))
+            {
+                eprintln!(
+                    "STARTUP_WARN component=capability_status_stream error_code={:?} message={}",
+                    error.error_code, error.message
+                );
             }
             Ok(())
         })
@@ -3911,6 +5902,23 @@ pub fn run() {
                                 .state::<DesktopLlmAlertStoryState>()
                                 .clear_session()
                                 .ok();
+                            if let Err(error) = window
+                                .app_handle()
+                                .state::<DesktopNativeSchedulerHostTaskState>()
+                                .stop_and_join(NativeSchedulerHostWakeReason::ShutdownRequested)
+                            {
+                                api.prevent_close();
+                                eprintln!(
+                                    "NATIVE_SCHEDULER_HOST_CLOSE_WARN error_code={:?} message={}",
+                                    error.error_code, error.message
+                                );
+                                return;
+                            }
+                            let read_state = window.app_handle().state::<DesktopReadState>();
+                            let mutation_state =
+                                window.app_handle().state::<DesktopMutationState>();
+                            mutation_state.stop_native_scheduler_host().ok();
+                            sync_read_state_from_mutation(&read_state, &mutation_state).ok();
                             window
                                 .app_handle()
                                 .state::<DesktopStorageState>()
@@ -3968,11 +5976,17 @@ pub fn run() {
         list_attack_hypotheses,
         get_attack_hypothesis,
         get_durable_baseline_summary,
-        get_evidence_quality_summary,
-        list_evidence_quality_records,
-        get_evidence_quality_record,
-        get_investigation_drill_down_summary,
-        resolve_navigation_reference,
+            get_evidence_quality_summary,
+            list_evidence_quality_records,
+            get_evidence_quality_record,
+            get_investigation_drill_down_summary,
+            get_endpoint_threat_summary,
+            get_provider_controller_status,
+            list_network_provider_status,
+            get_network_provider_status,
+            get_network_visibility_summary,
+            get_network_fallback_plan,
+            resolve_navigation_reference,
         get_hypothesis_explanation_detail,
         get_baseline_drill_down_detail,
         get_incident_group_investigation_detail,
@@ -4014,7 +6028,7 @@ pub fn run() {
             get_native_sampler_readiness_detail,
             get_native_sampler_authorization_review,
             get_future_security_fact_mapping_summary,
-        get_native_sampler_blocked_summary,
+            get_native_sampler_blocked_summary,
         get_missing_endpoint_visibility_summary,
         get_edr_readiness_summary,
         get_native_sampler_runtime_summary,
@@ -4027,6 +6041,8 @@ pub fn run() {
         get_native_scheduler_operational_summary,
         list_native_scheduler_cycles,
         get_latest_native_scheduler_cycle,
+        get_native_scheduler_host_status,
+        get_native_scheduler_host_health,
         get_portable_preferences,
             // ── mutation commands (Task 210) ──
             enable_plugin,
@@ -4073,7 +6089,13 @@ pub fn run() {
         preview_native_scheduler_enablement,
         apply_native_scheduler_action,
         tick_native_scheduler,
-            run_demo_story,
+        preview_native_scheduler_host_start,
+        start_native_scheduler_host,
+        pause_native_scheduler_host,
+        resume_native_scheduler_host,
+        wake_native_scheduler_host,
+        stop_native_scheduler_host,
+        run_demo_story,
             save_portable_preferences,
             shutdown_app,
         ])
@@ -4110,6 +6132,20 @@ pub fn run() {
                 );
                 return;
             }
+            if let Err(error) = app_handle
+                .state::<DesktopNativeSchedulerHostTaskState>()
+                .stop_and_join(NativeSchedulerHostWakeReason::ShutdownRequested)
+            {
+                eprintln!(
+                    "NATIVE_SCHEDULER_HOST_CLOSE_WARN error_code={:?} message={}",
+                    error.error_code, error.message
+                );
+                return;
+            }
+            let read_state = app_handle.state::<DesktopReadState>();
+            let mutation_state = app_handle.state::<DesktopMutationState>();
+            mutation_state.stop_native_scheduler_host().ok();
+            sync_read_state_from_mutation(&read_state, &mutation_state).ok();
             app_handle.state::<DesktopStorageState>().end_session();
             app_handle
                 .state::<DesktopLlmAlertStoryState>()
@@ -4244,6 +6280,30 @@ fn bootstrap_storage_state(startup_config: DemoStartupConfig) -> DesktopStorageS
     }
 }
 
+fn bootstrap_storage_state_for_runtime(
+    startup_config: DemoStartupConfig,
+    ownership_status: &DesktopRuntimeOwnershipStatus,
+) -> DesktopStorageState {
+    if ownership_status.local_core_allowed() {
+        return bootstrap_storage_state(startup_config);
+    }
+    let profile_mode = match ownership_status.runtime_mode {
+        RuntimeMode::ServiceOwned => "service-owned",
+        RuntimeMode::ServiceDegraded => "service-degraded",
+        RuntimeMode::ServiceUnavailable => "service-unavailable",
+        RuntimeMode::ProtocolIncompatible => "protocol-incompatible",
+        RuntimeMode::OwnershipTransitionPending => "ownership-transition-pending",
+        RuntimeMode::ShutdownInProgress => "shutdown-in-progress",
+        RuntimeMode::Failed => "failed",
+        RuntimeMode::Unresolved => "unresolved",
+        RuntimeMode::PortableInProcess => "portable-in-process",
+    };
+    DesktopStorageState::service_owned_presentation_cache(
+        "ServiceHost runtime owner selected; desktop service-owned SQLite writer is disabled",
+        profile_mode,
+    )
+}
+
 fn attach_machine_local_capability_status(
     storage_state: DesktopStorageState,
 ) -> DesktopStorageState {
@@ -4288,6 +6348,11 @@ fn service_status_for_storage(storage_state: &DesktopStorageState) -> ServiceSta
     } else {
         ObservabilityHealthStatus::Degraded
     };
+    status.storage_owner_state = storage_state.storage_owner_state().to_string();
+    status.storage_owner_category = storage_state.storage_owner_category().to_string();
+    status.canonical_storage_writer = storage_state.canonical_writer();
+    status.desktop_cache_canonical = storage_state.desktop_cache_canonical();
+    status.llm_key_transferred_to_service = storage_state.llm_key_transferred_to_service();
     status.active_session_id = storage_state
         .runtime()
         .and_then(DatabaseRuntime::session_lifecycle)
@@ -4303,6 +6368,76 @@ fn service_status_for_storage(storage_state: &DesktopStorageState) -> ServiceSta
     };
     status.machine_local_capability_status =
         storage_state.machine_local_capability_status().cloned();
+    status.generated_at = Timestamp::now();
+    status
+}
+
+fn service_status_for_runtime(
+    storage_state: &DesktopStorageState,
+    ownership_status: &DesktopRuntimeOwnershipStatus,
+) -> ServiceStatusView {
+    if ownership_status.local_core_allowed() {
+        return service_status_for_storage(storage_state);
+    }
+
+    let mut status = ServiceStatusView::reduced_visibility();
+    status.connected = ownership_status.service_connected;
+    status.degraded = ownership_status.runtime_mode != RuntimeMode::ServiceOwned;
+    status.reason = ownership_status.reason.clone();
+    status.profile_mode = storage_state.profile_mode().to_string();
+    status.local_core_status = ObservabilityHealthStatus::Unavailable;
+    status.elevated_service_status = if ownership_status.service_connected {
+        ObservabilityHealthStatus::Healthy
+    } else {
+        ObservabilityHealthStatus::Disconnected
+    };
+    status.ipc_status = if ownership_status.service_connected
+        && ownership_status.service_protocol_valid
+        && ownership_status.service_schema_valid
+    {
+        ObservabilityHealthStatus::Healthy
+    } else if ownership_status.runtime_mode == RuntimeMode::ProtocolIncompatible {
+        ObservabilityHealthStatus::Degraded
+    } else {
+        ObservabilityHealthStatus::Disconnected
+    };
+    status.storage_status = if ownership_status.runtime_mode == RuntimeMode::ServiceOwned
+        || storage_state.is_healthy()
+    {
+        ObservabilityHealthStatus::Healthy
+    } else {
+        ObservabilityHealthStatus::Degraded
+    };
+    status.storage_owner_state = storage_state.storage_owner_state().to_string();
+    status.storage_owner_category = storage_state.storage_owner_category().to_string();
+    status.canonical_storage_writer = storage_state.canonical_writer();
+    status.desktop_cache_canonical = storage_state.desktop_cache_canonical();
+    status.llm_key_transferred_to_service = storage_state.llm_key_transferred_to_service();
+    status.reduced_visibility = ownership_status.cached_read_models_stale
+        || ownership_status.runtime_mode != RuntimeMode::ServiceOwned;
+    status.privileged_actions_available = false;
+    status.capture_available = false;
+    status.machine_local_capability_status =
+        storage_state.machine_local_capability_status().cloned();
+    status.message_redacted = match ownership_status.runtime_mode {
+        RuntimeMode::ServiceOwned => {
+            "ServiceHost owns the production runtime; desktop is IPC client and presentation cache only"
+                .to_string()
+        }
+        RuntimeMode::ServiceUnavailable => {
+            "ServiceHost is unavailable; no local native runtime was created without explicit portable fallback"
+                .to_string()
+        }
+        RuntimeMode::ProtocolIncompatible => {
+            "ServiceHost protocol is incompatible; native runtime creation is blocked"
+                .to_string()
+        }
+        RuntimeMode::ServiceDegraded => {
+            "ServiceHost runtime status is degraded; cached read models are stale and local native runtime creation is blocked"
+                .to_string()
+        }
+        _ => "Runtime ownership is unresolved; local native runtime creation is blocked".to_string(),
+    };
     status.generated_at = Timestamp::now();
     status
 }
@@ -4334,7 +6469,9 @@ mod tests {
     use sentinel_contracts::{
         AlertId, AlertState, EvidenceId, GraphEdgeType, GraphEdgeViewModel, GraphNodeType,
         GraphNodeViewModel, GraphPathId, GraphPathSummary, GraphPathType, GraphRedactionSummary,
-        GraphScope, GraphType, GraphViewId, IncidentId, IncidentState, PrivacyClass, QualityScore,
+        GraphScope, GraphType, GraphViewId, IncidentId, IncidentState, NativePermissionAction,
+        NativeSamplerRuntimeAction, NativeScheduleIntervalBucket, NativeScheduleRetryBudgetBucket,
+        NativeScheduleTimeoutBucket, NativeSchedulerAction, PrivacyClass, QualityScore,
         QueryRequest, RedactedLabel, RedactionStatus, ReportId, ReportStatus, ResponseActionId,
         ResponsePlanId, SecuritySeverity, SessionId, Timestamp,
     };
@@ -4348,7 +6485,7 @@ mod tests {
 
     #[test]
     fn exposes_task_200_read_command_names() {
-        assert_eq!(READ_ONLY_COMMAND_NAMES.len(), 87);
+        assert_eq!(READ_ONLY_COMMAND_NAMES.len(), 95);
         assert_eq!(READ_ONLY_COMMAND_NAMES[0], "list_components");
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"list_export_history"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"search_response_plans"));
@@ -4363,6 +6500,7 @@ mod tests {
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"list_evidence_quality_records"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_evidence_quality_record"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_investigation_drill_down_summary"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_endpoint_threat_summary"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"resolve_navigation_reference"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_hypothesis_explanation_detail"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_baseline_drill_down_detail"));
@@ -4411,13 +6549,177 @@ mod tests {
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_native_scheduler_operational_summary"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"list_native_scheduler_cycles"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_latest_native_scheduler_cycle"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_native_scheduler_host_status"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_native_scheduler_host_health"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_provider_controller_status"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"list_network_provider_status"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_network_provider_status"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_network_visibility_summary"));
+        assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_network_fallback_plan"));
         assert!(READ_ONLY_COMMAND_NAMES.contains(&"get_portable_preferences"));
         assert!(!READ_ONLY_COMMAND_NAMES.contains(&"export_report"));
     }
 
     #[test]
+    fn provider_controller_desktop_reads_are_bounded_and_non_mutating() {
+        let state = DesktopReadState::bootstrap().expect("desktop read state");
+
+        let controller = state
+            .get_provider_controller_status()
+            .expect("provider controller");
+        let providers = state
+            .list_network_provider_status()
+            .expect("provider status list");
+        let ip_helper = state
+            .get_network_provider_status("ip_helper".to_string())
+            .expect("ip helper status");
+        let rdp_operational = state
+            .get_network_provider_status("windows_rdp_operational".to_string())
+            .expect("rdp operational status");
+        let smb_operational = state
+            .get_network_provider_status("windows_smb_operational".to_string())
+            .expect("smb operational status");
+        let ssh_operational = state
+            .get_network_provider_status("windows_ssh_operational".to_string())
+            .expect("ssh operational status");
+        let visibility = state
+            .get_network_visibility_summary()
+            .expect("visibility summary");
+        let fallback = state.get_network_fallback_plan().expect("fallback plan");
+
+        assert_eq!(
+            controller.controller_state,
+            sentinel_contracts::NetworkProviderControllerState::Inactive
+        );
+        assert_eq!(providers.len(), 11);
+        assert_eq!(
+            ip_helper.implementation_state,
+            sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        );
+        assert_eq!(
+            rdp_operational.implementation_state,
+            sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        );
+        assert_eq!(
+            smb_operational.implementation_state,
+            sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        );
+        assert_eq!(
+            ssh_operational.implementation_state,
+            sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        );
+        assert!(visibility.dimensions.iter().any(|dimension| {
+            dimension.dimension
+                == sentinel_contracts::NetworkVisibilityDimension::PortableMetadataVisibility
+                && dimension.visibility_state
+                    == sentinel_contracts::NetworkVisibilityState::Available
+        }));
+        assert_eq!(
+            fallback.selected_mode,
+            sentinel_contracts::NetworkProviderControllerMode::PortableOnly
+        );
+        assert!(controller.policy_summary.provider_activation_allowed);
+        assert!(
+            controller
+                .policy_summary
+                .ip_helper_execution_available_over_production_ipc
+        );
+        assert!(
+            !controller
+                .policy_summary
+                .provider_readiness_creates_evidence
+        );
+        assert!(
+            !controller
+                .policy_summary
+                .provider_availability_creates_findings
+        );
+        assert!(controller.provider_zero.all_zero());
+        assert!(
+            !state
+                .runtime_ownership_status()
+                .expect("runtime ownership")
+                .local_native_runtime_created
+        );
+
+        let serialized = serde_json::to_string(&(
+            controller,
+            providers,
+            ip_helper,
+            rdp_operational,
+            visibility,
+            fallback,
+        ))
+        .expect("provider desktop json");
+        for marker in [
+            "provider_handle",
+            "packet_data",
+            "etw_raw_event",
+            "npcap_handle",
+            "process_name",
+            "api_key",
+            "secret",
+        ] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(marker),
+                "desktop provider read leaked marker {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_helper_controls_desktop_surface_is_bounded_and_non_mutating() {
+        let state = DesktopReadState::bootstrap().expect("desktop read state");
+        let controller = state
+            .get_provider_controller_status()
+            .expect("provider controller");
+        let ip_helper = state
+            .get_network_provider_status("ip_helper".to_string())
+            .expect("ip helper status");
+
+        assert!(controller.policy_summary.provider_activation_allowed);
+        assert!(
+            controller
+                .policy_summary
+                .ip_helper_execution_available_over_production_ipc
+        );
+        assert_eq!(
+            ip_helper.provider_kind,
+            sentinel_contracts::NetworkProviderKind::IpHelper
+        );
+        assert!(ip_helper.activation_allowed);
+        assert_eq!(
+            ip_helper.lifecycle_state,
+            sentinel_contracts::NetworkProviderLifecycleState::Inactive
+        );
+        assert!(controller.provider_zero.all_zero());
+        assert!(
+            !state
+                .runtime_ownership_status()
+                .expect("runtime ownership")
+                .local_native_runtime_created
+        );
+        let serialized = serde_json::to_string(&(controller, ip_helper)).expect("controls json");
+        for marker in [
+            "provider_handle",
+            "packet_data",
+            "process_name",
+            "pid",
+            "ip_address",
+            "port_number",
+            "token",
+            "secret",
+        ] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(marker),
+                "desktop ip helper controls leaked marker {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn exposes_task_210_mutation_command_names() {
-        assert_eq!(MUTATION_COMMAND_NAMES.len(), 47);
+        assert_eq!(MUTATION_COMMAND_NAMES.len(), 53);
         assert_eq!(MUTATION_COMMAND_NAMES[0], "enable_plugin");
         assert!(MUTATION_COMMAND_NAMES.contains(&"export_report"));
         assert!(MUTATION_COMMAND_NAMES.contains(&"get_local_metadata_proxy_status"));
@@ -4447,6 +6749,12 @@ mod tests {
         assert!(MUTATION_COMMAND_NAMES.contains(&"preview_native_scheduler_enablement"));
         assert!(MUTATION_COMMAND_NAMES.contains(&"apply_native_scheduler_action"));
         assert!(MUTATION_COMMAND_NAMES.contains(&"tick_native_scheduler"));
+        assert!(MUTATION_COMMAND_NAMES.contains(&"preview_native_scheduler_host_start"));
+        assert!(MUTATION_COMMAND_NAMES.contains(&"start_native_scheduler_host"));
+        assert!(MUTATION_COMMAND_NAMES.contains(&"pause_native_scheduler_host"));
+        assert!(MUTATION_COMMAND_NAMES.contains(&"resume_native_scheduler_host"));
+        assert!(MUTATION_COMMAND_NAMES.contains(&"wake_native_scheduler_host"));
+        assert!(MUTATION_COMMAND_NAMES.contains(&"stop_native_scheduler_host"));
         assert!(MUTATION_COMMAND_NAMES.contains(&"run_demo_story"));
         assert!(MUTATION_COMMAND_NAMES.contains(&"save_portable_preferences"));
         assert!(MUTATION_COMMAND_NAMES.contains(&"shutdown_app"));
@@ -5531,6 +7839,562 @@ mod tests {
     }
 
     #[test]
+    fn runtime_ownership_service_owned_blocks_desktop_production_runtime() {
+        let error = evaluate_desktop_runtime_construction_gate(RuntimeMode::ServiceOwned, false)
+            .expect_err("service-owned blocks desktop runtime");
+        assert_eq!(error.error_code, ErrorCode::PolicyDenial);
+        assert_eq!(
+            error
+                .details_redacted
+                .as_ref()
+                .and_then(|details| details.get("reason_category"))
+                .and_then(serde_json::Value::as_str),
+            Some("runtime_owner_mismatch")
+        );
+    }
+
+    #[test]
+    fn runtime_ownership_portable_fallback_requires_explicit_selection() {
+        let blocked =
+            evaluate_desktop_runtime_construction_gate(RuntimeMode::PortableInProcess, false)
+                .expect("blocked gate");
+        assert!(!blocked.production_runtime_allowed);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("portable_fallback_not_authorized")
+        );
+
+        let allowed =
+            evaluate_desktop_runtime_construction_gate(RuntimeMode::PortableInProcess, true)
+                .expect("allowed gate");
+        assert!(allowed.production_runtime_allowed);
+        assert!(allowed.portable_fallback_allowed);
+        assert!(!allowed.native_runtime_allowed);
+    }
+
+    #[test]
+    fn runtime_ownership_protocol_incompatible_creates_no_native_runtime() {
+        let gate =
+            evaluate_desktop_runtime_construction_gate(RuntimeMode::ProtocolIncompatible, false)
+                .expect("gate");
+        assert!(!gate.production_runtime_allowed);
+        assert!(!gate.native_runtime_allowed);
+        assert_eq!(
+            gate.blocked_reason.as_deref(),
+            Some("protocol_incompatible")
+        );
+    }
+
+    #[test]
+    fn startup_gate_actual_tauri_setup_negotiates_before_local_runtime() {
+        let status = negotiate_desktop_runtime_ownership_from_status(service_owned_ipc_status());
+        assert_eq!(status.runtime_mode, RuntimeMode::ServiceOwned);
+        assert!(!status.local_runtime_created);
+        assert!(!status.local_native_runtime_created);
+
+        let assembly = assemble_desktop_startup_runtime(normal_startup_config(), status)
+            .expect("startup assembly");
+        let ownership = assembly
+            .runtime_ownership
+            .status()
+            .expect("ownership status");
+        assert_eq!(ownership.runtime_mode, RuntimeMode::ServiceOwned);
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+        assert_eq!(
+            assembly.storage_state.storage_owner_category(),
+            "service_host"
+        );
+        assert_eq!(
+            assembly.storage_state.storage_owner_state(),
+            "service_owned"
+        );
+        assert!(!assembly.storage_state.canonical_writer());
+        assert!(!assembly.storage_state.desktop_cache_canonical());
+        assert!(!assembly.storage_state.llm_key_transferred_to_service());
+        assert!(!ownership.desktop_scheduler_host_owned);
+        assert_eq!(
+            assembly.service_status.message_redacted,
+            "ServiceHost owns the production runtime; desktop is IPC client and presentation cache only"
+        );
+        assert_eq!(
+            assembly.service_status.storage_owner_category,
+            "service_host"
+        );
+        assert_eq!(assembly.service_status.storage_owner_state, "service_owned");
+        assert!(!assembly.service_status.canonical_storage_writer);
+        assert!(!assembly.service_status.desktop_cache_canonical);
+        assert!(!assembly.service_status.llm_key_transferred_to_service);
+    }
+
+    #[test]
+    fn startup_gate_service_owned_mode_creates_no_local_runtime() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        let ownership = assembly
+            .read_state
+            .runtime_ownership_status()
+            .expect("read ownership");
+
+        assert_eq!(ownership.runtime_mode, RuntimeMode::ServiceOwned);
+        assert!(!ownership.local_runtime_created);
+        assert!(!ownership.local_native_runtime_created);
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+        assert_eq!(
+            assembly.storage_state.storage_owner_category(),
+            "service_host"
+        );
+        assert!(!assembly.storage_state.canonical_writer());
+        assert!(
+            assembly
+                .read_state
+                .get_service_status()
+                .expect("status")
+                .connected
+        );
+    }
+
+    #[test]
+    fn presentation_cache_is_non_canonical_and_side_effect_free() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+
+        let cache = assembly
+            .read_state
+            .install_service_snapshot(service_snapshot_response(
+                ServiceReadCommandId::GetRuntimeOwnership,
+                1,
+            ))
+            .expect("install service snapshot");
+
+        assert!(!cache.canonical);
+        assert_eq!(cache.source_owner, "service_host");
+        assert_eq!(
+            cache.connection_state,
+            DesktopPresentationConnectionState::Connected
+        );
+        assert_eq!(cache.ownership_epoch, Some(1));
+        assert_eq!(cache.records.len(), 1);
+        assert!(!cache.records[0].canonical);
+        assert_eq!(cache.records[0].source_owner, "service_host");
+        assert_eq!(cache.records[0].redaction_status, RedactionStatus::Redacted);
+        assert!(cache.side_effects.all_zero());
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+        assert!(!assembly.storage_state.canonical_writer());
+        assert!(!assembly.storage_state.desktop_cache_canonical());
+    }
+
+    #[test]
+    fn presentation_cache_report_export_traceability_is_display_only() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        assembly
+            .read_state
+            .install_service_snapshot(service_snapshot_response(
+                ServiceReadCommandId::GetReportTraceability,
+                1,
+            ))
+            .expect("report traceability snapshot");
+        let cache = assembly
+            .read_state
+            .install_service_snapshot(service_snapshot_response(
+                ServiceReadCommandId::GetExportTraceability,
+                1,
+            ))
+            .expect("export traceability snapshot");
+
+        assert!(!cache.canonical);
+        assert_eq!(cache.records.len(), 2);
+        assert!(cache.records.iter().all(|record| {
+            !record.canonical
+                && record.source_owner == "service_host"
+                && record.ownership_epoch == 1
+        }));
+        assert!(cache.side_effects.all_zero());
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+        assert!(!assembly.storage_state.canonical_writer());
+        assert!(!assembly.storage_state.desktop_cache_canonical());
+        assert!(!assembly.storage_state.llm_key_transferred_to_service());
+    }
+
+    #[test]
+    fn disconnect_semantics_mark_snapshots_stale_and_reconnect_pending() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        assembly
+            .read_state
+            .install_service_snapshot(service_snapshot_response(
+                ServiceReadCommandId::GetRiskSummary,
+                1,
+            ))
+            .expect("install service snapshot");
+
+        let disconnected = assembly
+            .read_state
+            .mark_service_disconnected()
+            .expect("disconnect");
+        let cache = assembly
+            .read_state
+            .presentation_cache_snapshot()
+            .expect("presentation cache");
+
+        assert_eq!(disconnected.runtime_mode, RuntimeMode::ServiceDegraded);
+        assert!(disconnected.cached_read_models_stale);
+        assert_eq!(disconnected.bounded_reconnect_attempts, 1);
+        assert!(!disconnected.local_runtime_created);
+        assert!(!disconnected.local_native_runtime_created);
+        assert!(!disconnected.desktop_scheduler_host_owned);
+        assert_eq!(
+            cache.connection_state,
+            DesktopPresentationConnectionState::ReconnectPending
+        );
+        assert_eq!(
+            cache.snapshot_freshness_state,
+            ReadModelSnapshotFreshness::Stale
+        );
+        assert!(cache.reconnect_pending);
+        for reason in [
+            "service_disconnected",
+            "snapshot_stale",
+            "canonical_owner_unavailable",
+            "reconnect_pending",
+            "portable_fallback_requires_explicit_validation",
+        ] {
+            assert!(
+                cache.degraded_reasons.iter().any(|value| value == reason),
+                "missing degraded reason {reason}"
+            );
+        }
+        assert!(cache.records.iter().all(|record| {
+            record.freshness_state == ReadModelSnapshotFreshness::Stale && !record.canonical
+        }));
+        assert!(cache.side_effects.all_zero());
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+        assert!(!assembly.storage_state.canonical_writer());
+    }
+
+    #[test]
+    fn reconnect_semantics_replace_cache_generation_and_supersede_old_epoch() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary_with_epoch(1)),
+        )
+        .expect("startup assembly");
+        assembly
+            .read_state
+            .install_service_snapshot(service_snapshot_response(
+                ServiceReadCommandId::GetRuntimeOwnership,
+                1,
+            ))
+            .expect("initial snapshot");
+        assembly
+            .read_state
+            .mark_service_disconnected()
+            .expect("disconnect");
+        let reconnect =
+            negotiate_desktop_runtime_ownership_from_status(service_owned_ipc_status_with_epoch(2));
+
+        let cache = assembly
+            .read_state
+            .reconnect_service_snapshots(
+                reconnect,
+                vec![service_snapshot_response(
+                    ServiceReadCommandId::GetRuntimeOwnership,
+                    2,
+                )],
+            )
+            .expect("reconnect snapshots");
+
+        assert_eq!(
+            cache.connection_state,
+            DesktopPresentationConnectionState::Connected
+        );
+        assert_eq!(cache.ownership_epoch, Some(2));
+        assert_eq!(cache.records.len(), 1);
+        assert_eq!(cache.records[0].ownership_epoch, 2);
+        assert_eq!(cache.superseded_records.len(), 1);
+        assert_eq!(cache.superseded_records[0].ownership_epoch, 1);
+        assert!(cache.superseded_records[0].superseded);
+        assert_eq!(
+            cache.superseded_records[0].freshness_state,
+            ReadModelSnapshotFreshness::Stale
+        );
+        assert!(!cache.reconnect_pending);
+        assert!(cache.side_effects.all_zero());
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+    }
+
+    #[test]
+    fn reconnect_semantics_reject_epoch_mismatch_without_local_runtime() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary_with_epoch(1)),
+        )
+        .expect("startup assembly");
+        let reconnect =
+            negotiate_desktop_runtime_ownership_from_status(service_owned_ipc_status_with_epoch(2));
+
+        let error = assembly
+            .read_state
+            .reconnect_service_snapshots(
+                reconnect,
+                vec![service_snapshot_response(
+                    ServiceReadCommandId::GetRuntimeOwnership,
+                    1,
+                )],
+            )
+            .expect_err("epoch mismatch rejected");
+
+        assert_eq!(error.error_code, ErrorCode::PolicyDenial);
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+        assert!(!assembly.storage_state.canonical_writer());
+    }
+
+    #[test]
+    fn reconnect_semantics_protocol_mismatch_keeps_cache_non_canonical() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        let mut status = service_owned_ipc_status();
+        status.runtime_schema_version = Some(sentinel_contracts::SchemaVersion::new(2, 0, 0));
+        let ownership = negotiate_desktop_runtime_ownership_from_status(status);
+
+        let cache = assembly
+            .read_state
+            .reconnect_service_snapshots(ownership, Vec::new())
+            .expect("protocol mismatch cache");
+
+        assert_eq!(
+            cache.connection_state,
+            DesktopPresentationConnectionState::ProtocolIncompatible
+        );
+        assert!(!cache.canonical);
+        assert_eq!(
+            cache.snapshot_freshness_state,
+            ReadModelSnapshotFreshness::Unavailable
+        );
+        assert!(cache
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason == "canonical_owner_unavailable"));
+        assert!(cache.side_effects.all_zero());
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly.storage_state.runtime().is_none());
+    }
+
+    #[test]
+    fn disconnect_semantics_explicit_portable_fallback_requires_duplicate_ownership_validation() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        let disconnected = assembly
+            .read_state
+            .mark_service_disconnected()
+            .expect("disconnect");
+
+        let blocked = evaluate_desktop_runtime_construction_gate_for_status(&disconnected, true)
+            .expect("blocked gate");
+        assert!(!blocked.production_runtime_allowed);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("duplicate_ownership_not_ruled_out")
+        );
+
+        let mut ruled_out = disconnected;
+        ruled_out.duplicate_ownership_ruled_out = true;
+        let allowed = evaluate_desktop_runtime_construction_gate_for_status(&ruled_out, true)
+            .expect("allowed gate");
+        assert!(allowed.production_runtime_allowed);
+        assert!(allowed.portable_fallback_allowed);
+        assert!(!allowed.native_runtime_allowed);
+    }
+
+    #[test]
+    fn startup_gate_protocol_mismatch_creates_no_native_runtime() {
+        let mut status = service_owned_ipc_status();
+        status.runtime_protocol_version = Some(sentinel_contracts::SchemaVersion::new(2, 0, 0));
+        let ownership = negotiate_desktop_runtime_ownership_from_status(status);
+
+        assert_eq!(ownership.runtime_mode, RuntimeMode::ProtocolIncompatible);
+        assert!(!ownership.local_runtime_created);
+        assert!(!ownership.local_native_runtime_created);
+        assert!(!ownership.duplicate_ownership_ruled_out);
+
+        let assembly =
+            assemble_desktop_startup_runtime(normal_startup_config(), ownership).expect("assembly");
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+    }
+
+    #[test]
+    fn runtime_ownership_disconnect_marks_cache_stale_without_duplicate_runtime() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+
+        let disconnected = assembly
+            .read_state
+            .mark_service_disconnected()
+            .expect("disconnect");
+        assert_eq!(disconnected.runtime_mode, RuntimeMode::ServiceDegraded);
+        assert!(disconnected.cached_read_models_stale);
+        assert_eq!(disconnected.bounded_reconnect_attempts, 1);
+        assert!(!disconnected.local_runtime_created);
+        assert!(!disconnected.local_native_runtime_created);
+        let status = assembly.read_state.get_service_status().expect("status");
+        assert!(!status.connected);
+        assert!(status.reduced_visibility);
+        assert_eq!(status.storage_owner_category, "service_host");
+        assert_eq!(status.storage_owner_state, "service_owned");
+        assert!(!status.canonical_storage_writer);
+        assert!(!status.desktop_cache_canonical);
+        assert!(!status.llm_key_transferred_to_service);
+    }
+
+    #[test]
+    fn storage_gate_service_owned_desktop_cache_cannot_become_canonical() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+
+        assert!(assembly.storage_state.runtime().is_none());
+        assert_eq!(
+            assembly.storage_state.storage_owner_category(),
+            "service_host"
+        );
+        assert!(!assembly.storage_state.canonical_writer());
+        assert!(!assembly.storage_state.desktop_cache_canonical());
+        assert!(!assembly.storage_state.llm_key_transferred_to_service());
+
+        let serialized = serde_json::to_string(&assembly.service_status).expect("status json");
+        assert!(serialized.contains("service_host"));
+        assert!(serialized.contains("service_owned"));
+        for marker in ["api_key", "password", "session_token", "c:\\", "sid"] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(marker),
+                "desktop storage status leaked marker {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_gate_explicit_portable_fallback_is_required() {
+        let error = ServiceIpcClientError {
+            kind: sentinel_infrastructure::service_ipc::ServiceIpcClientErrorKind::Unreachable,
+            code: "service_unreachable".to_string(),
+            message_redacted: "service pipe unavailable".to_string(),
+            retryable: true,
+        };
+        let blocked = negotiate_desktop_runtime_ownership(Err(error.clone()), false);
+        assert_eq!(blocked.runtime_mode, RuntimeMode::ServiceUnavailable);
+        assert!(!blocked.local_runtime_created);
+
+        let allowed = negotiate_desktop_runtime_ownership(Err(error), true);
+        assert_eq!(allowed.runtime_mode, RuntimeMode::PortableInProcess);
+        assert!(allowed.explicit_portable_fallback);
+        assert!(allowed.local_runtime_created);
+        assert!(!allowed.local_native_runtime_created);
+    }
+
+    #[test]
+    fn runtime_ownership_desktop_does_not_own_scheduler_host() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        let ownership = assembly
+            .mutation_state
+            .runtime_ownership_status()
+            .expect("mutation ownership");
+
+        assert!(!ownership.desktop_scheduler_host_owned);
+        assert!(!assembly.mutation_state.local_core_available());
+    }
+
+    #[test]
+    fn ip_helper_scheduler_ui_service_owned_mode_has_no_desktop_timer_owner() {
+        let assembly = assemble_desktop_startup_runtime(
+            normal_startup_config(),
+            DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+        )
+        .expect("startup assembly");
+        let ownership = assembly
+            .runtime_ownership
+            .status()
+            .expect("runtime ownership");
+
+        assert_eq!(ownership.runtime_mode, RuntimeMode::ServiceOwned);
+        assert!(!ownership.desktop_scheduler_host_owned);
+        assert!(!assembly.read_state.local_core_available());
+        assert!(!assembly.mutation_state.local_core_available());
+        assert!(assembly
+            .service_status
+            .message_redacted
+            .contains("ServiceHost"));
+    }
+
+    #[test]
+    fn runtime_ownership_scheduler_sampler_mutations_are_unavailable_in_service_owned_mode() {
+        let mutation_state =
+            DesktopMutationState::service_client_only(DesktopRuntimeOwnershipState::new(
+                DesktopRuntimeOwnershipStatus::service_owned(service_owned_summary()),
+            ));
+
+        let error = mutation_state
+            .preview_native_sampler_activation("native_health_probe_sampler".to_string())
+            .expect_err("mutation unavailable");
+        assert_eq!(error.error_code, ErrorCode::UnsupportedOperation);
+        assert_eq!(error.message, "mutation_unavailable");
+        assert_eq!(
+            error
+                .details_redacted
+                .as_ref()
+                .and_then(|details| details.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("production_ipc_mutation_trust_not_implemented")
+        );
+
+        let error = mutation_state
+            .start_native_scheduler_host()
+            .expect_err("scheduler host unavailable");
+        assert_eq!(error.message, "mutation_unavailable");
+    }
+
+    #[test]
     fn desktop_event_state_dispatches_all_named_streams_with_hints() {
         let state = DesktopEventState::bootstrap().expect("event state");
 
@@ -5789,6 +8653,269 @@ mod tests {
         assert!(!revoked.capability.sampler_policy_allows_collection());
     }
 
+    #[test]
+    fn native_scheduler_host_timer_task_is_explicit_singleton_and_joined() {
+        let read_state = DesktopReadState::bootstrap().expect("read state");
+        let mutation_state = DesktopMutationState::bootstrap().expect("mutation state");
+        let host_task_state = DesktopNativeSchedulerHostTaskState::default();
+
+        assert!(!native_scheduler_host_task_running(&host_task_state));
+        assert!(
+            !read_state
+                .get_native_scheduler_host_status()
+                .expect("initial host status")
+                .timer_task_active
+        );
+
+        prepare_native_scheduler_host(&read_state, &mutation_state);
+        assert!(!native_scheduler_host_task_running(&host_task_state));
+        assert!(
+            !read_state
+                .get_native_scheduler_host_status()
+                .expect("configured host status")
+                .timer_task_active
+        );
+
+        let started = mutation_state
+            .start_native_scheduler_host()
+            .expect("start host state");
+        sync_read_state_from_mutation(&read_state, &mutation_state).expect("sync start");
+        assert!(started.task_created);
+        assert!(host_task_state
+            .ensure_started(read_state.shared_core(), mutation_state.shared_core())
+            .expect("spawn host task"));
+        assert!(!host_task_state
+            .ensure_started(read_state.shared_core(), mutation_state.shared_core())
+            .expect("duplicate start is singleton"));
+        assert!(native_scheduler_host_task_running(&host_task_state));
+
+        host_task_state
+            .notify(NativeSchedulerHostWakeReason::ScheduleChanged)
+            .expect("notify schedule change");
+        let cycle_seen = wait_until(Duration::from_millis(1_000), || {
+            read_state
+                .get_native_scheduler_summary()
+                .expect("scheduler summary")
+                .status
+                .cycle_count
+                > 0
+        });
+        assert!(
+            cycle_seen,
+            "autonomous timer wake should reuse scheduler tick"
+        );
+        let status = read_state
+            .get_native_scheduler_host_status()
+            .expect("host status");
+        assert!(status.timer_task_active);
+        assert_eq!(status.task_ownership_state, "owned");
+        assert!(!status.provider_direct_calls);
+        assert!(!status.automatic_llm_calls);
+        assert!(!status.response_execution_started);
+
+        host_task_state
+            .stop_and_join(NativeSchedulerHostWakeReason::StopRequested)
+            .expect("join host task");
+        assert!(!native_scheduler_host_task_running(&host_task_state));
+        mutation_state
+            .stop_native_scheduler_host()
+            .expect("stop host state");
+        sync_read_state_from_mutation(&read_state, &mutation_state).expect("sync stop");
+        let stopped = read_state
+            .get_native_scheduler_host_status()
+            .expect("stopped host status");
+        assert!(!stopped.timer_task_active);
+        assert_eq!(stopped.join_state, "joined");
+        assert_eq!(stopped.shutdown_cleanup_status, "completed");
+    }
+
+    fn prepare_native_scheduler_host(
+        read_state: &DesktopReadState,
+        mutation_state: &DesktopMutationState,
+    ) {
+        mutation_state
+            .update_native_permission(NativePermissionActionRequest {
+                capability_id: "native_health_probe".to_string(),
+                action: NativePermissionAction::GrantAuthorization,
+                explicit_user_action: true,
+                reason_redacted: "authorize native scheduler host timer test".to_string(),
+            })
+            .expect("grant native health");
+        mutation_state
+            .apply_native_sampler_runtime_action(NativeSamplerRuntimeActionRequest {
+                sampler_id: "native_health_probe_sampler".to_string(),
+                action: NativeSamplerRuntimeAction::Activate,
+                explicit_user_action: true,
+                enable_interval_sampling: false,
+                max_records_per_sample: 128,
+                max_bytes_per_sample: 65_536,
+                timeout_millis: 5_000,
+                reason_redacted: "activate native scheduler host timer test".to_string(),
+            })
+            .expect("activate native health");
+        mutation_state
+            .apply_native_scheduler_action(NativeSchedulerActionRequest {
+                sampler_id: Some("native_health_probe_sampler".to_string()),
+                action: NativeSchedulerAction::EnableSampler,
+                explicit_user_action: true,
+                interval_bucket: NativeScheduleIntervalBucket::OneMinute,
+                timeout_bucket: NativeScheduleTimeoutBucket::FiveSeconds,
+                retry_budget_bucket: NativeScheduleRetryBudgetBucket::One,
+                max_records: 128,
+                max_bytes: 65_536,
+                reason_redacted: "enable native scheduler host timer test".to_string(),
+            })
+            .expect("enable native health schedule");
+        sync_read_state_from_mutation(read_state, mutation_state).expect("sync prepared");
+    }
+
+    fn native_scheduler_host_task_running(
+        task_state: &DesktopNativeSchedulerHostTaskState,
+    ) -> bool {
+        task_state
+            .slot
+            .lock()
+            .expect("host task slot")
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if predicate() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        predicate()
+    }
+
+    fn normal_startup_config() -> DemoStartupConfig {
+        DemoStartupConfig {
+            mode: StartupMode::Normal,
+            source: StartupModeSource::Default,
+            portable_root: None,
+        }
+    }
+
+    fn service_owned_ipc_status() -> ServiceIpcStatusResult {
+        ServiceIpcStatusResult {
+            service_status: "running".to_string(),
+            connected_clients: 1,
+            memory_usage_mb: 0.0,
+            pid: 0,
+            runtime_ownership: Some(RuntimeMode::ServiceOwned),
+            runtime_ownership_status: Some(service_owned_summary()),
+            runtime_protocol_version: Some(RUNTIME_OWNERSHIP_PROTOCOL_VERSION),
+            runtime_schema_version: Some(RUNTIME_OWNERSHIP_SCHEMA_VERSION),
+            caller_verification_status: None,
+            mutation_authorization_status: None,
+            provider_controller_status: None,
+        }
+    }
+
+    fn service_owned_summary() -> RuntimeOwnershipSummary {
+        use sentinel_contracts::runtime_ownership::{
+            RuntimeComponentCategory, RuntimeComponentLifecycle, RuntimeComponentOwnershipSummary,
+            RuntimeHealthState, RuntimeMutationTrustState, RuntimeOwnerCategory,
+            RuntimeProviderZeroSummary, RuntimeShutdownState, RuntimeShutdownSummary,
+            RuntimeTransitionState,
+        };
+
+        RuntimeOwnershipSummary {
+            ownership_ref: "runtime-owner-test".to_string(),
+            ownership_epoch: 1,
+            runtime_mode: RuntimeMode::ServiceOwned,
+            owner_category: RuntimeOwnerCategory::ServiceHost,
+            runtime_health: RuntimeHealthState::Ready,
+            transition_state: RuntimeTransitionState::Ready,
+            protocol_version: RUNTIME_OWNERSHIP_PROTOCOL_VERSION,
+            schema_version: RUNTIME_OWNERSHIP_SCHEMA_VERSION,
+            degraded_reason: None,
+            mutation_trust_state: RuntimeMutationTrustState::ImpersonationNotImplemented,
+            mutation_commands_enabled: false,
+            provider_controller_state: "inactive".to_string(),
+            provider_call_count: 0,
+            provider_zero: RuntimeProviderZeroSummary::default(),
+            scheduler_state: "disabled".to_string(),
+            scheduler_host_state: "stopped".to_string(),
+            sampler_state: "inactive".to_string(),
+            storage_owner_state: "owned".to_string(),
+            canonical_read_model_owner: "service_host".to_string(),
+            snapshot_freshness: "fresh".to_string(),
+            shutdown: RuntimeShutdownSummary {
+                state: RuntimeShutdownState::NotStarted,
+                total_timeout_bucket: "under_30_seconds".to_string(),
+                mutation_leases_invalidated: false,
+                scheduler_host_cancellation_signalled: false,
+                scheduler_host_joined: false,
+                provider_stop_called: false,
+                stages: Vec::new(),
+                audit_refs: Vec::new(),
+                redaction_status: RedactionStatus::Redacted,
+            },
+            component_summaries: vec![RuntimeComponentOwnershipSummary {
+                ownership_ref: "runtime-owner-test".to_string(),
+                ownership_epoch: 1,
+                runtime_mode: RuntimeMode::ServiceOwned,
+                owner_category: RuntimeOwnerCategory::ServiceHost,
+                component_category: RuntimeComponentCategory::ProviderController,
+                component_lifecycle: RuntimeComponentLifecycle::Inactive,
+                runtime_health: RuntimeHealthState::Inactive,
+                degraded_reason: Some("provider_execution_deferred".to_string()),
+                audit_refs: Vec::new(),
+                provenance_id: "runtime_container".to_string(),
+                time_bucket: Timestamp::now(),
+                redaction_status: RedactionStatus::Redacted,
+            }],
+            audit_refs: Vec::new(),
+            provenance_id: "runtime_container".to_string(),
+            time_bucket: Timestamp::now(),
+            redaction_status: RedactionStatus::Redacted,
+        }
+    }
+
+    fn service_owned_summary_with_epoch(epoch: u64) -> RuntimeOwnershipSummary {
+        let mut summary = service_owned_summary();
+        summary.ownership_epoch = epoch;
+        for component in &mut summary.component_summaries {
+            component.ownership_epoch = epoch;
+        }
+        summary
+    }
+
+    fn service_owned_ipc_status_with_epoch(epoch: u64) -> ServiceIpcStatusResult {
+        let mut status = service_owned_ipc_status();
+        status.runtime_ownership_status = Some(service_owned_summary_with_epoch(epoch));
+        status
+    }
+
+    fn service_snapshot_response(
+        command_id: ServiceReadCommandId,
+        epoch: u64,
+    ) -> ServiceReadCommandResponse {
+        ServiceReadCommandResponse {
+            command_id,
+            protocol_version: sentinel_contracts::READ_COMMAND_PROTOCOL_VERSION,
+            schema_version: sentinel_contracts::READ_COMMAND_SCHEMA_VERSION,
+            snapshot_id: ReadModelSnapshotId::new_v4(),
+            ownership_ref: "runtime-owner-test".to_string(),
+            ownership_epoch: epoch,
+            generation_bucket: format!("generation_{epoch:08}"),
+            freshness_state: ReadModelSnapshotFreshness::Fresh,
+            partial_state: false,
+            items: Vec::new(),
+            total_available: 0,
+            truncated: false,
+            continuation_token: None,
+            degraded_reason: None,
+            provenance_id: "desktop_presentation_cache_test".to_string(),
+            redaction_status: RedactionStatus::Redacted,
+        }
+    }
+
     fn response_update(status: ResponseStatusKind) -> ResponseStatusUpdate {
         ResponseStatusUpdate {
             plan_id: Some(ResponsePlanId::new_v4()),
@@ -5808,6 +8935,37 @@ mod tests {
             progress_percent: Some(100),
             summary_redacted: "report progress changed".to_string(),
         }
+    }
+
+    #[test]
+    fn mutation_authorization_status_remains_read_only_in_desktop_state() {
+        let mut status = ServiceStatusView::reduced_visibility();
+        status.mutation_authorization_status =
+            Some(sentinel_contracts::MutationAuthorizationStatus {
+                schema_version: sentinel_contracts::MUTATION_AUTHORIZATION_SCHEMA_VERSION,
+                framework_state:
+                    sentinel_contracts::MutationAuthorizationFrameworkState::ImplementedDryRun,
+                policy_catalog_version: sentinel_contracts::MUTATION_POLICY_CATALOG_VERSION,
+                supported_command_count: sentinel_contracts::MutationCommandId::ALL.len() as u32,
+                dry_run_only: true,
+                production_execution_enabled: false,
+                last_decision_category: None,
+                denied_count_bucket: sentinel_contracts::MutationCountBucket::Zero,
+                expired_count_bucket: sentinel_contracts::MutationCountBucket::Zero,
+                replay_count_bucket: sentinel_contracts::MutationCountBucket::Zero,
+                caller_trust_ready: false,
+                ownership_runtime_ready: false,
+                degraded_reasons: vec!["caller_trust_unavailable".to_string()],
+                audit_refs: vec!["mutation_authorization_audit".to_string()],
+                provenance_id: "servicehost_mutation_authorization".to_string(),
+                redaction_status: RedactionStatus::Redacted,
+            });
+        let authorization = status
+            .mutation_authorization_status
+            .expect("bounded authorization status");
+        assert!(authorization.dry_run_only);
+        assert!(!authorization.production_execution_enabled);
+        assert!(!status.privileged_actions_available);
     }
 
     fn privacy_update(warning_kind: PrivacyWarningKind) -> PrivacyWarningUpdate {

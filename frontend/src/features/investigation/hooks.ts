@@ -6,6 +6,7 @@ import {
   escalateAlert,
   getDurableBaselineSummary,
   getEvidenceQualitySummary,
+  getEndpointThreatSummary,
   getIncidentDetail,
   getInvestigationDrillDownSummary,
   searchAlerts,
@@ -64,6 +65,13 @@ export function useInvestigationDrillDownSummaryQuery() {
   return useQuery({
     queryKey: queryKeys.security.investigationDrillDown,
     queryFn: getInvestigationDrillDownSummary,
+  });
+}
+
+export function useEndpointThreatSummaryQuery() {
+  return useQuery({
+    queryKey: queryKeys.security.endpointThreat,
+    queryFn: getEndpointThreatSummary,
   });
 }
 

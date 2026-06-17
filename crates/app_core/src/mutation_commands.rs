@@ -1,8 +1,12 @@
 use crate::authorized_native_permissions::AuthorizedNativePermissionRuntime;
 use crate::native_sampler_runtime::NativeSamplerRuntime;
 use crate::native_scheduler::NativeSchedulerController;
+use crate::native_scheduler_host::{
+    NativeSchedulerHostController, NativeSchedulerHostTimerRuntimeUpdate,
+    NativeSchedulerHostWaitPlan,
+};
 use crate::portable_capture_import::{
-    ingest_portable_capture_import, prepare_portable_capture_import,
+    ingest_portable_capture_import_with_runtime, prepare_portable_capture_import,
     PortableCaptureImportConfirmation, PortableCaptureImportResult, PreparedPortableCaptureImport,
 };
 use crate::portable_proxy_metadata_provider::PortableProxyMetadataRuntime;
@@ -10,22 +14,26 @@ use crate::portable_source_readers::{
     PortableReaderSourcePreviewRequest, PortableSourceReaderError, PortableSourceReaderRuntime,
 };
 use crate::read_commands::{
-    build_attack_coverage_summary, get_durable_baseline_summary, get_evidence_quality_summary,
-    get_investigation_drill_down_summary, get_native_permission_status_summary,
-    get_native_sampler_readiness_summary, get_native_sampler_runtime_summary,
+    build_attack_coverage_summary, get_durable_baseline_summary, get_endpoint_threat_summary,
+    get_evidence_quality_summary, get_investigation_drill_down_summary,
+    get_native_permission_status_summary, get_native_sampler_readiness_summary,
+    get_native_sampler_runtime_summary, get_native_scheduler_host_status,
     get_native_scheduler_operational_summary, get_native_visibility_summary, ReadOnlyCommandState,
+};
+use crate::runtime_container::{
+    RuntimeEventBusHandle, RuntimeMutationContext, RuntimeOwnershipLease, RuntimeServices,
 };
 use sentinel_capabilities::{
     build_export_safe_graph_snapshot_from_view as capability_export_safe_graph_snapshot_from_view,
-    register_static_response_planning_plugin, ContinuousMetadataWatchController,
-    ContinuousMetadataWatchError, ExportAuditService, ExportAuditSuccessInput,
-    ExportDestinationMetadata, ExportFileHash, ExportHistoryError, ExportHistoryRecord,
-    ExportHistoryStorageAdapter, ExportPolicyViolation, ExportPolicyViolationInput,
-    GraphAnalyticsError, IncidentReportGenerator, IncidentReportInput,
+    ContinuousMetadataWatchController, ContinuousMetadataWatchError, ExportAuditService,
+    ExportAuditSuccessInput, ExportDestinationMetadata, ExportFileHash, ExportHistoryError,
+    ExportHistoryRecord, ExportHistoryStorageAdapter, ExportPolicyViolation,
+    ExportPolicyViolationInput, GraphAnalyticsError, IncidentReportGenerator, IncidentReportInput,
     LocalProxyMetadataProviderStateKind, LocalProxyMetadataProviderStatus,
     LocalProxyMetadataStartRequest, MetadataSamplingObservation, PortableCaptureLiteRunResult,
-    ReportExportGate, ReportExportGateRequest, ReportGenerationError, ResponsePlanningError,
-    ResponsePlanningInput, ResponsePlanningPlugin, RESPONSE_POLICY_RULE_CONTRACT,
+    ReportExportGate, ReportExportGateRequest, ReportGenerationError, ReportRedactionPipeline,
+    ResponsePlanningError, ResponsePlanningInput, ResponsePlanningPlugin,
+    RESPONSE_PLANNING_STATIC_PLUGIN_ID, RESPONSE_POLICY_RULE_CONTRACT,
     RESPONSE_POLICY_SETTINGS_CONTRACT,
 };
 use sentinel_contracts::{
@@ -44,14 +52,17 @@ use sentinel_contracts::{
     NativePermissionActionRequest, NativePermissionActionResult, NativePermissionPreview,
     NativeSamplerActivationPreview, NativeSamplerRuntimeAction, NativeSamplerRuntimeActionRequest,
     NativeSamplerRuntimeActionResult, NativeSchedulerActionRequest, NativeSchedulerActionResult,
-    NativeSchedulerCycleSummary, NativeSchedulerEnablementPreview, NativeSchedulerTickRequest,
+    NativeSchedulerCycleSummary, NativeSchedulerEnablementPreview, NativeSchedulerHostAction,
+    NativeSchedulerHostActionRequest, NativeSchedulerHostActionResult,
+    NativeSchedulerHostStartPreview, NativeSchedulerHostWakeReason, NativeSchedulerTickRequest,
     PermissionCategory, PermissionDescriptor, PermissionKey, PermissionRiskLevel, PluginId,
     PluginManifest, PolicyDecision as ResponsePolicyDecision, PortableCaptureInputSourceType,
-    PrivacyClass, PrivacyPolicy, RedactionStatus, RedactionSummary, Report, ReportId,
-    ResponseAction, ResponseActionId, ResponseActionType, ResponseLevel, ResponsePlan,
-    ResponsePlanSource, ResponsePolicy, ResponseResult, RollbackPlan, RollbackResult,
-    RuntimeProfile, SchemaVersion, SettingsChangeKind, SettingsChangeRequest,
-    SettingsImpactAnalysis, Timestamp, TraceContext, TraceId,
+    PrivacyClass, PrivacyPolicy, QualityBreakdown, RedactionStatus, RedactionSummary, Report,
+    ReportId, ReportSection, ReportSectionType, ResponseAction, ResponseActionId,
+    ResponseActionType, ResponseLevel, ResponsePlan, ResponsePlanSource, ResponsePolicy,
+    ResponseResult, RollbackPlan, RollbackResult, RuntimeProfile, SchemaVersion,
+    SettingsChangeKind, SettingsChangeRequest, SettingsImpactAnalysis, Timestamp, TraceContext,
+    TraceId,
 };
 use sentinel_platform::{
     AuditActionType, AuditCategory, AuditDecision, AuditEvent, AuditReceipt, AuditSink,
@@ -114,6 +125,11 @@ pub struct MutationCommandState {
     authorized_native_permission_runtime: AuthorizedNativePermissionRuntime,
     native_sampler_runtime: NativeSamplerRuntime,
     native_scheduler_controller: NativeSchedulerController,
+    native_scheduler_host_controller: NativeSchedulerHostController,
+    runtime_event_bus: RuntimeEventBusHandle,
+    runtime_services: Option<RuntimeServices>,
+    runtime_mutation_context: Option<RuntimeMutationContext>,
+    runtime_ownership_lease: Option<RuntimeOwnershipLease>,
 }
 
 #[derive(Clone, Debug)]
@@ -218,11 +234,38 @@ impl MetadataSamplingLoopRuntime {
 }
 
 impl MutationCommandState {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bootstrap() -> CommandResult<Self> {
         Self::from_read_state(ReadOnlyCommandState::bootstrap()?)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_read_state(read: ReadOnlyCommandState) -> CommandResult<Self> {
+        let services = RuntimeServices::for_test("mutation-command-state")?;
+        Self::from_runtime_services(read, services)
+    }
+
+    pub(crate) fn from_runtime_services(
+        read: ReadOnlyCommandState,
+        services: RuntimeServices,
+    ) -> CommandResult<Self> {
+        Self::from_read_state_with_event_bus_and_context(
+            read,
+            services.event_bus(),
+            Some(services.clone()),
+            Some(services.mutation_context().clone()),
+        )
+    }
+
+    fn from_read_state_with_event_bus_and_context(
+        read: ReadOnlyCommandState,
+        event_bus: RuntimeEventBusHandle,
+        runtime_services: Option<RuntimeServices>,
+        runtime_mutation_context: Option<RuntimeMutationContext>,
+    ) -> CommandResult<Self> {
+        if let Some(context) = &runtime_mutation_context {
+            context.validate().map_err(CoreError::from)?;
+        }
         let mut permission_resolver = PermissionResolver::new();
         register_tauri_mutation_permissions(&mut permission_resolver)?;
         let metadata_watch_controller = ContinuousMetadataWatchController::from_read_models(
@@ -230,10 +273,26 @@ impl MutationCommandState {
             read.metadata_sampling_batches.items.clone(),
         )
         .map_err(metadata_watch_error)?;
+        let runtime_event_bus = event_bus.clone();
         let authorized_native_permission_runtime =
-            AuthorizedNativePermissionRuntime::from_read_state(&read);
-        let native_sampler_runtime = NativeSamplerRuntime::from_read_state(&read);
-        let native_scheduler_controller = NativeSchedulerController::from_read_state(&read);
+            AuthorizedNativePermissionRuntime::from_read_state_with_event_bus(
+                &read,
+                event_bus.clone(),
+            );
+        let native_sampler_runtime = NativeSamplerRuntime::from_read_state_with_services(
+            &read,
+            runtime_services.clone().ok_or_else(|| {
+                CoreError::validation_failure("container-owned runtime services are required")
+            })?,
+        );
+        let native_scheduler_controller =
+            NativeSchedulerController::from_read_state_with_event_bus(&read, event_bus.clone());
+        let native_scheduler_host_controller =
+            NativeSchedulerHostController::from_read_state_with_event_bus(&read, event_bus);
+        let portable_proxy_runtime =
+            PortableProxyMetadataRuntime::new(runtime_services.clone().ok_or_else(|| {
+                CoreError::validation_failure("container-owned runtime services are required")
+            })?);
         let mut state = Self {
             read,
             permission_resolver,
@@ -246,13 +305,18 @@ impl MutationCommandState {
             rollback_results: Vec::new(),
             export_results: Vec::new(),
             settings_rollbacks: HashMap::new(),
-            portable_proxy_runtime: PortableProxyMetadataRuntime::default(),
+            portable_proxy_runtime,
             metadata_watch_controller,
             metadata_reader_runtime: PortableSourceReaderRuntime::default(),
             metadata_sampling_loop: MetadataSamplingLoopRuntime::default(),
             authorized_native_permission_runtime,
             native_sampler_runtime,
             native_scheduler_controller,
+            native_scheduler_host_controller,
+            runtime_event_bus,
+            runtime_services,
+            runtime_mutation_context,
+            runtime_ownership_lease: None,
         };
         sync_metadata_watch_read_state(&mut state)?;
         Ok(state)
@@ -260,6 +324,162 @@ impl MutationCommandState {
 
     pub fn read_state(&self) -> &ReadOnlyCommandState {
         &self.read
+    }
+
+    pub(crate) fn attach_runtime_ownership_lease(&mut self, lease: RuntimeOwnershipLease) {
+        self.runtime_ownership_lease = Some(lease);
+    }
+
+    pub fn replace_read_state_preserving_runtime(
+        &mut self,
+        read: ReadOnlyCommandState,
+    ) -> CommandResult<()> {
+        self.validate_production_mutation()?;
+        let lease = self.runtime_ownership_lease.take();
+        let mut replacement = Self::from_read_state_with_event_bus_and_context(
+            read,
+            self.runtime_event_bus.clone(),
+            self.runtime_services.clone(),
+            self.runtime_mutation_context.clone(),
+        )?;
+        replacement.runtime_ownership_lease = lease;
+        *self = replacement;
+        Ok(())
+    }
+
+    pub fn has_container_owned_runtime_context(&self) -> bool {
+        self.runtime_mutation_context.is_some()
+    }
+
+    pub fn runtime_ownership_epoch(&self) -> Option<u64> {
+        self.runtime_mutation_context
+            .as_ref()
+            .map(RuntimeMutationContext::expected_epoch)
+    }
+
+    pub fn validate_current_owner_epoch(&self) -> CommandResult<()> {
+        self.validate_production_mutation()
+    }
+
+    pub(crate) fn invalidate_runtime_mutation_lease_for_shutdown(&mut self) {
+        if let Some(context) = self.runtime_mutation_context.as_mut() {
+            context.invalidate_for_shutdown();
+        }
+        self.metadata_sampling_loop.state = MetadataSamplingLoopState::ShuttingDown;
+        self.metadata_sampling_loop.graceful_shutdown_requested = true;
+        self.metadata_sampling_loop.scheduled_source_count = 0;
+    }
+
+    #[cfg(test)]
+    pub fn replace_runtime_mutation_context_for_tests(&mut self, context: RuntimeMutationContext) {
+        self.runtime_mutation_context = Some(context);
+    }
+
+    #[cfg(test)]
+    pub fn runtime_mutation_context_for_tests(&self) -> RuntimeMutationContext {
+        self.runtime_mutation_context
+            .clone()
+            .expect("container-owned mutation context")
+    }
+
+    fn validate_production_mutation(&self) -> CommandResult<()> {
+        if let Some(context) = &self.runtime_mutation_context {
+            context.validate().map_err(CoreError::from)?;
+        }
+        Ok(())
+    }
+
+    pub fn portable_runtime_orchestration_instance_count(&self) -> usize {
+        let _proxy = &self.portable_proxy_runtime;
+        let _watch = &self.metadata_watch_controller;
+        let _reader = &self.metadata_reader_runtime;
+        let _loop = &self.metadata_sampling_loop;
+        4
+    }
+
+    pub fn native_permission_runtime_instance_count(&self) -> usize {
+        let _runtime = &self.authorized_native_permission_runtime;
+        1
+    }
+
+    pub fn native_scheduler_controller_instance_count(&self) -> usize {
+        let _runtime = &self.native_scheduler_controller;
+        1
+    }
+
+    pub fn native_scheduler_host_instance_count(&self) -> usize {
+        let _runtime = &self.native_scheduler_host_controller;
+        1
+    }
+
+    pub fn native_sampler_runtime_instance_count(&self) -> usize {
+        let _runtime = &self.native_sampler_runtime;
+        1
+    }
+
+    pub fn native_scheduler_starts_disabled(&self) -> bool {
+        self.native_scheduler_controller
+            .summary(&self.read)
+            .map(|summary| {
+                summary.status.controller_state
+                    == sentinel_contracts::NativeSchedulerControllerState::Disabled
+                    && !summary.status.periodic_sampling_enabled
+                    && !summary.status.periodic_execution_started
+                    && !summary.status.sample_requested
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn native_scheduler_host_starts_stopped(&self) -> bool {
+        self.native_scheduler_host_controller
+            .status(&self.read)
+            .map(|status| {
+                status.lifecycle_state
+                    == sentinel_contracts::NativeSchedulerHostLifecycleState::Disabled
+                    && status.health_state
+                        == sentinel_contracts::NativeSchedulerHostHealthState::Stopped
+                    && !status.timer_task_active
+                    && !status.startup_auto_started
+                    && !status.provider_direct_calls
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn native_samplers_start_inactive(&self) -> bool {
+        self.native_sampler_runtime
+            .summary(&self.read)
+            .map(|summary| {
+                summary.active_count == 0
+                    && !summary.response_execution_allowed
+                    && !summary.automatic_llm_calls
+                    && summary.statuses.iter().all(|status| {
+                        matches!(
+                            status.runtime_state,
+                            sentinel_contracts::NativeSamplerRuntimeState::ReadinessBlocked
+                                | sentinel_contracts::NativeSamplerRuntimeState::ReadyInactive
+                                | sentinel_contracts::NativeSamplerRuntimeState::NotImplemented
+                                | sentinel_contracts::NativeSamplerRuntimeState::Revoked
+                        ) && !status.telemetry_collection_active
+                    })
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn startup_side_effect_count(&self) -> usize {
+        self.read.findings.items.len()
+            + self.read.alerts.items.len()
+            + self.read.incidents.items.len()
+            + self.read.response_plans.items.len()
+            + self.read.reports.items.len()
+            + self.read.llm_alert_stories.items.len()
+            + self.read.native_sampler_runtime_batches.len()
+            + self.read.native_scheduler_cycles.len()
+            + self.read.endpoint_threat_findings.len()
+            + self.response_actions.len()
+            + self.response_results.len()
+            + self.rollback_results.len()
+            + self.export_results.len()
+            + self.read.export_history.records().len()
     }
 
     pub fn audit_records(&self) -> &[AuditEvent] {
@@ -287,6 +507,7 @@ impl MutationCommandState {
     }
 
     pub fn record_llm_alert_story(&mut self, story: LlmAlertStoryRecord) -> CommandResult<()> {
+        self.validate_production_mutation()?;
         story.validate().map_err(contract_error)?;
         self.read.llm_alert_stories.items.push(story);
         Ok(())
@@ -304,6 +525,7 @@ impl MutationCommandState {
         &mut self,
         request: NativePermissionActionRequest,
     ) -> CommandResult<NativePermissionActionResult> {
+        self.validate_production_mutation()?;
         let result = self
             .authorized_native_permission_runtime
             .apply_action(request)?;
@@ -323,10 +545,16 @@ impl MutationCommandState {
                 }
             }
         }
-        self.native_sampler_runtime = NativeSamplerRuntime::from_read_state(&self.read);
+        self.native_sampler_runtime = NativeSamplerRuntime::from_read_state_with_services(
+            &self.read,
+            self.runtime_services.clone().ok_or_else(|| {
+                CoreError::validation_failure("container-owned runtime services are required")
+            })?,
+        );
         self.native_scheduler_controller.reconcile(&self.read)?;
         self.native_scheduler_controller
             .sync_read_state(&mut self.read);
+        self.refresh_native_scheduler_host(NativeSchedulerHostWakeReason::PermissionChanged)?;
         Ok(result)
     }
 
@@ -342,6 +570,7 @@ impl MutationCommandState {
         &mut self,
         request: NativeSamplerRuntimeActionRequest,
     ) -> CommandResult<NativeSamplerRuntimeActionResult> {
+        self.validate_production_mutation()?;
         if request.action == NativeSamplerRuntimeAction::ScheduledSample {
             return Err(CoreError::validation_failure(
                 "scheduled native samples require the scheduler tick runtime",
@@ -364,6 +593,7 @@ impl MutationCommandState {
         self.native_scheduler_controller.reconcile(&self.read)?;
         self.native_scheduler_controller
             .sync_read_state(&mut self.read);
+        self.refresh_native_scheduler_host(NativeSchedulerHostWakeReason::SamplerStateChanged)?;
         Ok(result)
     }
 
@@ -379,23 +609,153 @@ impl MutationCommandState {
         &mut self,
         request: NativeSchedulerActionRequest,
     ) -> CommandResult<NativeSchedulerActionResult> {
+        self.validate_production_mutation()?;
         let result = self
             .native_scheduler_controller
             .apply_action(&mut self.read, request)?;
         self.native_scheduler_controller
             .sync_read_state(&mut self.read);
+        self.refresh_native_scheduler_host(NativeSchedulerHostWakeReason::ScheduleChanged)?;
         Ok(result)
+    }
+
+    pub fn preview_native_scheduler_host_start(
+        &mut self,
+    ) -> CommandResult<NativeSchedulerHostStartPreview> {
+        self.native_scheduler_host_controller
+            .preview_start(&self.read)
+    }
+
+    pub fn apply_native_scheduler_host_action(
+        &mut self,
+        request: NativeSchedulerHostActionRequest,
+    ) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.validate_production_mutation()?;
+        let result = self.native_scheduler_host_controller.apply_action(
+            &mut self.read,
+            &mut self.native_scheduler_controller,
+            &mut self.native_sampler_runtime,
+            request,
+        )?;
+        self.native_sampler_runtime.sync_read_state(&mut self.read);
+        self.native_scheduler_controller
+            .sync_read_state(&mut self.read);
+        self.native_scheduler_host_controller
+            .sync_read_state(&mut self.read);
+        Ok(result)
+    }
+
+    pub fn start_native_scheduler_host(
+        &mut self,
+    ) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.apply_native_scheduler_host_action(native_scheduler_host_request(
+            NativeSchedulerHostAction::Start,
+        ))
+    }
+
+    pub fn pause_native_scheduler_host(
+        &mut self,
+    ) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.apply_native_scheduler_host_action(native_scheduler_host_request(
+            NativeSchedulerHostAction::Pause,
+        ))
+    }
+
+    pub fn resume_native_scheduler_host(
+        &mut self,
+    ) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.apply_native_scheduler_host_action(native_scheduler_host_request(
+            NativeSchedulerHostAction::Resume,
+        ))
+    }
+
+    pub fn wake_native_scheduler_host(&mut self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.apply_native_scheduler_host_action(native_scheduler_host_request(
+            NativeSchedulerHostAction::WakeNow,
+        ))
+    }
+
+    pub fn wake_native_scheduler_host_for_timer(
+        &mut self,
+        wake_reason: NativeSchedulerHostWakeReason,
+    ) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.apply_native_scheduler_host_action(NativeSchedulerHostActionRequest {
+            action: NativeSchedulerHostAction::WakeNow,
+            explicit_user_action: false,
+            wake_reason,
+            reason_redacted: "native scheduler host autonomous timer wake".to_string(),
+        })
+    }
+
+    pub fn stop_native_scheduler_host(&mut self) -> CommandResult<NativeSchedulerHostActionResult> {
+        self.apply_native_scheduler_host_action(native_scheduler_host_request(
+            NativeSchedulerHostAction::Stop,
+        ))
+    }
+
+    pub fn native_scheduler_host_wait_plan(
+        &mut self,
+        current_elapsed_millis: u64,
+    ) -> CommandResult<NativeSchedulerHostWaitPlan> {
+        self.validate_production_mutation()?;
+        self.native_scheduler_controller.reconcile(&self.read)?;
+        self.native_scheduler_controller
+            .sync_read_state(&mut self.read);
+        self.native_scheduler_host_controller
+            .wait_plan(&self.read, current_elapsed_millis)
+    }
+
+    pub fn record_native_scheduler_host_timer_update(
+        &mut self,
+        update: NativeSchedulerHostTimerRuntimeUpdate,
+    ) -> CommandResult<()> {
+        self.validate_production_mutation()?;
+        self.native_scheduler_host_controller
+            .record_timer_runtime_update(&mut self.read, update)
+    }
+
+    fn refresh_native_scheduler_host(
+        &mut self,
+        wake_reason: NativeSchedulerHostWakeReason,
+    ) -> CommandResult<()> {
+        self.validate_production_mutation()?;
+        self.native_scheduler_host_controller.apply_action(
+            &mut self.read,
+            &mut self.native_scheduler_controller,
+            &mut self.native_sampler_runtime,
+            NativeSchedulerHostActionRequest {
+                action: NativeSchedulerHostAction::RefreshStatus,
+                explicit_user_action: false,
+                wake_reason,
+                reason_redacted: "native scheduler host bounded refresh".to_string(),
+            },
+        )?;
+        self.native_scheduler_host_controller
+            .sync_read_state(&mut self.read);
+        Ok(())
     }
 
     pub fn tick_native_scheduler(
         &mut self,
         request: NativeSchedulerTickRequest,
     ) -> CommandResult<NativeSchedulerCycleSummary> {
+        self.validate_production_mutation()?;
+        if self.read.native_scheduler_cycle_gate_active {
+            return Err(CoreError::new(
+                ErrorCode::RateLimited,
+                "native scheduler cycle gate is busy",
+            )
+            .with_severity(ErrorSeverity::Warning)
+            .with_redacted_details(json!({ "cycle_gate": "busy" })));
+        }
+        self.read.native_scheduler_cycle_gate_active = true;
         let result = self.native_scheduler_controller.tick(
             &mut self.read,
             &mut self.native_sampler_runtime,
             request,
-        )?;
+        );
+        self.read.native_scheduler_cycle_gate_active = false;
+        let result = result?;
         self.native_sampler_runtime.sync_read_state(&mut self.read);
         self.native_scheduler_controller
             .sync_read_state(&mut self.read);
@@ -410,10 +770,12 @@ impl MutationCommandState {
         &mut self,
         request: LocalProxyMetadataStartRequest,
     ) -> CommandResult<LocalProxyMetadataProviderStatus> {
+        self.validate_production_mutation()?;
         self.portable_proxy_runtime.start(&mut self.read, request)
     }
 
     pub fn stop_local_metadata_proxy(&mut self) -> CommandResult<LocalProxyMetadataProviderStatus> {
+        self.validate_production_mutation()?;
         let status = self.portable_proxy_runtime.stop(&mut self.read)?;
         mark_proxy_watch_sources_after_stop(self)?;
         sync_metadata_watch_read_state(self)?;
@@ -423,6 +785,7 @@ impl MutationCommandState {
     pub fn drain_local_metadata_proxy(
         &mut self,
     ) -> CommandResult<LocalProxyMetadataProviderStatus> {
+        self.validate_production_mutation()?;
         self.portable_proxy_runtime.drain(&mut self.read)
     }
 
@@ -476,6 +839,17 @@ impl MutationCommandState {
         request: MetadataSamplingLoopRunRequest,
     ) -> CommandResult<MutationReceipt<MetadataSamplingTickResult>> {
         run_metadata_sampling_loop(self, request)
+    }
+}
+
+fn native_scheduler_host_request(
+    action: NativeSchedulerHostAction,
+) -> NativeSchedulerHostActionRequest {
+    NativeSchedulerHostActionRequest {
+        action,
+        explicit_user_action: true,
+        wake_reason: NativeSchedulerHostWakeReason::ManualWake,
+        reason_redacted: "native scheduler host explicit action".to_string(),
     }
 }
 
@@ -1106,6 +1480,7 @@ pub fn generate_incident_report(
     input.native_sampler_runtime = Some(get_native_sampler_runtime_summary(&state.read)?);
     input.native_scheduler_operational =
         Some(get_native_scheduler_operational_summary(&state.read)?);
+    input.native_scheduler_host = Some(get_native_scheduler_host_status(&state.read)?);
     input.llm_alert_stories = state
         .read
         .llm_alert_stories
@@ -1126,7 +1501,11 @@ pub fn generate_incident_report(
     let output = IncidentReportGenerator::new()
         .generate(input)
         .map_err(report_generation_error)?;
-    let report = output.report;
+    let mut report = output.report;
+    append_endpoint_threat_report_section(&mut report, &state.read)?;
+    ReportRedactionPipeline::new()
+        .validate_report(&report)
+        .map_err(report_generation_error)?;
     state.read.reports.items.push(report.clone());
 
     finish_mutation(
@@ -1138,6 +1517,120 @@ pub fn generate_incident_report(
         audit.with_result("incident report generated from redacted metadata"),
         None,
     )
+}
+
+fn append_endpoint_threat_report_section(
+    report: &mut Report,
+    read: &ReadOnlyCommandState,
+) -> CommandResult<()> {
+    let summary = get_endpoint_threat_summary(read)?;
+    let source_evidence_refs = read
+        .endpoint_threat_evidence
+        .iter()
+        .map(|evidence| evidence.source_evidence_ref.clone())
+        .collect::<Vec<_>>();
+    for evidence_ref in &source_evidence_refs {
+        push_report_evidence_ref(&mut report.evidence_refs, evidence_ref.clone());
+    }
+
+    let mut section = ReportSection::new(
+        ReportSectionType::Custom,
+        "Endpoint threat analysis traceability",
+        report.redaction_summary.clone(),
+    )
+    .map_err(contract_error)?;
+    section.evidence_refs = source_evidence_refs.clone();
+    section.privacy_class = PrivacyClass::Internal;
+    section.quality = QualityBreakdown::metadata_only();
+    section.quality.degraded_reasons = summary.degraded_reasons.clone();
+    section.quality.missing_visibility_flags =
+        summary.missing_visibility.missing_visibility_flags.clone();
+    section.content_redacted = json!({
+        "scope": "endpoint_threat_analysis_lite",
+        "summary": {
+            "detector_status": summary.detector_status.clone(),
+            "candidate_count": summary.candidate_count,
+            "finding_count": summary.finding_count,
+            "evidence_count": summary.evidence_count,
+            "risk_hint_count": summary.risk_hint_count,
+            "advisory_count": summary.advisory_count,
+            "rejected_count": summary.rejected_count,
+            "graph_ref_count": summary.graph_ref_count,
+        },
+        "finding_refs": summary
+            .findings
+            .iter()
+            .map(|finding| finding.finding_id.clone())
+            .collect::<Vec<_>>(),
+        "detector_refs": summary
+            .findings
+            .iter()
+            .map(|finding| format!("{} v{}", finding.detector_id, finding.detector_version))
+            .collect::<Vec<_>>(),
+        "candidate_refs": summary
+            .findings
+            .iter()
+            .map(|finding| finding.candidate_ref.clone())
+            .collect::<Vec<_>>(),
+        "evidence_refs": summary.evidence_correlation.evidence_refs.clone(),
+        "endpoint_evidence_refs": summary.evidence_correlation.endpoint_evidence_refs.clone(),
+        "hypothesis_refs": summary.evidence_correlation.hypothesis_refs.clone(),
+        "risk_refs": summary.evidence_correlation.risk_refs.clone(),
+        "attack_refs": summary
+            .attack_context
+            .iter()
+            .map(|attack| format!("{}:{}", attack.tactic_id, attack.technique_id))
+            .collect::<Vec<_>>(),
+        "graph_refs": summary.graph_refs.clone(),
+        "report_refs": summary.report_refs.clone(),
+        "export_refs": summary.export_refs.clone(),
+        "quality_summary": {
+            "evidence_buckets": summary.quality.evidence_quality_buckets.clone(),
+            "source_reliability_buckets": summary.quality.source_reliability_buckets.clone(),
+            "correlation_buckets": summary.quality.correlation_quality_buckets.clone(),
+            "freshness_categories": summary.quality.freshness_categories.clone(),
+        },
+        "visibility_summary": {
+            "baseline_support": summary.baseline_support.support_bucket.clone(),
+            "baseline_refs": summary.baseline_support.baseline_refs.clone(),
+            "missing_visibility_flags": summary.missing_visibility.missing_visibility_flags.clone(),
+            "degraded_reasons": summary.missing_visibility.degraded_reasons.clone(),
+            "advisory_refs": summary
+                .visibility_advisories
+                .iter()
+                .map(|advisory| advisory.advisory_id.clone())
+                .collect::<Vec<_>>(),
+            "warning_markers": [
+                "endpoint category context available",
+                "specific process identity unavailable",
+                "process-network attribution unavailable",
+                "confirmed compromise not established"
+            ],
+        },
+        "rejected_candidate_reasons": summary
+            .rejected_candidates
+            .iter()
+            .map(|candidate| candidate.reason.clone())
+            .collect::<Vec<_>>(),
+        "guardrails": {
+            "bounded_refs_only": true,
+            "analysis_run_by_report": false,
+            "samplers_started": false,
+            "scheduler_started": false,
+            "providers_contacted": false,
+            "automatic_llm_invocation": false,
+            "response_execution_started": false,
+        },
+    });
+    report.sections.push(section);
+    report.updated_at = Timestamp::now();
+    Ok(())
+}
+
+fn push_report_evidence_ref(refs: &mut Vec<EvidenceId>, evidence_ref: EvidenceId) {
+    if refs.len() < 100 && !refs.contains(&evidence_ref) {
+        refs.push(evidence_ref);
+    }
 }
 
 pub fn export_report(
@@ -1489,7 +1982,11 @@ pub fn confirm_portable_capture_import(
         PolicyOptions::default(),
         audit.clone(),
     )?;
-    let result = ingest_portable_capture_import(&mut state.read, prepared)?;
+    let runtime_services = state.runtime_services.clone().ok_or_else(|| {
+        CoreError::validation_failure("portable import runtime services are unavailable")
+    })?;
+    let result =
+        ingest_portable_capture_import_with_runtime(&mut state.read, prepared, &runtime_services)?;
     record_manual_import_watch_sampling(state, &result)?;
 
     finish_mutation(
@@ -1733,7 +2230,14 @@ fn run_reader_watch_tick(
         let before_facts = state.read.security_facts.items.len();
         let before_findings = state.read.findings.items.len();
         let before_fusion = state.read.fusion_summaries.len();
-        let result = ingest_portable_capture_import(&mut state.read, &prepared)?;
+        let runtime_services = state.runtime_services.clone().ok_or_else(|| {
+            CoreError::validation_failure("portable reader runtime services are unavailable")
+        })?;
+        let result = ingest_portable_capture_import_with_runtime(
+            &mut state.read,
+            &prepared,
+            &runtime_services,
+        )?;
         emitted_topics.extend(result.emitted_topics.clone());
         sampled_record_count = sampled_record_count.max(portable_import_record_count(&result));
         sampled_byte_count = sampled_byte_count.saturating_add(candidate.content_len as u64);
@@ -2080,6 +2584,20 @@ fn metadata_parser_family_for_source_type(
         PortableCaptureInputSourceType::ImportedJsonlNetworkMetadata => {
             MetadataParserFamily::JsonlNetwork
         }
+        PortableCaptureInputSourceType::ImportedDnsResolverLog => {
+            MetadataParserFamily::DnsResolverLog
+        }
+        PortableCaptureInputSourceType::ImportedApiGatewayLog => {
+            MetadataParserFamily::ApiGatewayLog
+        }
+        PortableCaptureInputSourceType::ImportedWafLog => MetadataParserFamily::WafLog,
+        PortableCaptureInputSourceType::ImportedCdnEdgeLog => MetadataParserFamily::CdnEdgeLog,
+        PortableCaptureInputSourceType::ImportedSdnControlPlaneLog => {
+            MetadataParserFamily::SdnControlPlaneLog
+        }
+        PortableCaptureInputSourceType::ImportedObjectStorageAuditLog => {
+            MetadataParserFamily::ObjectStorageAuditLog
+        }
         PortableCaptureInputSourceType::ImportedWebAccessLog => MetadataParserFamily::WebAccessLog,
         PortableCaptureInputSourceType::ImportedAuthSecurityLog => {
             MetadataParserFamily::AuthSecurityLog
@@ -2106,6 +2624,7 @@ fn run_record_count(run: &PortableCaptureLiteRunResult) -> u64 {
         + u64::from(counts.auth_metadata_records)
         + u64::from(counts.saas_cloud_metadata_records)
         + u64::from(counts.deception_event_records)
+        + u64::from(counts.sdn_control_plane_records)
 }
 
 fn portable_import_record_count(result: &PortableCaptureImportResult) -> u64 {
@@ -2117,7 +2636,8 @@ fn portable_import_record_count(result: &PortableCaptureImportResult) -> u64 {
             + result.http_metadata_count
             + result.auth_metadata_count
             + result.saas_cloud_metadata_count
-            + result.deception_event_count,
+            + result.deception_event_count
+            + result.sdn_control_plane_metadata_count,
     )
     .unwrap_or(u64::MAX)
 }
@@ -2745,6 +3265,7 @@ fn authorize(
     options: PolicyOptions,
     audit: AuditDraft,
 ) -> CommandResult<PermissionDecision> {
+    state.validate_production_mutation()?;
     let permission = permission_key(permission)?;
     let subject = PermissionSubject::TauriCommand(command.to_string());
     let request = PermissionRequest::new(
@@ -3343,7 +3864,10 @@ fn response_planning_output_for_source(
 ) -> CommandResult<ResponsePlanningCommandOutput> {
     let input = response_planning_input_for_source(state, source)?;
     if response_source_can_use_static_runtime(source) {
-        return static_response_planning_output(input, trace_id);
+        let runtime_services = state.runtime_services.as_ref().ok_or_else(|| {
+            CoreError::validation_failure("container-owned runtime services are required")
+        })?;
+        return static_response_planning_output_with_runtime(input, trace_id, runtime_services);
     }
 
     let output = ResponsePlanningPlugin::new()
@@ -3365,13 +3889,23 @@ fn response_source_can_use_static_runtime(source: &ResponsePlanSource) -> bool {
     )
 }
 
-pub(crate) fn static_response_planning_output(
+fn static_response_planning_output_with_runtime(
+    input: ResponsePlanningInput,
+    trace_id: &TraceId,
+    runtime_services: &RuntimeServices,
+) -> CommandResult<ResponsePlanningCommandOutput> {
+    runtime_services.with_plugin_runtime(|runtime| {
+        static_response_planning_output_with_plugin_runtime(runtime, input, trace_id)
+    })
+}
+
+fn static_response_planning_output_with_plugin_runtime(
+    runtime: &mut PluginRuntime,
     input: ResponsePlanningInput,
     trace_id: &TraceId,
 ) -> CommandResult<ResponsePlanningCommandOutput> {
     let staged_event_producer = input.producer_plugin.clone();
-    let mut runtime = PluginRuntime::new();
-    let plugin_id = register_static_response_planning_plugin(&mut runtime)
+    let plugin_id = PluginId::parse_str(RESPONSE_PLANNING_STATIC_PLUGIN_ID)
         .map_err(|error| response_planning_runtime_error(error, trace_id))?;
     let manifest = runtime
         .manifest(&plugin_id)
@@ -3504,6 +4038,36 @@ pub(crate) fn static_response_planning_output(
         response_plans,
         used_static_runtime: true,
     })
+}
+
+pub(crate) fn fixture_response_planning_output(
+    input: ResponsePlanningInput,
+    trace_id: &TraceId,
+) -> CommandResult<ResponsePlanningCommandOutput> {
+    let output = ResponsePlanningPlugin::new()
+        .process(input)
+        .map_err(response_planning_error)?;
+    let mut response_plans = output.response_plans;
+    for plan in &mut response_plans {
+        push_unique_string(
+            &mut plan.audit_requirements,
+            "response.fixture.pure_capability.process".to_string(),
+        );
+    }
+    let _ = trace_id;
+    Ok(ResponsePlanningCommandOutput {
+        response_plans,
+        used_static_runtime: false,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn static_response_planning_output(
+    input: ResponsePlanningInput,
+    trace_id: &TraceId,
+) -> CommandResult<ResponsePlanningCommandOutput> {
+    let runtime_services = RuntimeServices::for_test("static-response-planning")?;
+    static_response_planning_output_with_runtime(input, trace_id, &runtime_services)
 }
 
 fn contract_registry_for_manifest(
@@ -4489,15 +5053,22 @@ fn export_history_storage_error(error: ExportHistoryError, trace_id: &TraceId) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoint_threat_runtime::run_endpoint_threat_analysis_runtime;
     use rusqlite::Connection;
     use sentinel_capabilities::ResponsePolicyRule;
     use sentinel_contracts::{
-        Alert, EntityId, EntityRef, EntityType, EvidenceId, FindingExplanation, ForensicScopeKind,
-        GraphEdgeType, GraphEdgeViewModel, GraphNodeType, GraphNodeViewModel,
+        Alert, AttackHypothesisId, AttackHypothesisRecord, EntityId, EntityRef, EntityType,
+        EvidenceId, FindingExplanation, ForensicScopeKind, FusionConfidenceBucket, FusionCount,
+        FusionSummary, GraphEdgeType, GraphEdgeViewModel, GraphNodeType, GraphNodeViewModel,
         GraphRedactionSummary, GraphType, LlmAlertStoryDraft, LlmAlertStoryId,
         LlmAlertStoryProvider, LlmAlertStoryRecord, LlmAttackTechniqueRef, PrivacyClass,
-        QualityScore, RedactedLabel, ReportSectionType, ResponseMode, RiskEventId,
-        SecuritySeverity,
+        QualityScore, RedactedLabel, RedactionStatus, ReportSectionType, ResponseMode, RiskEventId,
+        SecurityFact, SecurityLayer, SecuritySeverity,
+    };
+    use sentinel_platform::{
+        CLOUD_SAAS_METADATA, ENDPOINT_PROCESS_CATEGORY_FACT, ENDPOINT_PROCESS_PARENT_CATEGORY_FACT,
+        ENDPOINT_SERVICE_CATEGORY_FACT, NETWORK_DNS_OBSERVATION, NETWORK_HTTP_METADATA,
+        NETWORK_SDN_CONTROL_PLANE_METADATA,
     };
     use sentinel_storage::{
         logical_store_migration, InMemoryMigrationAuditSink, MigrationRunner, SchemaMetadata,
@@ -5018,6 +5589,429 @@ mod tests {
         .expect("complete appended tail tick");
         assert_eq!(state.read.flows.items.len(), first_flow_count + 1);
         assert_reader_surfaces_redacted(&state, &["access.log", "token=secret", "192.0.2.55"]);
+    }
+
+    #[test]
+    fn portable_dns_resolver_tail_reader_processes_logs_without_identifier_exposure() {
+        let temp = TestTempDir::new("dns_resolver_tail");
+        let log_path = temp.path().join("bind-resolver.log");
+        std::fs::write(&log_path, dns_resolver_reader_fixture()).expect("write resolver log");
+        let mut state = MutationCommandState::bootstrap().expect("state");
+        let source_id = confirm_reader_source(
+            &mut state,
+            MetadataWatchSourceKind::TailedDnsResolverLog,
+            MetadataParserFamily::DnsResolverLog,
+            MetadataSamplingMode::IntervalTick,
+            &log_path,
+        );
+
+        let first = tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id.clone()),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("first resolver tick");
+        assert_eq!(first.result.batches.len(), 1);
+        assert_eq!(state.read.dns.items.len(), 1);
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == NETWORK_DNS_OBSERVATION));
+
+        append_to_file(&log_path, &dnsmasq_resolver_reader_line());
+        tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("appended resolver tick");
+        assert_eq!(state.read.dns.items.len(), 2);
+        assert!(state.read.llm_alert_stories.items.is_empty());
+        assert!(state.response_actions().is_empty());
+        assert_reader_surfaces_redacted(
+            &state,
+            &[
+                "bind-resolver.log",
+                "api-token-secret.example.test",
+                "cdn.example.test",
+                "10.42.0.5",
+                "10.42.0.6",
+            ],
+        );
+    }
+
+    #[test]
+    fn portable_api_gateway_tail_reader_processes_jsonl_without_identifier_exposure() {
+        let temp = TestTempDir::new("api_gateway_tail");
+        let log_path = temp.path().join("aws-api-gateway.jsonl");
+        std::fs::write(&log_path, api_gateway_reader_fixture()).expect("write gateway log");
+        let mut state = MutationCommandState::bootstrap().expect("state");
+        let source_id = confirm_reader_source(
+            &mut state,
+            MetadataWatchSourceKind::TailedApiGatewayLog,
+            MetadataParserFamily::ApiGatewayLog,
+            MetadataSamplingMode::IntervalTick,
+            &log_path,
+        );
+
+        let first = tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id.clone()),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("first api gateway tick");
+        assert_eq!(first.result.batches.len(), 1);
+        assert_eq!(state.read.http_metadata.items.len(), 1);
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == NETWORK_HTTP_METADATA));
+
+        append_to_file(&log_path, &api_gateway_reader_append_line());
+        tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("second api gateway tick");
+        assert_eq!(state.read.http_metadata.items.len(), 2);
+        assert!(state.read.llm_alert_stories.items.is_empty());
+        assert!(state.response_actions().is_empty());
+        assert_reader_surfaces_redacted(
+            &state,
+            &[
+                "aws-api-gateway.jsonl",
+                "api.customer.example.test",
+                "edge-api.internal.example.test",
+                "10.77.1.44",
+                "203.0.113.44",
+                "req-sensitive-123",
+                "AliceSecret",
+                "Bob",
+                "access_token",
+            ],
+        );
+    }
+
+    #[test]
+    fn portable_waf_tail_reader_processes_jsonl_without_identifier_exposure() {
+        let temp = TestTempDir::new("waf_tail");
+        let log_path = temp.path().join("cloudflare-waf.jsonl");
+        std::fs::write(&log_path, waf_reader_fixture()).expect("write waf log");
+        let mut state = MutationCommandState::bootstrap().expect("state");
+        let source_id = confirm_reader_source(
+            &mut state,
+            MetadataWatchSourceKind::TailedWafLog,
+            MetadataParserFamily::WafLog,
+            MetadataSamplingMode::IntervalTick,
+            &log_path,
+        );
+
+        let first = tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id.clone()),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("first waf tick");
+        assert_eq!(first.result.batches.len(), 1);
+        assert_eq!(state.read.http_metadata.items.len(), 1);
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == NETWORK_HTTP_METADATA));
+
+        append_to_file(&log_path, &waf_reader_append_line());
+        tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("second waf tick");
+        assert_eq!(state.read.http_metadata.items.len(), 2);
+        assert!(state.read.llm_alert_stories.items.is_empty());
+        assert!(state.response_actions().is_empty());
+        assert_reader_surfaces_redacted(
+            &state,
+            &[
+                "cloudflare-waf.jsonl",
+                "shop.example.test",
+                "admin.example.test",
+                "10.88.1.10",
+                "203.0.113.88",
+                "AliceSecret",
+                "BobSecret",
+                "password=secret",
+                "access_token=secret",
+                "cf-secret-rule-123",
+                "aws-secret-rule-789",
+                "aws-req-secret",
+            ],
+        );
+    }
+
+    #[test]
+    fn portable_cdn_edge_tail_reader_processes_jsonl_without_identifier_exposure() {
+        let temp = TestTempDir::new("cdn_edge_tail");
+        let log_path = temp.path().join("cloudfront-edge.jsonl");
+        std::fs::write(&log_path, cdn_edge_reader_fixture()).expect("write cdn edge log");
+        let mut state = MutationCommandState::bootstrap().expect("state");
+        let source_id = confirm_reader_source(
+            &mut state,
+            MetadataWatchSourceKind::TailedCdnEdgeLog,
+            MetadataParserFamily::CdnEdgeLog,
+            MetadataSamplingMode::IntervalTick,
+            &log_path,
+        );
+
+        let first = tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id.clone()),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("first cdn edge tick");
+        assert_eq!(first.result.batches.len(), 1);
+        assert_eq!(state.read.http_metadata.items.len(), 2);
+        assert_eq!(
+            state.read.portable_capture_sources[0]
+                .record_counts
+                .saas_cloud_metadata_records,
+            2
+        );
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == NETWORK_HTTP_METADATA));
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == CLOUD_SAAS_METADATA));
+        assert!(state.read.findings.items.iter().any(|finding| finding
+            .finding_type()
+            .starts_with("portable.saas_cloud_abuse_lite.")));
+
+        append_to_file(&log_path, &cdn_edge_reader_append_line());
+        tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("second cdn edge tick");
+        assert_eq!(state.read.http_metadata.items.len(), 3);
+        assert!(state.read.llm_alert_stories.items.is_empty());
+        assert!(state.response_actions().is_empty());
+        assert_reader_surfaces_redacted(
+            &state,
+            &[
+                "cloudfront-edge.jsonl",
+                "assets.customer.example.test",
+                "d111111abcdef8.cloudfront.net",
+                "frontdoor.customer.example.test",
+                "10.90.1.10",
+                "203.0.113.90",
+                "198.51.100.91",
+                "AliceSecret",
+                "BobSecret",
+                "CarolSecret",
+                "token=secret",
+                "access_token=secret",
+                "credential=secret",
+                "cf-ray-secret-123",
+                "afd-trace-secret-456",
+                "private-route-secret",
+            ],
+        );
+    }
+
+    #[test]
+    fn portable_object_storage_tail_reader_processes_jsonl_without_identifier_exposure() {
+        let temp = TestTempDir::new("object_storage_tail");
+        let log_path = temp.path().join("object-storage-audit.jsonl");
+        std::fs::write(&log_path, object_storage_reader_fixture())
+            .expect("write object storage log");
+        let mut state = MutationCommandState::bootstrap().expect("state");
+        let source_id = confirm_reader_source(
+            &mut state,
+            MetadataWatchSourceKind::TailedObjectStorageAuditLog,
+            MetadataParserFamily::ObjectStorageAuditLog,
+            MetadataSamplingMode::IntervalTick,
+            &log_path,
+        );
+
+        let first = tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id.clone()),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("first object storage tick");
+        assert_eq!(first.result.batches.len(), 1);
+        assert_eq!(
+            state.read.portable_capture_sources[0]
+                .record_counts
+                .saas_cloud_metadata_records,
+            2
+        );
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == CLOUD_SAAS_METADATA));
+        assert!(state.read.findings.items.iter().any(|finding| finding
+            .finding_type()
+            .contains("suspicious_object_storage_upload")));
+
+        append_to_file(&log_path, &object_storage_reader_append_line());
+        tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("second object storage tick");
+        assert_eq!(
+            state
+                .read
+                .portable_capture_sources
+                .iter()
+                .map(|source| source.record_counts.saas_cloud_metadata_records)
+                .sum::<u32>(),
+            3
+        );
+        assert!(state.read.llm_alert_stories.items.is_empty());
+        assert!(state.response_actions().is_empty());
+        assert_reader_surfaces_redacted(
+            &state,
+            &[
+                "object-storage-audit.jsonl",
+                "prod-private-bucket",
+                "customers/alice.csv",
+                "principal",
+                "account_id",
+                "sourceIPAddress",
+                "s3://",
+                "https://",
+                "payload",
+            ],
+        );
+    }
+
+    #[test]
+    fn portable_sdn_control_plane_tail_reader_processes_jsonl_without_identifier_exposure() {
+        let temp = TestTempDir::new("sdn_control_plane_tail");
+        let log_path = temp.path().join("sdn-control-plane.jsonl");
+        std::fs::write(&log_path, sdn_control_plane_reader_fixture()).expect("write sdn log");
+        let mut state = MutationCommandState::bootstrap().expect("state");
+        let source_id = confirm_reader_source(
+            &mut state,
+            MetadataWatchSourceKind::TailedSdnControlPlaneLog,
+            MetadataParserFamily::SdnControlPlaneLog,
+            MetadataSamplingMode::IntervalTick,
+            &log_path,
+        );
+
+        let first = tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id.clone()),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("first sdn tick");
+        assert_eq!(first.result.batches.len(), 1);
+        assert_eq!(
+            state.read.portable_capture_sources[0]
+                .record_counts
+                .sdn_control_plane_records,
+            2
+        );
+        assert!(first.result.batches[0]
+            .emitted_topics
+            .iter()
+            .any(|topic| topic == NETWORK_SDN_CONTROL_PLANE_METADATA));
+        assert!(state
+            .read
+            .security_facts
+            .items
+            .iter()
+            .any(|fact| fact.layer == SecurityLayer::SdnControlPlane));
+        assert!(state.read.findings.items.is_empty());
+
+        append_to_file(&log_path, &sdn_control_plane_reader_append_line());
+        tick_metadata_watch_controller(
+            &mut state,
+            MetadataSamplingTickRequest {
+                source_id: Some(source_id),
+                max_sources: 1,
+                reason_redacted: "operator_tick".to_string(),
+                requested_by_redacted: None,
+            },
+        )
+        .expect("second sdn tick");
+        assert_eq!(
+            state
+                .read
+                .portable_capture_sources
+                .iter()
+                .map(|source| source.record_counts.sdn_control_plane_records)
+                .sum::<u32>(),
+            3
+        );
+        assert!(state.read.llm_alert_stories.items.is_empty());
+        assert!(state.response_actions().is_empty());
+        assert_reader_surfaces_redacted(
+            &state,
+            &[
+                "sdn-control-plane.jsonl",
+                "controller-prod-a",
+                "leaf-01",
+                "edge-router",
+                "10.0.0.",
+                "private-route-777",
+                "tenant",
+                "payload",
+                "acl_text",
+                "raw_topology",
+            ],
+        );
     }
 
     #[test]
@@ -5905,6 +6899,167 @@ mod tests {
     }
 
     #[test]
+    fn read_commands_endpoint_threat_report_and_export_are_ref_only_and_side_effect_free() {
+        let mut read = endpoint_report_read_state();
+        run_endpoint_threat_analysis_runtime(&mut read).expect("endpoint runtime");
+        let summary = get_endpoint_threat_summary(&read).expect("endpoint summary");
+        assert!(summary.finding_count > 0);
+        let endpoint_finding_ids_before = read
+            .endpoint_threat_findings
+            .iter()
+            .map(|finding| finding.finding_id.to_string())
+            .collect::<Vec<_>>();
+        let emitted_topics_before = read.endpoint_threat_emitted_topics.clone();
+        let incident_id = read.incidents.items[0].id().clone();
+        let mut state = MutationCommandState::from_read_state(read).expect("state");
+        let scheduler_cycles_before = state.read_state().native_scheduler_cycles.len();
+        let sampler_batches_before = state.read_state().native_sampler_runtime_batches.len();
+        let llm_story_count_before = state.read_state().llm_alert_stories.items.len();
+        let response_action_count_before = state.response_actions().len();
+
+        let report = generate_incident_report(
+            &mut state,
+            GenerateIncidentReportRequest {
+                incident_id,
+                requested_by_redacted: Some("local_operator".to_string()),
+                reason_redacted: "prepare endpoint threat traceability report".to_string(),
+            },
+        )
+        .expect("endpoint report")
+        .result
+        .report;
+
+        assert_eq!(
+            endpoint_finding_ids_before,
+            state
+                .read_state()
+                .endpoint_threat_findings
+                .iter()
+                .map(|finding| finding.finding_id.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            emitted_topics_before,
+            state.read_state().endpoint_threat_emitted_topics
+        );
+        assert_eq!(
+            scheduler_cycles_before,
+            state.read_state().native_scheduler_cycles.len()
+        );
+        assert_eq!(
+            sampler_batches_before,
+            state.read_state().native_sampler_runtime_batches.len()
+        );
+        assert_eq!(
+            llm_story_count_before,
+            state.read_state().llm_alert_stories.items.len()
+        );
+        assert_eq!(response_action_count_before, state.response_actions().len());
+
+        let section = report
+            .sections
+            .iter()
+            .find(|section| section.title_redacted == "Endpoint threat analysis traceability")
+            .expect("endpoint traceability section");
+        assert_eq!(section.section_type, ReportSectionType::Custom);
+        assert_eq!(
+            section.content_redacted["guardrails"]["analysis_run_by_report"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            section.content_redacted["guardrails"]["samplers_started"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            section.content_redacted["guardrails"]["scheduler_started"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            section.content_redacted["guardrails"]["providers_contacted"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            section.content_redacted["guardrails"]["automatic_llm_invocation"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            section.content_redacted["guardrails"]["response_execution_started"],
+            Value::Bool(false)
+        );
+        let section_text = serde_json::to_string(&section.content_redacted).expect("section json");
+        assert!(section_text.contains("finding_refs"));
+        assert!(section_text.contains("detector_refs"));
+        assert!(section_text.contains("hypothesis_refs"));
+        assert!(section_text.contains("risk_refs"));
+        assert!(section_text.contains("attack_refs"));
+        assert!(section_text.contains("graph_refs"));
+        assert!(section_text.contains("quality_summary"));
+        assert!(section_text.contains("visibility_summary"));
+        assert_no_endpoint_report_leaks(&section_text);
+
+        let export_package = ReportExportGate::new()
+            .prepare_export(ReportExportGateRequest {
+                report: report.clone(),
+                format: ExportFormat::RedactedJson,
+                policy: state
+                    .read_state()
+                    .runtime_profile
+                    .report_export_policy
+                    .clone(),
+                requested_by_redacted: "local_operator".to_string(),
+                user_confirmed: true,
+                audit_ref: AuditRef::new("report.export.requested").expect("audit ref"),
+                destination_metadata_redacted: Some("local endpoint trace export".to_string()),
+                file_hash: None,
+            })
+            .expect("export package");
+        assert!(export_package
+            .rendered_report
+            .content_redacted
+            .contains("Endpoint threat analysis traceability"));
+        assert_no_endpoint_report_leaks(&export_package.rendered_report.content_redacted);
+
+        export_report(
+            &mut state,
+            ExportReportRequest {
+                report_id: report.report_id,
+                format: ExportFormat::RedactedJson,
+                destination_metadata_redacted: Some("local endpoint trace export".to_string()),
+                requested_by_redacted: Some("local_operator".to_string()),
+                user_confirmed: true,
+            },
+        )
+        .expect("export");
+
+        assert_eq!(
+            endpoint_finding_ids_before,
+            state
+                .read_state()
+                .endpoint_threat_findings
+                .iter()
+                .map(|finding| finding.finding_id.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            emitted_topics_before,
+            state.read_state().endpoint_threat_emitted_topics
+        );
+        assert_eq!(
+            scheduler_cycles_before,
+            state.read_state().native_scheduler_cycles.len()
+        );
+        assert_eq!(
+            sampler_batches_before,
+            state.read_state().native_sampler_runtime_batches.len()
+        );
+        assert_eq!(
+            llm_story_count_before,
+            state.read_state().llm_alert_stories.items.len()
+        );
+        assert_eq!(response_action_count_before, state.response_actions().len());
+    }
+
+    #[test]
     fn unsafe_export_destination_does_not_append_history_and_redacts_error_details() {
         let read = sample_read_state();
         let incident_id = read.incidents.items[0].id().clone();
@@ -6401,6 +7556,158 @@ mod tests {
             .with_graph_views(vec![graph_view])
     }
 
+    fn endpoint_report_read_state() -> ReadOnlyCommandState {
+        let state = sample_read_state();
+        let finding = state.findings.items[0].clone();
+        let evidence = finding.evidence_refs()[0].clone();
+        let process = endpoint_fact(
+            SecurityLayer::AuthorizedNativeProcess,
+            ENDPOINT_PROCESS_CATEGORY_FACT,
+            "script_capable_activity",
+        );
+        let service = endpoint_fact(
+            SecurityLayer::AuthorizedNativeService,
+            ENDPOINT_SERVICE_CATEGORY_FACT,
+            "service_state_change",
+        );
+        let parent = endpoint_fact(
+            SecurityLayer::AuthorizedNativeProcess,
+            ENDPOINT_PROCESS_PARENT_CATEGORY_FACT,
+            "parent_category_transition",
+        );
+        let hypothesis = endpoint_hypothesis(&process, &evidence, finding.id().clone());
+        let fusion_summary = endpoint_fusion_summary(
+            vec![process.clone(), service.clone(), parent.clone()],
+            &hypothesis,
+            &evidence,
+            finding.id().clone(),
+        );
+        state
+            .with_security_facts(vec![process, service, parent])
+            .with_attack_hypotheses(vec![hypothesis])
+            .with_fusion_summaries(vec![fusion_summary])
+    }
+
+    fn endpoint_fact(layer: SecurityLayer, category: &str, context: &str) -> SecurityFact {
+        let mut fact = SecurityFact::new(layer, category, "endpoint_report_test", Timestamp::now())
+            .expect("fact");
+        fact.evidence_refs = vec![EvidenceId::new_v4()];
+        fact.provenance_id = Some(sentinel_contracts::DataSourceId::new_v4());
+        fact.redaction_status = RedactionStatus::Redacted;
+        fact.count_bucket = Some("low".to_string());
+        match context {
+            "script_capable_activity" => {
+                fact.process_category = Some("script_category".to_string());
+                fact.auth_category = Some("auth_failure_bucket".to_string());
+                fact.saas_cloud_category = Some("saas_cloud_category".to_string());
+            }
+            "service_state_change" => {
+                fact.status_category = Some("service_state_change".to_string());
+            }
+            "parent_category_transition" => {
+                fact.parent_process_category = Some("shell_category".to_string());
+                fact.relation_category = Some("parent_category_transition".to_string());
+            }
+            _ => {}
+        }
+        fact.validate().expect("safe fact");
+        fact
+    }
+
+    fn endpoint_hypothesis(
+        fact: &SecurityFact,
+        evidence: &EvidenceId,
+        finding_id: FindingId,
+    ) -> AttackHypothesisRecord {
+        let record = AttackHypothesisRecord {
+            hypothesis_record_id: AttackHypothesisId::new_v4(),
+            definition_id: "endpoint_threat_lite.possible_endpoint_activity_with_auth_pressure"
+                .to_string(),
+            version: "1.0.0".to_string(),
+            category: "possible_endpoint_activity_with_auth_pressure".to_string(),
+            fact_refs: vec![fact.fact_id.clone()],
+            correlated_layers: vec![SecurityLayer::AuthorizedNativeProcess],
+            correlation_count: 2,
+            confidence_bucket: FusionConfidenceBucket::Low,
+            degraded_reason: Some("metadata_only_visibility".to_string()),
+            missing_visibility_flags: vec!["command_visibility_context_unavailable".to_string()],
+            evidence_refs: vec![evidence.clone(), EvidenceId::new_v4()],
+            finding_refs: vec![finding_id],
+            risk_refs: Vec::new(),
+            graph_hint_refs: Vec::new(),
+            attack_candidates: Vec::new(),
+            negative_evidence_notes: Vec::new(),
+            benign_baseline_indicators: Vec::new(),
+            optional_llm_story_marker: false,
+            quality: QualityBreakdown::metadata_only(),
+            created_at: Timestamp::now(),
+        };
+        record.validate().expect("safe hypothesis");
+        record
+    }
+
+    fn endpoint_fusion_summary(
+        facts: Vec<SecurityFact>,
+        hypothesis: &AttackHypothesisRecord,
+        evidence: &EvidenceId,
+        finding_id: FindingId,
+    ) -> FusionSummary {
+        let summary = FusionSummary {
+            generated_at: Timestamp::now(),
+            sampler_health: Vec::new(),
+            fact_count: facts.len() as u32,
+            hypothesis_count: 1,
+            fact_refs: facts.iter().map(|fact| fact.fact_id.clone()).collect(),
+            hypothesis_refs: vec![hypothesis.hypothesis_record_id.clone()],
+            facts,
+            hypotheses: vec![hypothesis.clone()],
+            top_correlated_layers: vec![FusionCount {
+                label: "authorized_native_process".to_string(),
+                count: 1,
+            }],
+            top_hypothesis_categories: vec![FusionCount {
+                label: "possible_endpoint_activity_with_auth_pressure".to_string(),
+                count: 1,
+            }],
+            degraded_visibility_context: vec!["metadata_only_visibility".to_string()],
+            evidence_refs: vec![evidence.clone()],
+            finding_refs: vec![finding_id],
+            graph_hint_refs: Vec::new(),
+            quality: QualityBreakdown::metadata_only(),
+            privacy_class: PrivacyClass::Internal,
+            automatic_llm_calls: false,
+        };
+        summary.validate().expect("safe fusion summary");
+        summary
+    }
+
+    fn assert_no_endpoint_report_leaks(serialized: &str) {
+        for marker in [
+            "process.exe",
+            "cmd.exe",
+            "powershell.exe",
+            "C:\\",
+            "/users/",
+            "alice@example.com",
+            "10.0.0.1",
+            "192.168.1.1",
+            "tenant_id",
+            "session_token",
+            "access_token",
+            "api_key=",
+            "credential=",
+            "password=",
+            "command_line=",
+        ] {
+            assert!(
+                !serialized
+                    .to_ascii_lowercase()
+                    .contains(&marker.to_ascii_lowercase()),
+                "endpoint report/export leaked marker {marker}"
+            );
+        }
+    }
+
     fn metadata_watch_preview_request(
         source_kind: MetadataWatchSourceKind,
         parser_family: MetadataParserFamily,
@@ -6579,6 +7886,231 @@ mod tests {
                 "client_ip": "192.0.2.15",
                 "answers": [{ "answer_type": "ip", "value": "203.0.113.22", "ttl_seconds": 60 }]
             }
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn dns_resolver_reader_fixture() -> String {
+        "16-Jun-2026 10:15:30.123 queries: info: client @0x1 10.42.0.5#53000 (api-token-secret.example.test): query: api-token-secret.example.test IN A +E(0)K (10.42.0.53)\n".to_string()
+    }
+
+    fn dnsmasq_resolver_reader_line() -> String {
+        "Jun 16 10:15:31 dnsmasq[344]: query[AAAA] cdn.example.test from 10.42.0.6\n".to_string()
+    }
+
+    fn api_gateway_reader_fixture() -> String {
+        serde_json::json!({
+            "requestTimeEpoch": 1781595330123_u64,
+            "requestId": "req-sensitive-123",
+            "domainName": "api.customer.example.test",
+            "sourceIp": "10.77.1.44",
+            "routeKey": "POST /prod/orders/{orderId}",
+            "path": "/prod/orders/AliceSecret?access_token=secret",
+            "status": 429,
+            "requestLength": 2048,
+            "responseLength": 512,
+            "integrationLatency": 42,
+            "protocol": "HTTP/2"
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn api_gateway_reader_append_line() -> String {
+        serde_json::json!({
+            "timestamp": "2026-06-16T10:16:00Z",
+            "authority": "edge-api.internal.example.test",
+            "client_ip": "203.0.113.44",
+            "method": "GET",
+            "raw_path": "/v1/customer/Bob/private",
+            "statusCode": 502,
+            "bytes_sent": 128,
+            "duration_ms": 8
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn waf_reader_fixture() -> String {
+        serde_json::json!({
+            "EdgeStartTimestamp": "2026-06-16T10:20:00Z",
+            "ClientIP": "10.88.1.10",
+            "ClientRequestHost": "shop.example.test",
+            "ClientRequestMethod": "POST",
+            "ClientRequestURI": "/prod/login/AliceSecret?password=secret",
+            "EdgeResponseStatus": 403,
+            "ClientRequestBytes": 900,
+            "EdgeResponseBytes": 64,
+            "WAFAction": "block",
+            "WAFRuleID": "cf-secret-rule-123",
+            "WAFRuleMessage": "SQL Injection attempt on password field",
+            "ClientRequestUserAgent": "sqlmap/1.7"
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn waf_reader_append_line() -> String {
+        serde_json::json!({
+            "timestamp": 1781595601000_u64,
+            "action": "BLOCK",
+            "terminatingRuleId": "aws-secret-rule-789",
+            "ruleMessage": "SQLi detected against token parameter",
+            "httpRequest": {
+                "clientIp": "203.0.113.88",
+                "host": "admin.example.test",
+                "uri": "/prod/login/BobSecret?access_token=secret",
+                "httpMethod": "POST",
+                "requestId": "aws-req-secret"
+            }
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn cdn_edge_reader_fixture() -> String {
+        serde_json::json!({
+            "EdgeStartTimestamp": "2026-06-16T10:30:00Z",
+            "ClientIP": "10.90.1.10",
+            "ClientRequestHost": "assets.customer.example.test",
+            "ClientRequestMethod": "GET",
+            "ClientRequestURI": "/prod/download/AliceSecret?token=secret",
+            "EdgeResponseStatus": 403,
+            "ClientRequestBytes": 256,
+            "EdgeResponseBytes": 64,
+            "CacheCacheStatus": "miss",
+            "RayID": "cf-ray-secret-123",
+            "ClientRequestUserAgent": "curl/8.0"
+        })
+        .to_string()
+            + "\n"
+            + &serde_json::json!({
+                "date": "2026-06-16",
+                "time": "10:30:01",
+                "c-ip": "203.0.113.90",
+                "cs-method": "POST",
+                "cs-host": "d111111abcdef8.cloudfront.net",
+                "cs-uri-stem": "/v1/upload/BobSecret",
+                "cs-uri-query": "access_token=secret",
+                "sc-status": 502,
+                "cs-bytes": 4096,
+                "sc-bytes": 128,
+                "time-taken": 0.24,
+                "x-edge-result-type": "OriginError"
+            })
+            .to_string()
+            + "\n"
+    }
+
+    fn cdn_edge_reader_append_line() -> String {
+        serde_json::json!({
+            "TimeGenerated": "2026-06-16T10:30:02Z",
+            "clientIp": "198.51.100.91",
+            "hostName": "frontdoor.customer.example.test",
+            "httpMethod": "GET",
+            "requestUri": "/prod/api/CarolSecret?credential=secret",
+            "httpStatusCode": 429,
+            "requestBytes": 512,
+            "responseBytes": 96,
+            "timeTaken": 0.11,
+            "cacheStatus": "CONFIG_NOCACHE",
+            "routingRuleName": "private-route-secret",
+            "trackingReference": "afd-trace-secret-456"
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn object_storage_reader_fixture() -> String {
+        serde_json::json!({
+            "eventTime": "2026-06-12T07:00:00Z",
+            "provider": "aws_s3",
+            "service": "s3",
+            "eventName": "PutObject",
+            "status_bucket": "success",
+            "transfer_direction": "upload",
+            "bucket_exposure": "public",
+            "provider_confidence": "high"
+        })
+        .to_string()
+            + "\n"
+            + &serde_json::json!({
+                "eventTime": "2026-06-12T07:01:00Z",
+                "provider": "aws_s3",
+                "service": "s3",
+                "eventName": "PutObject",
+                "status_bucket": "success",
+                "transfer_direction": "upload",
+                "bucket_exposure": "public",
+                "provider_confidence": "high"
+            })
+            .to_string()
+            + "\n"
+    }
+
+    fn object_storage_reader_append_line() -> String {
+        serde_json::json!({
+            "timestamp": "2026-06-12T07:02:00Z",
+            "storage_provider": "azure_blob",
+            "storage_service": "blob",
+            "operation_category": "GetBlob",
+            "result": "AccessDenied",
+            "direction": "download",
+            "storage_scope": "private",
+            "confidence": "medium"
+        })
+        .to_string()
+            + "\n"
+    }
+
+    fn sdn_control_plane_reader_fixture() -> String {
+        serde_json::json!({
+            "timestamp": "2026-06-12T09:00:00Z",
+            "controller_category": "onos controller-prod-a",
+            "event_category": "policy_change",
+            "impact_scope": "multiple_segments",
+            "reliability": "medium",
+            "policy_action": "deny",
+            "affected_asset_category": "cloud_workload",
+            "exposure_category": "reduced_exposure",
+            "status": "success",
+            "count": 8,
+            "controller_id": "controller-prod-a",
+            "node_id": "leaf-01-10.0.0.5"
+        })
+        .to_string()
+            + "\n"
+            + &serde_json::json!({
+                "timestamp": "2026-06-12T09:01:00Z",
+                "controller_type": "OpenDaylight",
+                "event_type": "route_change",
+                "scope": "edge",
+                "source_reliability": "high",
+                "route_change": "withdraw",
+                "affected_asset_category": "network_device",
+                "exposure": "lateral_path",
+                "result": "success",
+                "change_count": 1,
+                "route_id": "private-route-777",
+                "device": "edge-router-10.0.0.9"
+            })
+            .to_string()
+            + "\n"
+    }
+
+    fn sdn_control_plane_reader_append_line() -> String {
+        serde_json::json!({
+            "timestamp": "2026-06-12T09:02:00Z",
+            "controller_type": "sdwan",
+            "event_type": "topology_change",
+            "scope": "branch_edge",
+            "reliability": "medium",
+            "topology_change": "link_down",
+            "affected_asset_category": "network_device",
+            "status": "success",
+            "change_count": 2,
+            "link_id": "branch-link-10.0.0.10"
         })
         .to_string()
             + "\n"

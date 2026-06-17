@@ -744,6 +744,36 @@ fn source_family(
             MetadataParserFamily::JsonlNetwork,
             PortableCaptureInputSourceType::ImportedJsonlNetworkMetadata,
         )),
+        MetadataWatchSourceKind::TailedDnsResolverLog => Ok((
+            PortableReaderKind::TailFile,
+            MetadataParserFamily::DnsResolverLog,
+            PortableCaptureInputSourceType::ImportedDnsResolverLog,
+        )),
+        MetadataWatchSourceKind::TailedApiGatewayLog => Ok((
+            PortableReaderKind::JsonlAppend,
+            MetadataParserFamily::ApiGatewayLog,
+            PortableCaptureInputSourceType::ImportedApiGatewayLog,
+        )),
+        MetadataWatchSourceKind::TailedWafLog => Ok((
+            PortableReaderKind::JsonlAppend,
+            MetadataParserFamily::WafLog,
+            PortableCaptureInputSourceType::ImportedWafLog,
+        )),
+        MetadataWatchSourceKind::TailedCdnEdgeLog => Ok((
+            PortableReaderKind::JsonlAppend,
+            MetadataParserFamily::CdnEdgeLog,
+            PortableCaptureInputSourceType::ImportedCdnEdgeLog,
+        )),
+        MetadataWatchSourceKind::TailedSdnControlPlaneLog => Ok((
+            PortableReaderKind::JsonlAppend,
+            MetadataParserFamily::SdnControlPlaneLog,
+            PortableCaptureInputSourceType::ImportedSdnControlPlaneLog,
+        )),
+        MetadataWatchSourceKind::TailedObjectStorageAuditLog => Ok((
+            PortableReaderKind::JsonlAppend,
+            MetadataParserFamily::ObjectStorageAuditLog,
+            PortableCaptureInputSourceType::ImportedObjectStorageAuditLog,
+        )),
         MetadataWatchSourceKind::TailedWebLog => Ok((
             PortableReaderKind::TailFile,
             MetadataParserFamily::WebAccessLog,
@@ -809,6 +839,11 @@ fn validate_jsonl_if_required(
     if !matches!(
         source_type,
         PortableCaptureInputSourceType::ImportedJsonlNetworkMetadata
+            | PortableCaptureInputSourceType::ImportedApiGatewayLog
+            | PortableCaptureInputSourceType::ImportedWafLog
+            | PortableCaptureInputSourceType::ImportedCdnEdgeLog
+            | PortableCaptureInputSourceType::ImportedSdnControlPlaneLog
+            | PortableCaptureInputSourceType::ImportedObjectStorageAuditLog
             | PortableCaptureInputSourceType::ImportedSaasCloudMetadata
             | PortableCaptureInputSourceType::ImportedDeceptionEventLog
     ) {

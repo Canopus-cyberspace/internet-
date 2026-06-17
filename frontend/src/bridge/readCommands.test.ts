@@ -31,6 +31,11 @@ const READ_CASES = [
   ["search_flows", () => readCommands.searchFlows(queryRequest)],
   ["search_dns", () => readCommands.searchDns(queryRequest)],
   ["search_tls", () => readCommands.searchTls(queryRequest)],
+  ["get_provider_controller_status", () => readCommands.getProviderControllerStatus()],
+  ["list_network_provider_status", () => readCommands.listNetworkProviderStatus()],
+  ["get_network_provider_status", () => readCommands.getNetworkProviderStatus("ip_helper")],
+  ["get_network_visibility_summary", () => readCommands.getNetworkVisibilitySummary()],
+  ["get_network_fallback_plan", () => readCommands.getNetworkFallbackPlan()],
   [
     "get_graph_view",
     () =>
@@ -66,6 +71,7 @@ const READ_CASES = [
     () => readCommands.getEvidenceQualityRecord("quality-1"),
   ],
   ["get_investigation_drill_down_summary", () => readCommands.getInvestigationDrillDownSummary()],
+  ["get_endpoint_threat_summary", () => readCommands.getEndpointThreatSummary()],
   [
     "resolve_navigation_reference",
     () =>
@@ -172,6 +178,14 @@ const READ_CASES = [
   [
     "get_native_scheduler_operational_summary",
     () => readCommands.getNativeSchedulerOperationalSummary(),
+  ],
+  [
+    "get_native_scheduler_host_status",
+    () => readCommands.getNativeSchedulerHostStatus(),
+  ],
+  [
+    "get_native_scheduler_host_health",
+    () => readCommands.getNativeSchedulerHostHealth(),
   ],
   ["get_portable_preferences", () => readCommands.getPortablePreferences()],
 ] as const;

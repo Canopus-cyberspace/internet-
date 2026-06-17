@@ -1,7 +1,8 @@
 use crate::common::{
     DataSourceId, DeceptionEventId, DnsObservationId, EntityRef, EvidenceId, FindingId, FlowId,
     GraphHintId, HttpMetadataId, PacketRecordId, PrivacyClass, ProcessContextId, QualityScore,
-    SaasCloudMetadataId, SessionId, Timestamp, TlsObservationId, TraceId,
+    SaasCloudMetadataId, SdnControlPlaneMetadataId, SessionId, Timestamp, TlsObservationId,
+    TraceId,
 };
 use crate::graph::RedactionStatus;
 use crate::identity::{AttributionConfidence, CollectionMode, VisibilityLevel};
@@ -155,6 +156,12 @@ pub enum CaptureSource {
 pub enum PortableCaptureInputSourceType {
     ImportedHar,
     ImportedJsonlNetworkMetadata,
+    ImportedDnsResolverLog,
+    ImportedApiGatewayLog,
+    ImportedWafLog,
+    ImportedCdnEdgeLog,
+    ImportedSdnControlPlaneLog,
+    ImportedObjectStorageAuditLog,
     ImportedWebAccessLog,
     ImportedAuthSecurityLog,
     ImportedSaasCloudMetadata,
@@ -172,6 +179,7 @@ pub struct PortableCaptureRecordCounts {
     pub auth_metadata_records: u32,
     pub saas_cloud_metadata_records: u32,
     pub deception_event_records: u32,
+    pub sdn_control_plane_records: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +336,613 @@ pub struct PortableSaasCloudSummary {
     pub graph_hint_refs: Vec<GraphHintId>,
 }
 
+pub const MAX_OBJECT_STORAGE_AUDIT_PAGES_PER_TICK: u8 = 8;
+pub const MAX_OBJECT_STORAGE_AUDIT_RECORDS_PER_PAGE: u16 = 256;
+pub const DEFAULT_OBJECT_STORAGE_AUDIT_TIMEOUT_MILLIS: u64 = 10_000;
+pub const DEFAULT_OBJECT_STORAGE_AUDIT_RATE_LIMIT_PER_MINUTE: u16 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStorageAuditProviderKind {
+    AwsCloudTrail,
+    AzureActivity,
+    GoogleCloudAudit,
+    CloudflareR2,
+    Minio,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStorageAuditEndpointKind {
+    CloudTrailLookupEvents,
+    AzureActivityLogs,
+    GoogleCloudAuditLogs,
+    CloudflareR2Audit,
+    MinioAudit,
+    GenericJsonPage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStorageAuditAuthMode {
+    AwsSigV4Session,
+    BearerTokenSession,
+    AccessKeySession,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStorageAuditClientState {
+    Ready,
+    MissingCredentials,
+    PageFetched,
+    RateLimited,
+    RetryScheduled,
+    Degraded,
+    Revoked,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStorageAuditCheckpointState {
+    Empty,
+    CursorHashPresent,
+    EndReached,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStorageAuditCredentialRef {
+    pub session_ref: String,
+    pub auth_mode: ObjectStorageAuditAuthMode,
+    pub expires_at: Option<Timestamp>,
+}
+
+impl ObjectStorageAuditCredentialRef {
+    pub fn new(
+        session_ref: impl Into<String>,
+        auth_mode: ObjectStorageAuditAuthMode,
+        expires_at: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            session_ref: session_ref.into(),
+            auth_mode,
+            expires_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStorageAuditClientConfig {
+    pub provider_kind: ObjectStorageAuditProviderKind,
+    pub endpoint_kind: ObjectStorageAuditEndpointKind,
+    pub region_bucket: Option<String>,
+    pub max_pages_per_tick: u8,
+    pub max_records_per_page: u16,
+    pub timeout_millis: u64,
+    pub rate_limit_per_minute: u16,
+}
+
+impl ObjectStorageAuditClientConfig {
+    pub fn new(
+        provider_kind: ObjectStorageAuditProviderKind,
+        endpoint_kind: ObjectStorageAuditEndpointKind,
+    ) -> Self {
+        Self {
+            provider_kind,
+            endpoint_kind,
+            region_bucket: None,
+            max_pages_per_tick: 1,
+            max_records_per_page: 100,
+            timeout_millis: DEFAULT_OBJECT_STORAGE_AUDIT_TIMEOUT_MILLIS,
+            rate_limit_per_minute: DEFAULT_OBJECT_STORAGE_AUDIT_RATE_LIMIT_PER_MINUTE,
+        }
+    }
+
+    pub fn bounded_max_pages_per_tick(&self) -> u8 {
+        self.max_pages_per_tick
+            .clamp(1, MAX_OBJECT_STORAGE_AUDIT_PAGES_PER_TICK)
+    }
+
+    pub fn bounded_max_records_per_page(&self) -> u16 {
+        self.max_records_per_page
+            .clamp(1, MAX_OBJECT_STORAGE_AUDIT_RECORDS_PER_PAGE)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStorageAuditPageCursor {
+    pub safe_cursor_bucket: String,
+    pub next_page_token_hash: Option<String>,
+    pub checkpoint_state: ObjectStorageAuditCheckpointState,
+    pub updated_at: Timestamp,
+}
+
+impl ObjectStorageAuditPageCursor {
+    pub fn empty(updated_at: Timestamp) -> Self {
+        Self {
+            safe_cursor_bucket: "not_started".to_string(),
+            next_page_token_hash: None,
+            checkpoint_state: ObjectStorageAuditCheckpointState::Empty,
+            updated_at,
+        }
+    }
+
+    pub fn from_safe_checkpoint(
+        safe_cursor_bucket: impl Into<String>,
+        next_page_token_hash: Option<String>,
+        updated_at: Timestamp,
+    ) -> Self {
+        let checkpoint_state = if next_page_token_hash.is_some() {
+            ObjectStorageAuditCheckpointState::CursorHashPresent
+        } else {
+            ObjectStorageAuditCheckpointState::EndReached
+        };
+        Self {
+            safe_cursor_bucket: safe_cursor_bucket.into(),
+            next_page_token_hash,
+            checkpoint_state,
+            updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStorageAuditPollRequest {
+    pub config: ObjectStorageAuditClientConfig,
+    pub credential_ref: Option<ObjectStorageAuditCredentialRef>,
+    pub cursor: ObjectStorageAuditPageCursor,
+}
+
+impl ObjectStorageAuditPollRequest {
+    pub fn new(
+        config: ObjectStorageAuditClientConfig,
+        credential_ref: Option<ObjectStorageAuditCredentialRef>,
+        cursor: ObjectStorageAuditPageCursor,
+    ) -> Self {
+        Self {
+            config,
+            credential_ref,
+            cursor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObjectStorageAuditPollOutcome {
+    pub client_state: ObjectStorageAuditClientState,
+    pub metadata: Vec<PortableSaasCloudMetadata>,
+    pub cursor: ObjectStorageAuditPageCursor,
+    pub requested_page_count: u8,
+    pub accepted_record_count: u16,
+    pub skipped_record_count: u16,
+    pub retry_after_bucket: Option<String>,
+    pub degraded_reasons: Vec<String>,
+}
+
+impl ObjectStorageAuditPollOutcome {
+    pub fn empty(
+        client_state: ObjectStorageAuditClientState,
+        cursor: ObjectStorageAuditPageCursor,
+    ) -> Self {
+        Self {
+            client_state,
+            metadata: Vec::new(),
+            cursor,
+            requested_page_count: 0,
+            accepted_record_count: 0,
+            skipped_record_count: 0,
+            retry_after_bucket: None,
+            degraded_reasons: Vec::new(),
+        }
+    }
+}
+
+pub const MAX_CDN_EDGE_PAGES_PER_TICK: u8 = 8;
+pub const MAX_CDN_EDGE_RECORDS_PER_PAGE: u16 = 512;
+pub const DEFAULT_CDN_EDGE_TIMEOUT_MILLIS: u64 = 10_000;
+pub const DEFAULT_CDN_EDGE_RATE_LIMIT_PER_MINUTE: u16 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnEdgeProviderKind {
+    CloudflareHttp,
+    CloudFront,
+    AzureFrontDoor,
+    Fastly,
+    Akamai,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnEdgeEndpointKind {
+    CloudflareHttpRequests,
+    CloudFrontStandardLogs,
+    AzureFrontDoorAccessLogs,
+    FastlyLogInsights,
+    AkamaiDataStream,
+    GenericJsonPage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnEdgeAuthMode {
+    BearerTokenSession,
+    AwsSigV4Session,
+    SharedKeySession,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnEdgeClientState {
+    Ready,
+    MissingCredentials,
+    PageFetched,
+    RateLimited,
+    RetryScheduled,
+    Degraded,
+    Revoked,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CdnEdgeCheckpointState {
+    Empty,
+    CursorHashPresent,
+    EndReached,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdnEdgeCredentialRef {
+    pub session_ref: String,
+    pub auth_mode: CdnEdgeAuthMode,
+    pub expires_at: Option<Timestamp>,
+}
+
+impl CdnEdgeCredentialRef {
+    pub fn new(
+        session_ref: impl Into<String>,
+        auth_mode: CdnEdgeAuthMode,
+        expires_at: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            session_ref: session_ref.into(),
+            auth_mode,
+            expires_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdnEdgeClientConfig {
+    pub provider_kind: CdnEdgeProviderKind,
+    pub endpoint_kind: CdnEdgeEndpointKind,
+    pub region_bucket: Option<String>,
+    pub dataset_bucket: Option<String>,
+    pub max_pages_per_tick: u8,
+    pub max_records_per_page: u16,
+    pub timeout_millis: u64,
+    pub rate_limit_per_minute: u16,
+}
+
+impl CdnEdgeClientConfig {
+    pub fn new(provider_kind: CdnEdgeProviderKind, endpoint_kind: CdnEdgeEndpointKind) -> Self {
+        Self {
+            provider_kind,
+            endpoint_kind,
+            region_bucket: None,
+            dataset_bucket: None,
+            max_pages_per_tick: 1,
+            max_records_per_page: 100,
+            timeout_millis: DEFAULT_CDN_EDGE_TIMEOUT_MILLIS,
+            rate_limit_per_minute: DEFAULT_CDN_EDGE_RATE_LIMIT_PER_MINUTE,
+        }
+    }
+
+    pub fn bounded_max_pages_per_tick(&self) -> u8 {
+        self.max_pages_per_tick
+            .clamp(1, MAX_CDN_EDGE_PAGES_PER_TICK)
+    }
+
+    pub fn bounded_max_records_per_page(&self) -> u16 {
+        self.max_records_per_page
+            .clamp(1, MAX_CDN_EDGE_RECORDS_PER_PAGE)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdnEdgePageCursor {
+    pub safe_cursor_bucket: String,
+    pub next_page_token_hash: Option<String>,
+    pub checkpoint_state: CdnEdgeCheckpointState,
+    pub updated_at: Timestamp,
+}
+
+impl CdnEdgePageCursor {
+    pub fn empty(updated_at: Timestamp) -> Self {
+        Self {
+            safe_cursor_bucket: "not_started".to_string(),
+            next_page_token_hash: None,
+            checkpoint_state: CdnEdgeCheckpointState::Empty,
+            updated_at,
+        }
+    }
+
+    pub fn from_safe_checkpoint(
+        safe_cursor_bucket: impl Into<String>,
+        next_page_token_hash: Option<String>,
+        updated_at: Timestamp,
+    ) -> Self {
+        let checkpoint_state = if next_page_token_hash.is_some() {
+            CdnEdgeCheckpointState::CursorHashPresent
+        } else {
+            CdnEdgeCheckpointState::EndReached
+        };
+        Self {
+            safe_cursor_bucket: safe_cursor_bucket.into(),
+            next_page_token_hash,
+            checkpoint_state,
+            updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdnEdgePollRequest {
+    pub config: CdnEdgeClientConfig,
+    pub credential_ref: Option<CdnEdgeCredentialRef>,
+    pub cursor: CdnEdgePageCursor,
+}
+
+impl CdnEdgePollRequest {
+    pub fn new(
+        config: CdnEdgeClientConfig,
+        credential_ref: Option<CdnEdgeCredentialRef>,
+        cursor: CdnEdgePageCursor,
+    ) -> Self {
+        Self {
+            config,
+            credential_ref,
+            cursor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CdnEdgePollOutcome {
+    pub client_state: CdnEdgeClientState,
+    pub http_metadata: Vec<HttpMetadata>,
+    pub provider_metadata: Vec<PortableSaasCloudMetadata>,
+    pub cursor: CdnEdgePageCursor,
+    pub requested_page_count: u8,
+    pub accepted_record_count: u16,
+    pub skipped_record_count: u16,
+    pub retry_after_bucket: Option<String>,
+    pub degraded_reasons: Vec<String>,
+}
+
+impl CdnEdgePollOutcome {
+    pub fn empty(client_state: CdnEdgeClientState, cursor: CdnEdgePageCursor) -> Self {
+        Self {
+            client_state,
+            http_metadata: Vec::new(),
+            provider_metadata: Vec::new(),
+            cursor,
+            requested_page_count: 0,
+            accepted_record_count: 0,
+            skipped_record_count: 0,
+            retry_after_bucket: None,
+            degraded_reasons: Vec::new(),
+        }
+    }
+}
+
+pub const MAX_API_GATEWAY_PAGES_PER_TICK: u8 = 8;
+pub const MAX_API_GATEWAY_RECORDS_PER_PAGE: u16 = 512;
+pub const DEFAULT_API_GATEWAY_TIMEOUT_MILLIS: u64 = 10_000;
+pub const DEFAULT_API_GATEWAY_RATE_LIMIT_PER_MINUTE: u16 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiGatewayProviderKind {
+    AwsApiGateway,
+    AzureApim,
+    Kong,
+    Envoy,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiGatewayEndpointKind {
+    AwsCloudWatchLogEvents,
+    AzureApimGatewayLogs,
+    KongAdminApiRequests,
+    EnvoyAdminAccessLogs,
+    GenericJsonPage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiGatewayAuthMode {
+    AwsSigV4Session,
+    BearerTokenSession,
+    ApiKeySession,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiGatewayClientState {
+    Ready,
+    MissingCredentials,
+    PageFetched,
+    RateLimited,
+    RetryScheduled,
+    Degraded,
+    Revoked,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiGatewayCheckpointState {
+    Empty,
+    CursorHashPresent,
+    EndReached,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiGatewayCredentialRef {
+    pub session_ref: String,
+    pub auth_mode: ApiGatewayAuthMode,
+    pub expires_at: Option<Timestamp>,
+}
+
+impl ApiGatewayCredentialRef {
+    pub fn new(
+        session_ref: impl Into<String>,
+        auth_mode: ApiGatewayAuthMode,
+        expires_at: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            session_ref: session_ref.into(),
+            auth_mode,
+            expires_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiGatewayClientConfig {
+    pub provider_kind: ApiGatewayProviderKind,
+    pub endpoint_kind: ApiGatewayEndpointKind,
+    pub region_bucket: Option<String>,
+    pub workspace_bucket: Option<String>,
+    pub max_pages_per_tick: u8,
+    pub max_records_per_page: u16,
+    pub timeout_millis: u64,
+    pub rate_limit_per_minute: u16,
+}
+
+impl ApiGatewayClientConfig {
+    pub fn new(
+        provider_kind: ApiGatewayProviderKind,
+        endpoint_kind: ApiGatewayEndpointKind,
+    ) -> Self {
+        Self {
+            provider_kind,
+            endpoint_kind,
+            region_bucket: None,
+            workspace_bucket: None,
+            max_pages_per_tick: 1,
+            max_records_per_page: 100,
+            timeout_millis: DEFAULT_API_GATEWAY_TIMEOUT_MILLIS,
+            rate_limit_per_minute: DEFAULT_API_GATEWAY_RATE_LIMIT_PER_MINUTE,
+        }
+    }
+
+    pub fn bounded_max_pages_per_tick(&self) -> u8 {
+        self.max_pages_per_tick
+            .clamp(1, MAX_API_GATEWAY_PAGES_PER_TICK)
+    }
+
+    pub fn bounded_max_records_per_page(&self) -> u16 {
+        self.max_records_per_page
+            .clamp(1, MAX_API_GATEWAY_RECORDS_PER_PAGE)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiGatewayPageCursor {
+    pub safe_cursor_bucket: String,
+    pub next_page_token_hash: Option<String>,
+    pub checkpoint_state: ApiGatewayCheckpointState,
+    pub updated_at: Timestamp,
+}
+
+impl ApiGatewayPageCursor {
+    pub fn empty(updated_at: Timestamp) -> Self {
+        Self {
+            safe_cursor_bucket: "not_started".to_string(),
+            next_page_token_hash: None,
+            checkpoint_state: ApiGatewayCheckpointState::Empty,
+            updated_at,
+        }
+    }
+
+    pub fn from_safe_checkpoint(
+        safe_cursor_bucket: impl Into<String>,
+        next_page_token_hash: Option<String>,
+        updated_at: Timestamp,
+    ) -> Self {
+        let checkpoint_state = if next_page_token_hash.is_some() {
+            ApiGatewayCheckpointState::CursorHashPresent
+        } else {
+            ApiGatewayCheckpointState::EndReached
+        };
+        Self {
+            safe_cursor_bucket: safe_cursor_bucket.into(),
+            next_page_token_hash,
+            checkpoint_state,
+            updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiGatewayPollRequest {
+    pub config: ApiGatewayClientConfig,
+    pub credential_ref: Option<ApiGatewayCredentialRef>,
+    pub cursor: ApiGatewayPageCursor,
+}
+
+impl ApiGatewayPollRequest {
+    pub fn new(
+        config: ApiGatewayClientConfig,
+        credential_ref: Option<ApiGatewayCredentialRef>,
+        cursor: ApiGatewayPageCursor,
+    ) -> Self {
+        Self {
+            config,
+            credential_ref,
+            cursor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApiGatewayPollOutcome {
+    pub client_state: ApiGatewayClientState,
+    pub http_metadata: Vec<HttpMetadata>,
+    pub cursor: ApiGatewayPageCursor,
+    pub requested_page_count: u8,
+    pub accepted_record_count: u16,
+    pub skipped_record_count: u16,
+    pub retry_after_bucket: Option<String>,
+    pub degraded_reasons: Vec<String>,
+}
+
+impl ApiGatewayPollOutcome {
+    pub fn empty(client_state: ApiGatewayClientState, cursor: ApiGatewayPageCursor) -> Self {
+        Self {
+            client_state,
+            http_metadata: Vec::new(),
+            cursor,
+            requested_page_count: 0,
+            accepted_record_count: 0,
+            skipped_record_count: 0,
+            retry_after_bucket: None,
+            degraded_reasons: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortableDeceptionProtocolCategory {
@@ -411,6 +1026,107 @@ pub struct PortableDeceptionSummary {
     pub finding_refs: Vec<FindingId>,
     pub evidence_refs: Vec<EvidenceId>,
     pub graph_hint_refs: Vec<GraphHintId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableSdnControllerCategory {
+    OpenFlow,
+    Ovsdb,
+    Onos,
+    OpenDaylight,
+    SdWan,
+    CloudNetworkController,
+    KubernetesCni,
+    GenericController,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableSdnControlPlaneEventCategory {
+    TopologyChange,
+    RouteChange,
+    PolicyChange,
+    AclChange,
+    ControllerHealth,
+    FlowRuleChange,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableSdnImpactScopeBucket {
+    SingleSegment,
+    MultipleSegments,
+    Edge,
+    Datacenter,
+    Global,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableSdnReliabilityBucket {
+    High,
+    Medium,
+    Low,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PortableSdnControlPlaneMetadata {
+    pub sdn_control_plane_metadata_id: SdnControlPlaneMetadataId,
+    pub provenance_id: DataSourceId,
+    pub controller_category: PortableSdnControllerCategory,
+    pub event_category: PortableSdnControlPlaneEventCategory,
+    pub impact_scope_bucket: PortableSdnImpactScopeBucket,
+    pub reliability_bucket: PortableSdnReliabilityBucket,
+    pub policy_action_category: Option<String>,
+    pub route_change_category: Option<String>,
+    pub topology_change_category: Option<String>,
+    pub affected_asset_category: Option<String>,
+    pub exposure_category: Option<String>,
+    pub status_bucket: PortableStatusBucket,
+    pub count_bucket: Option<String>,
+    pub time_bucket_start: Timestamp,
+    pub redaction_status: RedactionStatus,
+    pub missing_visibility_flags: Vec<String>,
+    pub evidence_refs: Vec<EvidenceId>,
+    pub quality_score: QualityScore,
+}
+
+impl PortableSdnControlPlaneMetadata {
+    pub fn new(
+        controller_category: PortableSdnControllerCategory,
+        event_category: PortableSdnControlPlaneEventCategory,
+        time_bucket_start: Timestamp,
+    ) -> Self {
+        Self {
+            sdn_control_plane_metadata_id: SdnControlPlaneMetadataId::new_v4(),
+            provenance_id: DataSourceId::new_v4(),
+            controller_category,
+            event_category,
+            impact_scope_bucket: PortableSdnImpactScopeBucket::Unknown,
+            reliability_bucket: PortableSdnReliabilityBucket::Unknown,
+            policy_action_category: None,
+            route_change_category: None,
+            topology_change_category: None,
+            affected_asset_category: None,
+            exposure_category: None,
+            status_bucket: PortableStatusBucket::Unknown,
+            count_bucket: None,
+            time_bucket_start,
+            redaction_status: RedactionStatus::Redacted,
+            missing_visibility_flags: vec![
+                "metadata_only_visibility".to_string(),
+                "no_packet_content_visibility".to_string(),
+                "no_live_controller_api_visibility".to_string(),
+            ],
+            evidence_refs: Vec::new(),
+            quality_score: QualityScore::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -669,6 +1385,164 @@ impl DnsObservation {
     }
 }
 
+pub const WINDOWS_DNS_SENSING_SCHEMA_VERSION: crate::SchemaVersion =
+    crate::SchemaVersion::new(1, 0, 0);
+pub const MAX_WINDOWS_DNS_BATCH_RECORDS: usize = 128;
+pub const MAX_WINDOWS_DNS_SAFE_REF_LEN: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsQueryTypeCategory {
+    Address,
+    Alias,
+    Mail,
+    Service,
+    Reverse,
+    Text,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsResultCategory {
+    Pending,
+    Success,
+    NameError,
+    Timeout,
+    Refused,
+    ServerFailure,
+    Cancelled,
+    OtherFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsLengthBucket {
+    Short,
+    Medium,
+    Long,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsDepthBucket {
+    Shallow,
+    Moderate,
+    Deep,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsEntropyBucket {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsAnswerCountBucket {
+    Unknown,
+    Zero,
+    One,
+    Few,
+    Many,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsDnsRecurrenceBucket {
+    One,
+    Few,
+    Many,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsDnsObservation {
+    pub schema_version: crate::SchemaVersion,
+    pub observation_ref: String,
+    pub query_ref: String,
+    pub query_type_category: WindowsDnsQueryTypeCategory,
+    pub result_category: WindowsDnsResultCategory,
+    pub query_length_bucket: WindowsDnsLengthBucket,
+    pub subdomain_depth_bucket: WindowsDnsDepthBucket,
+    pub entropy_bucket: WindowsDnsEntropyBucket,
+    pub answer_count_bucket: WindowsDnsAnswerCountBucket,
+    pub recurrence_bucket: WindowsDnsRecurrenceBucket,
+    pub observed_at: Timestamp,
+    pub provenance_refs: Vec<String>,
+    pub redaction_status: RedactionStatus,
+}
+
+impl WindowsDnsObservation {
+    pub fn validate(&self) -> Result<(), NetworkContractError> {
+        if self.schema_version != WINDOWS_DNS_SENSING_SCHEMA_VERSION {
+            return Err(NetworkContractError::UnsupportedSchemaVersion);
+        }
+        validate_windows_dns_safe_ref("observation_ref", &self.observation_ref)?;
+        validate_windows_dns_safe_ref("query_ref", &self.query_ref)?;
+        if self.provenance_refs.len() > 8 {
+            return Err(NetworkContractError::TooManyItems("provenance_refs"));
+        }
+        for reference in &self.provenance_refs {
+            validate_windows_dns_safe_ref("provenance_ref", reference)?;
+        }
+        if self.redaction_status == RedactionStatus::RedactionRequired {
+            return Err(NetworkContractError::RedactionRequired);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsDnsObservationBatch {
+    pub schema_version: crate::SchemaVersion,
+    pub batch_ref: String,
+    pub allowlist_ref: String,
+    pub records: Vec<WindowsDnsObservation>,
+    pub raw_events_observed: u32,
+    pub normalized_events: u32,
+    pub dropped_events: u32,
+    pub overflow_events: u32,
+    pub rate_limited_events: u32,
+    pub schema_rejected_events: u32,
+    pub duplicate_events: u32,
+    pub provenance_refs: Vec<String>,
+    pub generated_at: Timestamp,
+    pub redaction_status: RedactionStatus,
+}
+
+impl WindowsDnsObservationBatch {
+    pub fn validate(&self) -> Result<(), NetworkContractError> {
+        if self.schema_version != WINDOWS_DNS_SENSING_SCHEMA_VERSION {
+            return Err(NetworkContractError::UnsupportedSchemaVersion);
+        }
+        validate_windows_dns_safe_ref("batch_ref", &self.batch_ref)?;
+        validate_windows_dns_safe_ref("allowlist_ref", &self.allowlist_ref)?;
+        if self.records.is_empty() || self.records.len() > MAX_WINDOWS_DNS_BATCH_RECORDS {
+            return Err(NetworkContractError::InvalidLimit("records"));
+        }
+        for record in &self.records {
+            record.validate()?;
+        }
+        if self.normalized_events < self.records.len() as u32 {
+            return Err(NetworkContractError::InvalidLimit("normalized_events"));
+        }
+        if self.provenance_refs.len() > 8 {
+            return Err(NetworkContractError::TooManyItems("provenance_refs"));
+        }
+        for reference in &self.provenance_refs {
+            validate_windows_dns_safe_ref("provenance_ref", reference)?;
+        }
+        if self.redaction_status == RedactionStatus::RedactionRequired {
+            return Err(NetworkContractError::RedactionRequired);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TlsObservation {
     pub tls_observation_id: TlsObservationId,
@@ -811,12 +1685,22 @@ impl HttpMetadata {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkContractError {
     EmptyField(&'static str),
+    UnsafeField(&'static str),
+    TooManyItems(&'static str),
+    InvalidLimit(&'static str),
+    UnsupportedSchemaVersion,
+    RedactionRequired,
 }
 
 impl fmt::Display for NetworkContractError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyField(field) => write!(f, "{field} must not be empty"),
+            Self::UnsafeField(field) => write!(f, "{field} contains unsafe network metadata"),
+            Self::TooManyItems(field) => write!(f, "{field} contains too many items"),
+            Self::InvalidLimit(field) => write!(f, "{field} is outside the bounded limit"),
+            Self::UnsupportedSchemaVersion => write!(f, "network schema version is unsupported"),
+            Self::RedactionRequired => write!(f, "network metadata must be redacted"),
         }
     }
 }
@@ -829,6 +1713,23 @@ fn require_non_empty(field: &'static str, value: String) -> Result<String, Netwo
     }
 
     Ok(value)
+}
+
+fn validate_windows_dns_safe_ref(
+    field: &'static str,
+    value: &str,
+) -> Result<(), NetworkContractError> {
+    if value.is_empty() {
+        return Err(NetworkContractError::EmptyField(field));
+    }
+    if value.len() > MAX_WINDOWS_DNS_SAFE_REF_LEN
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(NetworkContractError::UnsafeField(field));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -850,6 +1751,58 @@ mod tests {
         let error = IpAddress::parse_str("not-an-ip").expect_err("invalid IP rejected");
 
         assert_eq!(error.value(), "not-an-ip");
+    }
+
+    #[test]
+    fn windows_dns_observation_accepts_only_safe_refs_and_categories() {
+        let observation = WindowsDnsObservation {
+            schema_version: WINDOWS_DNS_SENSING_SCHEMA_VERSION,
+            observation_ref: "dns_observation_0001".to_string(),
+            query_ref: "dns_query_0123456789abcdef".to_string(),
+            query_type_category: WindowsDnsQueryTypeCategory::Address,
+            result_category: WindowsDnsResultCategory::Success,
+            query_length_bucket: WindowsDnsLengthBucket::Medium,
+            subdomain_depth_bucket: WindowsDnsDepthBucket::Shallow,
+            entropy_bucket: WindowsDnsEntropyBucket::Low,
+            answer_count_bucket: WindowsDnsAnswerCountBucket::Unknown,
+            recurrence_bucket: WindowsDnsRecurrenceBucket::One,
+            observed_at: Timestamp::now(),
+            provenance_refs: vec!["windows_dns_client_etw".to_string()],
+            redaction_status: RedactionStatus::Redacted,
+        };
+        assert!(observation.validate().is_ok());
+        let serialized = serde_json::to_string(&observation).expect("serialize");
+        assert!(!serialized.contains("query_name"));
+        assert!(!serialized.contains("resolver"));
+        assert!(!serialized.contains("source_ip"));
+        assert!(!serialized.contains("port"));
+        assert!(!serialized.contains("pid"));
+        assert!(!serialized.contains("payload"));
+    }
+
+    #[test]
+    fn windows_dns_observation_rejects_raw_looking_query_ref() {
+        let mut observation = WindowsDnsObservation {
+            schema_version: WINDOWS_DNS_SENSING_SCHEMA_VERSION,
+            observation_ref: "dns_observation_0001".to_string(),
+            query_ref: "raw.example.test".to_string(),
+            query_type_category: WindowsDnsQueryTypeCategory::Address,
+            result_category: WindowsDnsResultCategory::Pending,
+            query_length_bucket: WindowsDnsLengthBucket::Short,
+            subdomain_depth_bucket: WindowsDnsDepthBucket::Shallow,
+            entropy_bucket: WindowsDnsEntropyBucket::Low,
+            answer_count_bucket: WindowsDnsAnswerCountBucket::Unknown,
+            recurrence_bucket: WindowsDnsRecurrenceBucket::One,
+            observed_at: Timestamp::now(),
+            provenance_refs: Vec::new(),
+            redaction_status: RedactionStatus::Redacted,
+        };
+        assert!(matches!(
+            observation.validate(),
+            Err(NetworkContractError::UnsafeField("query_ref"))
+        ));
+        observation.query_ref = "dns_query_safe".to_string();
+        assert!(observation.validate().is_ok());
     }
 
     #[test]
@@ -877,6 +1830,7 @@ mod tests {
                 auth_metadata_records: 0,
                 saas_cloud_metadata_records: 0,
                 deception_event_records: 0,
+                sdn_control_plane_records: 0,
             },
             RedactionStatus::Redacted,
         );
@@ -903,6 +1857,7 @@ mod tests {
                 auth_metadata_records: 0,
                 saas_cloud_metadata_records: 0,
                 deception_event_records: 0,
+                sdn_control_plane_records: 0,
             },
             RedactionStatus::Redacted,
         );
@@ -911,6 +1866,118 @@ mod tests {
 
         assert!(value.contains("imported_web_access_log"));
         assert!(!value.contains("authorization"));
+        assert!(!value.contains("payload"));
+    }
+
+    #[test]
+    fn portable_capture_provenance_supports_dns_resolver_logs() {
+        let provenance = PortableCaptureProvenance::new(
+            PortableCaptureInputSourceType::ImportedDnsResolverLog,
+            PortableCaptureRecordCounts {
+                flow_records: 0,
+                session_records: 0,
+                dns_records: 3,
+                tls_records: 0,
+                http_metadata_records: 0,
+                auth_metadata_records: 0,
+                saas_cloud_metadata_records: 0,
+                deception_event_records: 0,
+                sdn_control_plane_records: 0,
+            },
+            RedactionStatus::Redacted,
+        );
+
+        let value = serde_json::to_string(&provenance).expect("serialize provenance");
+
+        assert!(value.contains("imported_dns_resolver_log"));
+        assert!(value.contains("dns_records"));
+        assert!(!value.contains("query_name"));
+        assert!(!value.contains("client_ip"));
+        assert!(!value.contains("payload"));
+    }
+
+    #[test]
+    fn portable_capture_provenance_supports_api_gateway_logs() {
+        let provenance = PortableCaptureProvenance::new(
+            PortableCaptureInputSourceType::ImportedApiGatewayLog,
+            PortableCaptureRecordCounts {
+                flow_records: 2,
+                session_records: 2,
+                dns_records: 0,
+                tls_records: 0,
+                http_metadata_records: 2,
+                auth_metadata_records: 0,
+                saas_cloud_metadata_records: 0,
+                deception_event_records: 0,
+                sdn_control_plane_records: 0,
+            },
+            RedactionStatus::Redacted,
+        );
+
+        let value = serde_json::to_string(&provenance).expect("serialize provenance");
+
+        assert!(value.contains("imported_api_gateway_log"));
+        assert!(value.contains("http_metadata_records"));
+        assert!(!value.contains("domainName"));
+        assert!(!value.contains("sourceIp"));
+        assert!(!value.contains("requestId"));
+        assert!(!value.contains("payload"));
+    }
+
+    #[test]
+    fn portable_capture_provenance_supports_waf_logs() {
+        let provenance = PortableCaptureProvenance::new(
+            PortableCaptureInputSourceType::ImportedWafLog,
+            PortableCaptureRecordCounts {
+                flow_records: 2,
+                session_records: 2,
+                dns_records: 0,
+                tls_records: 0,
+                http_metadata_records: 2,
+                auth_metadata_records: 0,
+                saas_cloud_metadata_records: 0,
+                deception_event_records: 0,
+                sdn_control_plane_records: 0,
+            },
+            RedactionStatus::Redacted,
+        );
+
+        let value = serde_json::to_string(&provenance).expect("serialize provenance");
+
+        assert!(value.contains("imported_waf_log"));
+        assert!(value.contains("http_metadata_records"));
+        assert!(!value.contains("clientIp"));
+        assert!(!value.contains("requestUri"));
+        assert!(!value.contains("ruleMessage"));
+        assert!(!value.contains("payload"));
+    }
+
+    #[test]
+    fn portable_capture_provenance_supports_cdn_edge_logs() {
+        let provenance = PortableCaptureProvenance::new(
+            PortableCaptureInputSourceType::ImportedCdnEdgeLog,
+            PortableCaptureRecordCounts {
+                flow_records: 3,
+                session_records: 3,
+                dns_records: 0,
+                tls_records: 0,
+                http_metadata_records: 3,
+                auth_metadata_records: 0,
+                saas_cloud_metadata_records: 3,
+                deception_event_records: 0,
+                sdn_control_plane_records: 0,
+            },
+            RedactionStatus::Redacted,
+        );
+
+        let value = serde_json::to_string(&provenance).expect("serialize provenance");
+
+        assert!(value.contains("imported_cdn_edge_log"));
+        assert!(value.contains("http_metadata_records"));
+        assert!(value.contains("saas_cloud_metadata_records"));
+        assert!(!value.contains("ClientIP"));
+        assert!(!value.contains("ClientRequestHost"));
+        assert!(!value.contains("RayID"));
         assert!(!value.contains("payload"));
     }
 
@@ -927,6 +1994,7 @@ mod tests {
                 auth_metadata_records: 4,
                 saas_cloud_metadata_records: 0,
                 deception_event_records: 0,
+                sdn_control_plane_records: 0,
             },
             RedactionStatus::Hashed,
         );
@@ -953,6 +2021,7 @@ mod tests {
                 auth_metadata_records: 0,
                 saas_cloud_metadata_records: 3,
                 deception_event_records: 0,
+                sdn_control_plane_records: 0,
             },
             RedactionStatus::Hashed,
         );
@@ -978,6 +2047,7 @@ mod tests {
                 auth_metadata_records: 0,
                 saas_cloud_metadata_records: 0,
                 deception_event_records: 2,
+                sdn_control_plane_records: 0,
             },
             RedactionStatus::Redacted,
         );
@@ -987,6 +2057,61 @@ mod tests {
         assert!(value.contains("imported_deception_event_log"));
         assert!(value.contains("deception_event_records"));
         assert!(!value.contains("credential"));
+        assert!(!value.contains("payload"));
+    }
+
+    #[test]
+    fn portable_capture_provenance_supports_sdn_control_plane_logs() {
+        let provenance = PortableCaptureProvenance::new(
+            PortableCaptureInputSourceType::ImportedSdnControlPlaneLog,
+            PortableCaptureRecordCounts {
+                flow_records: 0,
+                session_records: 0,
+                dns_records: 0,
+                tls_records: 0,
+                http_metadata_records: 0,
+                auth_metadata_records: 0,
+                saas_cloud_metadata_records: 0,
+                deception_event_records: 0,
+                sdn_control_plane_records: 2,
+            },
+            RedactionStatus::Redacted,
+        );
+
+        let value = serde_json::to_string(&provenance).expect("serialize provenance");
+
+        assert!(value.contains("imported_sdn_control_plane_log"));
+        assert!(value.contains("sdn_control_plane_records"));
+        assert!(!value.contains("controller-prod-a"));
+        assert!(!value.contains("tenant"));
+        assert!(!value.contains("payload"));
+    }
+
+    #[test]
+    fn portable_capture_provenance_supports_object_storage_audit_logs() {
+        let provenance = PortableCaptureProvenance::new(
+            PortableCaptureInputSourceType::ImportedObjectStorageAuditLog,
+            PortableCaptureRecordCounts {
+                flow_records: 0,
+                session_records: 0,
+                dns_records: 0,
+                tls_records: 0,
+                http_metadata_records: 0,
+                auth_metadata_records: 0,
+                saas_cloud_metadata_records: 2,
+                deception_event_records: 0,
+                sdn_control_plane_records: 0,
+            },
+            RedactionStatus::Redacted,
+        );
+
+        let value = serde_json::to_string(&provenance).expect("serialize provenance");
+
+        assert!(value.contains("imported_object_storage_audit_log"));
+        assert!(value.contains("saas_cloud_metadata_records"));
+        assert!(!value.contains("bucket_name"));
+        assert!(!value.contains("object_key"));
+        assert!(!value.contains("principal"));
         assert!(!value.contains("payload"));
     }
 
@@ -1013,6 +2138,144 @@ mod tests {
     }
 
     #[test]
+    fn object_storage_audit_client_contract_serializes_safe_state_only() {
+        let config = ObjectStorageAuditClientConfig::new(
+            ObjectStorageAuditProviderKind::AwsCloudTrail,
+            ObjectStorageAuditEndpointKind::CloudTrailLookupEvents,
+        );
+        let request = ObjectStorageAuditPollRequest::new(
+            config,
+            Some(ObjectStorageAuditCredentialRef::new(
+                "credential_session#current",
+                ObjectStorageAuditAuthMode::AwsSigV4Session,
+                None,
+            )),
+            ObjectStorageAuditPageCursor::from_safe_checkpoint(
+                "continuation_present",
+                Some("sha256#abc123".to_string()),
+                Timestamp::now(),
+            ),
+        );
+        let mut outcome = ObjectStorageAuditPollOutcome::empty(
+            ObjectStorageAuditClientState::PageFetched,
+            request.cursor.clone(),
+        );
+        outcome.accepted_record_count = 1;
+        outcome
+            .degraded_reasons
+            .push("metadata_only_object_storage_audit".to_string());
+
+        let request_value = serde_json::to_string(&request).expect("serialize request");
+        let outcome_value = serde_json::to_string(&outcome).expect("serialize outcome");
+
+        assert!(request_value.contains("aws_cloud_trail"));
+        assert!(request_value.contains("credential_session#current"));
+        assert!(request_value.contains("sha256#abc123"));
+        assert!(outcome_value.contains("metadata_only_object_storage_audit"));
+        for value in [request_value, outcome_value] {
+            assert!(!value.contains("AKIA"));
+            assert!(!value.contains("secret_access_key"));
+            assert!(!value.contains("session_token"));
+            assert!(!value.contains("RAW_NEXT_PAGE_TOKEN"));
+            assert!(!value.contains("private-bucket"));
+            assert!(!value.contains("alice@example.test"));
+            assert!(!value.contains("payload"));
+        }
+    }
+
+    #[test]
+    fn cdn_edge_client_contract_serializes_safe_state_only() {
+        let config = CdnEdgeClientConfig::new(
+            CdnEdgeProviderKind::CloudflareHttp,
+            CdnEdgeEndpointKind::CloudflareHttpRequests,
+        );
+        let request = CdnEdgePollRequest::new(
+            config,
+            Some(CdnEdgeCredentialRef::new(
+                "credential_session#cdn-edge",
+                CdnEdgeAuthMode::BearerTokenSession,
+                None,
+            )),
+            CdnEdgePageCursor::from_safe_checkpoint(
+                "continuation_present",
+                Some("sha256#def456".to_string()),
+                Timestamp::now(),
+            ),
+        );
+        let mut outcome =
+            CdnEdgePollOutcome::empty(CdnEdgeClientState::PageFetched, request.cursor.clone());
+        outcome.accepted_record_count = 1;
+        outcome
+            .degraded_reasons
+            .push("metadata_only_cdn_edge_page".to_string());
+
+        let request_value = serde_json::to_string(&request).expect("serialize request");
+        let outcome_value = serde_json::to_string(&outcome).expect("serialize outcome");
+
+        assert!(request_value.contains("cloudflare_http"));
+        assert!(request_value.contains("credential_session#cdn-edge"));
+        assert!(request_value.contains("sha256#def456"));
+        assert!(outcome_value.contains("metadata_only_cdn_edge_page"));
+        for value in [request_value, outcome_value] {
+            assert!(!value.contains("Bearer"));
+            assert!(!value.contains("authorization"));
+            assert!(!value.contains("secret_access_key"));
+            assert!(!value.contains("RAW_CDN_CURSOR"));
+            assert!(!value.contains("customer.example.test"));
+            assert!(!value.contains("/private/path"));
+            assert!(!value.contains("203.0.113."));
+            assert!(!value.contains("payload"));
+        }
+    }
+
+    #[test]
+    fn api_gateway_client_contract_serializes_safe_state_only() {
+        let config = ApiGatewayClientConfig::new(
+            ApiGatewayProviderKind::AwsApiGateway,
+            ApiGatewayEndpointKind::AwsCloudWatchLogEvents,
+        );
+        let request = ApiGatewayPollRequest::new(
+            config,
+            Some(ApiGatewayCredentialRef::new(
+                "credential_session#api-gateway",
+                ApiGatewayAuthMode::AwsSigV4Session,
+                None,
+            )),
+            ApiGatewayPageCursor::from_safe_checkpoint(
+                "continuation_present",
+                Some("sha256#fed789".to_string()),
+                Timestamp::now(),
+            ),
+        );
+        let mut outcome = ApiGatewayPollOutcome::empty(
+            ApiGatewayClientState::PageFetched,
+            request.cursor.clone(),
+        );
+        outcome.accepted_record_count = 1;
+        outcome
+            .degraded_reasons
+            .push("metadata_only_api_gateway_page".to_string());
+
+        let request_value = serde_json::to_string(&request).expect("serialize request");
+        let outcome_value = serde_json::to_string(&outcome).expect("serialize outcome");
+
+        assert!(request_value.contains("aws_api_gateway"));
+        assert!(request_value.contains("credential_session#api-gateway"));
+        assert!(request_value.contains("sha256#fed789"));
+        assert!(outcome_value.contains("metadata_only_api_gateway_page"));
+        for value in [request_value, outcome_value] {
+            assert!(!value.contains("AKIA"));
+            assert!(!value.contains("secret_access_key"));
+            assert!(!value.contains("x-api-key"));
+            assert!(!value.contains("RAW_API_CURSOR"));
+            assert!(!value.contains("customer.example.test"));
+            assert!(!value.contains("/prod/orders"));
+            assert!(!value.contains("203.0.113."));
+            assert!(!value.contains("payload"));
+        }
+    }
+
+    #[test]
     fn portable_deception_event_metadata_is_bounded_and_redacted() {
         let mut metadata = PortableDeceptionEventMetadata::new(
             "probe",
@@ -1033,5 +2296,30 @@ mod tests {
         assert!(!value.contains("credential"));
         assert!(!value.contains("payload"));
         assert!(!value.contains("source_ip"));
+    }
+
+    #[test]
+    fn portable_sdn_control_plane_metadata_is_bounded_and_redacted() {
+        let mut metadata = PortableSdnControlPlaneMetadata::new(
+            PortableSdnControllerCategory::Onos,
+            PortableSdnControlPlaneEventCategory::PolicyChange,
+            Timestamp::now(),
+        );
+        metadata.impact_scope_bucket = PortableSdnImpactScopeBucket::MultipleSegments;
+        metadata.reliability_bucket = PortableSdnReliabilityBucket::Medium;
+        metadata.policy_action_category = Some("blocked".to_string());
+        metadata.affected_asset_category = Some("cloud_workload".to_string());
+        metadata.exposure_category = Some("reduced_exposure".to_string());
+
+        let value = serde_json::to_string(&metadata).expect("serialize sdn metadata");
+
+        assert!(value.contains("onos"));
+        assert!(value.contains("policy_change"));
+        assert!(value.contains("reduced_exposure"));
+        assert!(!value.contains("controller-prod-a"));
+        assert!(!value.contains("10.0.0."));
+        assert!(!value.contains("acl_text"));
+        assert!(!value.contains("payload"));
+        assert!(!value.contains("tenant"));
     }
 }

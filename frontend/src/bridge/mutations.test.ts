@@ -43,6 +43,15 @@ const NO_REQUEST_MUTATION_CASES = [
   ["get_local_metadata_proxy_status", mutations.getLocalMetadataProxyStatus],
   ["stop_local_metadata_proxy", mutations.stopLocalMetadataProxy],
   ["drain_local_metadata_proxy", mutations.drainLocalMetadataProxy],
+  [
+    "preview_native_scheduler_host_start",
+    mutations.previewNativeSchedulerHostStart,
+  ],
+  ["start_native_scheduler_host", mutations.startNativeSchedulerHost],
+  ["pause_native_scheduler_host", mutations.pauseNativeSchedulerHost],
+  ["resume_native_scheduler_host", mutations.resumeNativeSchedulerHost],
+  ["wake_native_scheduler_host", mutations.wakeNativeSchedulerHost],
+  ["stop_native_scheduler_host", mutations.stopNativeSchedulerHost],
 ] as const;
 const CUSTOM_MUTATION_CASES = [
   [

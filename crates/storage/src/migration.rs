@@ -65,6 +65,7 @@ const FORBIDDEN_STORAGE_TOKENS: &[&str] = &[
     "refresh_token",
     "token_value",
 ];
+const MAX_MIGRATION_STATEMENT_COUNT: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -250,6 +251,16 @@ impl Migration {
             return Err(StorageError::InvalidMigration {
                 migration_key: self.migration_key.clone(),
                 reason: "migration must contain at least one SQL statement".to_string(),
+            });
+        }
+        let statement_count = self
+            .statements
+            .len()
+            .saturating_add(self.fts_rebuild_hooks.len());
+        if statement_count > MAX_MIGRATION_STATEMENT_COUNT {
+            return Err(StorageError::InvalidMigration {
+                migration_key: self.migration_key.clone(),
+                reason: "migration statement count exceeds bounded limit".to_string(),
             });
         }
         if !self.storage_privacy_class.normal_mode_persistence_allowed {
@@ -860,6 +871,33 @@ mod tests {
         );
 
         assert!(migration.is_err());
+    }
+
+    #[test]
+    fn migration_statement_count_is_bounded() {
+        let statements = (0..=MAX_MIGRATION_STATEMENT_COUNT)
+            .map(|index| {
+                MigrationStatement::new(
+                    format!("create_safe_table_{index}"),
+                    format!(
+                        "CREATE TABLE safe_table_{index} (record_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL)"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let migration = Migration::new(
+            "001_too_many_statements",
+            "too many statements",
+            SchemaVersion::new(0, 1, 0),
+            statements,
+            StoragePrivacyClass::operational_metadata(),
+        );
+
+        assert!(matches!(
+            migration,
+            Err(StorageError::InvalidMigration { .. })
+        ));
     }
 
     #[test]

@@ -3,6 +3,10 @@ use crate::authorized_native_permissions::{
     native_visibility_summary,
 };
 use crate::baseline_read_models::build_durable_baseline_summary;
+use crate::endpoint_threat_runtime::{
+    get_endpoint_threat_analysis_summary as build_endpoint_threat_analysis_summary,
+    EndpointThreatAnalysisSummary,
+};
 use crate::evidence_quality::build_evidence_quality_summary;
 use crate::investigation_drill_down::build_investigation_drill_down_summary;
 use crate::machine_local_capabilities::CapabilityStatusSummary;
@@ -43,20 +47,21 @@ use sentinel_contracts::{
     IncidentLinkedHypothesisGroup, IncidentTimelineEntry, IncidentTimelineEntryId,
     InvestigationDrillDownSummary, LlmAlertStoryId, LlmAlertStoryRecord, MetadataSamplingBatchId,
     MetadataSamplingBatchSummary, MetadataWatchControllerStatus, MetadataWatchSourceId,
-    MetadataWatchSourceStatus, MissingEndpointVisibilitySummary, NativePermissionAuditEntry,
-    NativePermissionAuditSummary, NativePermissionStatusSummary, NativeSamplerAuthorizationReview,
-    NativeSamplerBlockedSummary, NativeSamplerContract, NativeSamplerReadinessDetail,
-    NativeSamplerReadinessSummary, NativeSamplerRuntimeAuditEntry, NativeSamplerRuntimeBatch,
-    NativeSamplerRuntimeStatus, NativeSamplerRuntimeSummary, NativeSamplerScheduleStatus,
-    NativeSchedulerAuditEntry, NativeSchedulerControllerState, NativeSchedulerCycleSummary,
-    NativeSchedulerHostAuditEntry, NativeSchedulerHostCycleSummary, NativeSchedulerHostHealthSummary,
-    NativeSchedulerHostStatus, NativeSchedulerOperationalSummary, NativeSchedulerStatus,
-    NativeSchedulerSummary,
-    NativeStatusEvent, NativeVisibilitySummary, NavigationResolution, NavigationResolveRequest,
-    PageRequest, PageResponse, PluginDependencyType, PluginId, PluginManifest,
-    PortableCaptureProvenance, PrivacyClass, QualityBreakdown, QueryRequest, QueryScope,
-    RedactedLabel, Report, ReportId, ResponsePlan, RiskEventId, RuntimeProfile, SchemaVersion,
-    SecurityFact, SecuritySeverity, SessionId, SortDirection, SortSpec,
+    MetadataWatchSourceStatus, MissingEndpointVisibilitySummary, MutationAuthorizationStatus,
+    NativePermissionAuditEntry, NativePermissionAuditSummary, NativePermissionStatusSummary,
+    NativeSamplerAuthorizationReview, NativeSamplerBlockedSummary, NativeSamplerContract,
+    NativeSamplerReadinessDetail, NativeSamplerReadinessSummary, NativeSamplerRuntimeAuditEntry,
+    NativeSamplerRuntimeBatch, NativeSamplerRuntimeStatus, NativeSamplerRuntimeSummary,
+    NativeSamplerScheduleStatus, NativeSchedulerAuditEntry, NativeSchedulerControllerState,
+    NativeSchedulerCycleSummary, NativeSchedulerHostAuditEntry, NativeSchedulerHostCycleSummary,
+    NativeSchedulerHostHealthSummary, NativeSchedulerHostStatus, NativeSchedulerOperationalSummary,
+    NativeSchedulerStatus, NativeSchedulerSummary, NativeStatusEvent, NativeVisibilitySummary,
+    NavigationResolution, NavigationResolveRequest, NetworkFallbackPlan,
+    NetworkProviderControllerStatus, NetworkProviderKind, NetworkProviderStatus,
+    NetworkVisibilitySummary, PageRequest, PageResponse, PluginDependencyType, PluginId,
+    PluginManifest, PortableCaptureProvenance, PrivacyClass, QualityBreakdown, QueryRequest,
+    QueryScope, RedactedLabel, Report, ReportId, ResponsePlan, RiskEventId, RuntimeProfile,
+    SchemaVersion, SecurityFact, SecuritySeverity, SessionId, SortDirection, SortSpec,
     SourceReliabilityExplanation, SourceReliabilitySummary, TimeRange, TimelineDrillDownDetail,
     Timestamp, TlsObservation, TraceId, UiContribution, MAX_ATTACK_COVERAGE_REFS,
 };
@@ -104,6 +109,14 @@ pub struct ReadOnlyCommandState {
     pub(crate) security_facts: LogicalReadCollection<SecurityFact>,
     pub(crate) attack_hypotheses: LogicalReadCollection<AttackHypothesisRecord>,
     pub(crate) fusion_summaries: Vec<FusionSummary>,
+    pub(crate) endpoint_threat_candidates: Vec<sentinel_contracts::EndpointThreatCandidate>,
+    pub(crate) endpoint_threat_findings: Vec<sentinel_contracts::EndpointThreatFinding>,
+    pub(crate) endpoint_threat_evidence: Vec<sentinel_contracts::EndpointThreatEvidence>,
+    pub(crate) endpoint_threat_risk_hints: Vec<sentinel_contracts::EndpointThreatRiskHint>,
+    pub(crate) endpoint_visibility_advisories: Vec<sentinel_contracts::EndpointVisibilityAdvisory>,
+    pub(crate) endpoint_threat_rejected: Vec<sentinel_contracts::EndpointRejectedCandidate>,
+    pub(crate) endpoint_threat_graph_hints: Vec<sentinel_contracts::GraphHint>,
+    pub(crate) endpoint_threat_emitted_topics: Vec<String>,
     pub(crate) metadata_watch_sources: LogicalReadCollection<MetadataWatchSourceStatus>,
     pub(crate) metadata_sampling_batches: LogicalReadCollection<MetadataSamplingBatchSummary>,
     pub(crate) metadata_watch_controller_status: MetadataWatchControllerStatus,
@@ -136,25 +149,34 @@ pub struct ReadOnlyCommandState {
     pub(crate) catalog_production_ready: bool,
 }
 
+pub(crate) struct ReadModelRegistries {
+    pub(crate) component_registry: ComponentRegistry,
+    pub(crate) plugin_registry: PluginRegistry,
+    pub(crate) capability_registry: CapabilityRegistry,
+    pub(crate) contract_registry: ContractRegistry,
+    pub(crate) dependency_registry: DependencyRegistry,
+    pub(crate) runtime_registry: RuntimeRegistry,
+}
+
 impl ReadOnlyCommandState {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bootstrap() -> CommandResult<Self> {
-        let catalog = BuiltInPluginCatalog::static_internal().map_err(|error| {
-            internal_error(
-                "plugin_catalog",
-                "failed to build built-in plugin catalog",
-                json!({ "error_redacted": error.to_string() }),
-            )
-        })?;
-        Self::from_catalog(catalog)
+        crate::runtime_container::RuntimeContainerBuilder::for_test("read-only-command-state")
+            .build_read_state_for_test()
     }
 
-    pub fn from_catalog(catalog: BuiltInPluginCatalog) -> CommandResult<Self> {
-        let mut component_registry = ComponentRegistry::new();
-        let mut plugin_registry = PluginRegistry::new();
-        let mut capability_registry = CapabilityRegistry::new();
-        let mut contract_registry = ContractRegistry::new();
-        let mut dependency_registry = DependencyRegistry::new();
-        let mut runtime_registry = RuntimeRegistry::new();
+    pub(crate) fn from_catalog_with_registries(
+        catalog: BuiltInPluginCatalog,
+        registries: ReadModelRegistries,
+    ) -> CommandResult<Self> {
+        let ReadModelRegistries {
+            mut component_registry,
+            mut plugin_registry,
+            mut capability_registry,
+            mut contract_registry,
+            mut dependency_registry,
+            mut runtime_registry,
+        } = registries;
         let mut health_snapshots = Vec::new();
         let mut metric_samples = Vec::new();
         let catalog_mock_only = catalog.mock_only_catalog();
@@ -255,6 +277,14 @@ impl ReadOnlyCommandState {
             security_facts: LogicalReadCollection::new(StoreKind::Report),
             attack_hypotheses: LogicalReadCollection::new(StoreKind::Report),
             fusion_summaries: Vec::new(),
+            endpoint_threat_candidates: Vec::new(),
+            endpoint_threat_findings: Vec::new(),
+            endpoint_threat_evidence: Vec::new(),
+            endpoint_threat_risk_hints: Vec::new(),
+            endpoint_visibility_advisories: Vec::new(),
+            endpoint_threat_rejected: Vec::new(),
+            endpoint_threat_graph_hints: Vec::new(),
+            endpoint_threat_emitted_topics: Vec::new(),
             metadata_watch_sources: LogicalReadCollection::new(StoreKind::Report),
             metadata_sampling_batches: LogicalReadCollection::new(StoreKind::Report),
             metadata_watch_controller_status: MetadataWatchControllerStatus::empty(),
@@ -544,10 +574,16 @@ pub struct ServiceStatusView {
     pub elevated_service_status: ObservabilityHealthStatus,
     pub ipc_status: ObservabilityHealthStatus,
     pub storage_status: ObservabilityHealthStatus,
+    pub storage_owner_state: String,
+    pub storage_owner_category: String,
+    pub canonical_storage_writer: bool,
+    pub desktop_cache_canonical: bool,
+    pub llm_key_transferred_to_service: bool,
     pub reduced_visibility: bool,
     pub privileged_actions_available: bool,
     pub capture_available: bool,
     pub machine_local_capability_status: Option<CapabilityStatusSummary>,
+    pub mutation_authorization_status: Option<MutationAuthorizationStatus>,
     pub message_redacted: String,
     pub generated_at: Timestamp,
 }
@@ -564,10 +600,16 @@ impl ServiceStatusView {
             elevated_service_status: ObservabilityHealthStatus::Disconnected,
             ipc_status: ObservabilityHealthStatus::Disconnected,
             storage_status: ObservabilityHealthStatus::Unknown,
+            storage_owner_state: "unknown".to_string(),
+            storage_owner_category: "none".to_string(),
+            canonical_storage_writer: false,
+            desktop_cache_canonical: false,
+            llm_key_transferred_to_service: false,
             reduced_visibility: true,
             privileged_actions_available: false,
             capture_available: false,
             machine_local_capability_status: None,
+            mutation_authorization_status: None,
             message_redacted:
                 "Elevated Windows service is not connected; read-only local metadata is available"
                     .to_string(),
@@ -586,10 +628,16 @@ impl ServiceStatusView {
             elevated_service_status: ObservabilityHealthStatus::Healthy,
             ipc_status: ObservabilityHealthStatus::Healthy,
             storage_status,
+            storage_owner_state: "desktop_local".to_string(),
+            storage_owner_category: "desktop_portable".to_string(),
+            canonical_storage_writer: true,
+            desktop_cache_canonical: false,
+            llm_key_transferred_to_service: false,
             reduced_visibility: false,
             privileged_actions_available: false,
             capture_available: false,
             machine_local_capability_status: None,
+            mutation_authorization_status: None,
             message_redacted: message,
             generated_at: Timestamp::now(),
         }
@@ -1061,6 +1109,95 @@ pub fn get_fusion_summary(state: &ReadOnlyCommandState) -> CommandResult<FusionS
     Ok(summary)
 }
 
+pub fn get_endpoint_threat_summary(
+    state: &ReadOnlyCommandState,
+) -> CommandResult<EndpointThreatAnalysisSummary> {
+    build_endpoint_threat_analysis_summary(state)
+}
+
+pub fn get_provider_controller_status(
+    _state: &ReadOnlyCommandState,
+) -> CommandResult<NetworkProviderControllerStatus> {
+    inactive_provider_controller_status()
+}
+
+pub fn list_network_provider_status(
+    state: &ReadOnlyCommandState,
+) -> CommandResult<Vec<NetworkProviderStatus>> {
+    Ok(get_provider_controller_status(state)?.providers)
+}
+
+pub fn get_network_provider_status(
+    state: &ReadOnlyCommandState,
+    provider_id: String,
+) -> CommandResult<NetworkProviderStatus> {
+    let providers = list_network_provider_status(state)?;
+    providers
+        .into_iter()
+        .find(|provider| {
+            provider.provider_id == provider_id || provider.provider_kind.as_str() == provider_id
+        })
+        .ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::InvalidRequest,
+                "network provider status was not found",
+            )
+            .with_severity(ErrorSeverity::Warning)
+            .with_trace_id(TraceId::new_v4())
+            .with_redacted_details(json!({
+                "reason": "provider_status_not_found",
+                "provider_ref": safe_provider_ref(&provider_id)
+            }))
+        })
+}
+
+pub fn get_network_visibility_summary(
+    state: &ReadOnlyCommandState,
+) -> CommandResult<NetworkVisibilitySummary> {
+    Ok(get_provider_controller_status(state)?.visibility_summary)
+}
+
+pub fn get_network_fallback_plan(
+    state: &ReadOnlyCommandState,
+) -> CommandResult<NetworkFallbackPlan> {
+    Ok(get_provider_controller_status(state)?.fallback_plan)
+}
+
+fn inactive_provider_controller_status() -> CommandResult<NetworkProviderControllerStatus> {
+    NetworkProviderControllerStatus::inactive_servicehost("provider-controller-read-model", 1)
+        .map_err(|error| {
+            internal_error(
+                "provider_controller",
+                "provider controller read model failed validation",
+                json!({ "error_redacted": error.to_string() }),
+            )
+        })
+}
+
+fn safe_provider_ref(provider_id: &str) -> String {
+    match provider_id {
+        "portable_metadata" | "network_provider_portable_metadata" => {
+            NetworkProviderKind::PortableMetadata.as_str().to_string()
+        }
+        "ip_helper" | "network_provider_ip_helper" => {
+            NetworkProviderKind::IpHelper.as_str().to_string()
+        }
+        "etw_network" | "network_provider_etw_network" => {
+            NetworkProviderKind::EtwNetwork.as_str().to_string()
+        }
+        "windows_dns" | "network_provider_windows_dns" => {
+            NetworkProviderKind::WindowsDns.as_str().to_string()
+        }
+        "npcap_packet" | "network_provider_npcap_packet" => {
+            NetworkProviderKind::NpcapPacket.as_str().to_string()
+        }
+        "capture_broker" | "network_provider_capture_broker" => {
+            NetworkProviderKind::CaptureBroker.as_str().to_string()
+        }
+        _ => "unknown_provider_ref".to_string(),
+    }
+}
+
 fn append_native_visibility_degradation(
     state: &ReadOnlyCommandState,
     degraded_visibility_context: &mut Vec<String>,
@@ -1207,56 +1344,52 @@ pub fn get_edr_readiness_summary(
 pub fn get_native_sampler_runtime_summary(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<NativeSamplerRuntimeSummary> {
-    NativeSamplerRuntime::from_read_state(state).summary(state)
+    NativeSamplerRuntime::summary_from_read_state(state)
 }
 
 pub fn get_native_sampler_runtime_status(
     state: &ReadOnlyCommandState,
     sampler_id: String,
 ) -> CommandResult<NativeSamplerRuntimeStatus> {
-    NativeSamplerRuntime::from_read_state(state).status_for_detail(state, &sampler_id)
+    NativeSamplerRuntime::status_from_read_state(state, &sampler_id)
 }
 
 pub fn get_latest_native_sampler_runtime_batch(
     state: &ReadOnlyCommandState,
     sampler_id: String,
 ) -> CommandResult<Option<NativeSamplerRuntimeBatch>> {
-    NativeSamplerRuntime::from_read_state(state).latest_batch(&sampler_id)
+    NativeSamplerRuntime::latest_batch_from_read_state(state, &sampler_id)
 }
 
 pub fn get_native_scheduler_status(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<NativeSchedulerStatus> {
-    Ok(NativeSchedulerController::from_read_state(state)
-        .summary(state)?
-        .status)
+    Ok(NativeSchedulerController::summary_from_read_state(state)?.status)
 }
 
 pub fn list_native_sampler_schedule_statuses(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<Vec<NativeSamplerScheduleStatus>> {
-    Ok(NativeSchedulerController::from_read_state(state)
-        .summary(state)?
-        .schedules)
+    Ok(NativeSchedulerController::summary_from_read_state(state)?.schedules)
 }
 
 pub fn get_native_sampler_schedule_status(
     state: &ReadOnlyCommandState,
     sampler_id: String,
 ) -> CommandResult<NativeSamplerScheduleStatus> {
-    NativeSchedulerController::from_read_state(state).schedule_status(state, &sampler_id)
+    NativeSchedulerController::schedule_status_from_read_state(state, &sampler_id)
 }
 
 pub fn get_native_scheduler_summary(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<NativeSchedulerSummary> {
-    NativeSchedulerController::from_read_state(state).summary(state)
+    NativeSchedulerController::summary_from_read_state(state)
 }
 
 pub fn get_native_scheduler_operational_summary(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<NativeSchedulerOperationalSummary> {
-    NativeSchedulerController::from_read_state(state).operational_summary(state)
+    NativeSchedulerController::operational_summary_from_read_state(state)
 }
 
 pub fn list_native_scheduler_cycles(
@@ -1274,13 +1407,13 @@ pub fn get_latest_native_scheduler_cycle(
 pub fn get_native_scheduler_host_status(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<NativeSchedulerHostStatus> {
-    NativeSchedulerHostController::from_read_state(state).status(state)
+    NativeSchedulerHostController::status_from_read_state(state)
 }
 
 pub fn get_native_scheduler_host_health(
     state: &ReadOnlyCommandState,
 ) -> CommandResult<NativeSchedulerHostHealthSummary> {
-    NativeSchedulerHostController::from_read_state(state).health(state)
+    NativeSchedulerHostController::health_from_read_state(state)
 }
 
 pub fn list_native_scheduler_host_cycles(
@@ -1831,17 +1964,16 @@ pub fn get_service_status(state: &ReadOnlyCommandState) -> CommandResult<Service
         state.service_status.machine_local_capability_status.clone();
     match ElevatedServiceIpcClient::default().status() {
         Ok(status) if status.service_status == "running" => {
+            let mutation_authorization_status = status.mutation_authorization_status.clone();
             let mut status = ServiceStatusView::connected_stub(
                 storage_status,
-                format!(
-                    "Elevated service IPC connected; service pid {} is running in STUB_ONLY adapter mode",
-                    status.pid
-                ),
+                "Elevated service IPC connected in read-only adapter mode".to_string(),
             )
             .with_profile_mode(profile_mode)
             .with_active_session_id(active_session_id)
             .with_capture_available(capture_available);
             status.machine_local_capability_status = machine_local_capability_status;
+            status.mutation_authorization_status = mutation_authorization_status;
             Ok(status)
         }
         Ok(status) => {
@@ -1859,6 +1991,7 @@ pub fn get_service_status(state: &ReadOnlyCommandState) -> CommandResult<Service
             degraded.active_session_id = active_session_id;
             degraded.capture_available = capture_available;
             degraded.machine_local_capability_status = machine_local_capability_status;
+            degraded.mutation_authorization_status = status.mutation_authorization_status;
             Ok(degraded)
         }
         Err(error) => {
@@ -5309,7 +5442,7 @@ mod tests {
         let state = ReadOnlyCommandState::bootstrap().expect("bootstrap read commands");
 
         let catalog = get_plugin_catalog(&state).expect("plugin catalog");
-        assert_eq!(catalog.plugins.len(), 27);
+        assert_eq!(catalog.plugins.len(), 30);
         assert!(!catalog.production_ready);
         assert!(!catalog.mock_only);
         assert!(catalog
@@ -5323,6 +5456,14 @@ mod tests {
         assert!(catalog
             .plugins
             .iter()
+            .any(|plugin| plugin.plugin_name == "C2 Detection"));
+        assert!(catalog
+            .plugins
+            .iter()
+            .any(|plugin| plugin.plugin_name == "Native Network Fact Runtime"));
+        assert!(catalog
+            .plugins
+            .iter()
             .any(|plugin| plugin.plugin_name == "Lateral Movement Lite"));
         assert!(catalog
             .plugins
@@ -5332,6 +5473,10 @@ mod tests {
             .plugins
             .iter()
             .any(|plugin| plugin.plugin_name == "Native Sampler Fact Runtime"));
+        assert!(catalog
+            .plugins
+            .iter()
+            .any(|plugin| plugin.plugin_name == "Endpoint Threat Analysis Lite"));
         assert!(catalog.plugins.iter().all(|plugin| plugin
             .capability_tags
             .iter()
@@ -5642,10 +5787,14 @@ mod tests {
             .expect("serialize fusion summary")
             .to_ascii_lowercase();
 
-        assert_eq!(summary.sampler_health.len(), 11);
+        assert_eq!(summary.sampler_health.len(), 12);
         assert_eq!(summary.fact_count, 0);
         assert_eq!(summary.hypothesis_count, 0);
         assert!(!summary.automatic_llm_calls);
+        assert!(summary.sampler_health.iter().any(|sampler| {
+            sampler.layer == sentinel_contracts::SecurityLayer::SdnControlPlane
+                && sampler.portable_default_available
+        }));
         assert!(summary.sampler_health.iter().any(|sampler| {
             sampler.layer == sentinel_contracts::SecurityLayer::SdnPlaceholder
                 && !sampler.portable_default_available
@@ -6555,6 +6704,144 @@ mod tests {
         assert!(list_export_policy_violations(&state)
             .expect("violations")
             .is_empty());
+    }
+
+    #[test]
+    fn read_commands_report_export_reads_are_ref_only_and_side_effect_free() {
+        let state = sample_state();
+        let report_id = state.reports.items[0].report_id.clone();
+        let report_count = state.reports.items.len();
+        let finding_count = state.findings.items.len();
+        let export_count = state.export_history.records().len();
+        let llm_story_count = state.llm_alert_stories.items.len();
+
+        let reports = list_reports(&state, PageRequest::default()).expect("reports");
+        let report = get_report(&state, report_id).expect("report detail");
+        let exports = list_export_history(&state, ReportExportHistoryQuery::default())
+            .expect("export history");
+        let stories = list_llm_alert_stories(&state, PageRequest::default()).expect("stories");
+
+        assert_eq!(reports.items.len(), report_count);
+        assert_eq!(report.finding_refs.len(), 0);
+        assert_eq!(exports.items.len(), export_count);
+        assert_eq!(stories.items.len(), llm_story_count);
+        assert_eq!(state.reports.items.len(), report_count);
+        assert_eq!(state.findings.items.len(), finding_count);
+        assert_eq!(state.export_history.records().len(), export_count);
+        assert_eq!(state.llm_alert_stories.items.len(), llm_story_count);
+        let serialized =
+            serde_json::to_string(&(reports, report, exports, stories)).expect("read json");
+        for marker in [
+            "provider_value",
+            "automatic_llm_calls\":true",
+            "response_execution\":true",
+            "raw_log",
+            "api_key_value",
+            "c:\\",
+        ] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(marker),
+                "read command output leaked marker {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_controller_reads_are_inactive_side_effect_free_and_safe() {
+        let state = ReadOnlyCommandState::bootstrap().expect("bootstrap read commands");
+        let finding_count = state.findings.items.len();
+        let fact_count = state.security_facts.items.len();
+
+        let controller =
+            get_provider_controller_status(&state).expect("provider controller status");
+        let providers = list_network_provider_status(&state).expect("provider list");
+        let ip_helper =
+            get_network_provider_status(&state, "ip_helper".to_string()).expect("ip helper");
+        let visibility = get_network_visibility_summary(&state).expect("visibility summary");
+        let fallback = get_network_fallback_plan(&state).expect("fallback plan");
+
+        assert_eq!(
+            controller.controller_state,
+            sentinel_contracts::NetworkProviderControllerState::Inactive
+        );
+        assert_eq!(
+            controller.selected_mode,
+            sentinel_contracts::NetworkProviderControllerMode::PortableOnly
+        );
+        assert_eq!(providers.len(), 11);
+        assert!(providers.iter().any(|provider| {
+            provider.provider_kind == sentinel_contracts::NetworkProviderKind::WindowsRdpOperational
+                && provider.implementation_state
+                    == sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        }));
+        assert!(providers.iter().any(|provider| {
+            provider.provider_kind == sentinel_contracts::NetworkProviderKind::WindowsSmbOperational
+                && provider.implementation_state
+                    == sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        }));
+        assert!(providers.iter().any(|provider| {
+            provider.provider_kind == sentinel_contracts::NetworkProviderKind::WindowsSshOperational
+                && provider.implementation_state
+                    == sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        }));
+        assert_eq!(
+            ip_helper.implementation_state,
+            sentinel_contracts::NetworkProviderImplementationState::ImplementedInactive
+        );
+        assert!(visibility.dimensions.iter().any(|dimension| {
+            dimension.dimension
+                == sentinel_contracts::NetworkVisibilityDimension::PortableMetadataVisibility
+                && dimension.visibility_state
+                    == sentinel_contracts::NetworkVisibilityState::Available
+        }));
+        assert!(fallback
+            .selection_order
+            .contains(&sentinel_contracts::NetworkProviderKind::PortableMetadata));
+        assert!(controller.policy_summary.provider_activation_allowed);
+        assert!(
+            controller
+                .policy_summary
+                .ip_helper_execution_available_over_production_ipc
+        );
+        assert!(
+            !controller
+                .policy_summary
+                .provider_readiness_creates_evidence
+        );
+        assert!(
+            !controller
+                .policy_summary
+                .provider_availability_creates_findings
+        );
+        assert!(controller.provider_zero.all_zero());
+        assert_eq!(state.findings.items.len(), finding_count);
+        assert_eq!(state.security_facts.items.len(), fact_count);
+
+        let serialized =
+            serde_json::to_string(&(controller, providers, ip_helper, visibility, fallback))
+                .expect("provider json");
+        for marker in [
+            "process_name",
+            "pid",
+            "ppid",
+            "interface_name",
+            "device_identifier",
+            "packet_data",
+            "provider_handle",
+            "npcap_handle",
+            "etw_raw_event",
+            "credential",
+            "secret",
+            "token",
+            "api_key",
+            "http://",
+            "https://",
+        ] {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(marker),
+                "provider read leaked marker {marker}"
+            );
+        }
     }
 
     #[test]

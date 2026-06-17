@@ -1,9 +1,11 @@
 use crate::network_observations::{
     HttpMetadataExtractor, HttpMetadataInput, NetworkObservationError,
 };
+#[cfg(test)]
+use crate::portable_capture_lite::PortableCaptureLiteRunResult;
 use crate::portable_capture_lite::{
-    build_portable_capture_prepared_batch, run_portable_capture_lite, ParsedPortableCaptureInput,
-    PortableCaptureLiteError, PortableCaptureLiteRunResult,
+    build_portable_capture_prepared_batch, ParsedPortableCaptureInput, PortableCaptureLiteError,
+    PortableCaptureLitePreparedBatch,
 };
 use chrono::Duration as ChronoDuration;
 #[cfg(test)]
@@ -91,7 +93,7 @@ impl std::error::Error for LocalProxyMetadataProviderError {}
 #[derive(Debug)]
 pub struct LocalProxyMetadataProvider {
     runtime: Option<LocalProxyMetadataProviderRuntime>,
-    stopped_runs: Vec<PortableCaptureLiteRunResult>,
+    stopped_batches: Vec<PortableCaptureLitePreparedBatch>,
     last_status: LocalProxyMetadataProviderStatus,
 }
 
@@ -99,7 +101,7 @@ impl Default for LocalProxyMetadataProvider {
     fn default() -> Self {
         Self {
             runtime: None,
-            stopped_runs: Vec::new(),
+            stopped_batches: Vec::new(),
             last_status: stopped_status(None, LocalProxyMetadataProviderStats::default()),
         }
     }
@@ -133,7 +135,7 @@ impl LocalProxyMetadataProvider {
             .map_err(|_| LocalProxyMetadataProviderError::BindFailed)?
             .port();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let carryover_stats = if self.stopped_runs.is_empty() {
+        let carryover_stats = if self.stopped_batches.is_empty() {
             LocalProxyMetadataProviderStats {
                 drained_event_count: self.last_status.drained_event_count,
                 ..LocalProxyMetadataProviderStats::default()
@@ -143,7 +145,7 @@ impl LocalProxyMetadataProvider {
                 requests_captured: self.last_status.requests_captured,
                 requests_rejected: self.last_status.requests_rejected,
                 dropped_batches: self.last_status.dropped_batches,
-                pending_batches: self.stopped_runs.len(),
+                pending_batches: self.stopped_batches.len(),
                 pending_event_count: self.last_status.pending_event_count,
                 drained_event_count: self.last_status.drained_event_count,
                 last_capture_at: self.last_status.last_capture_at.clone(),
@@ -152,7 +154,7 @@ impl LocalProxyMetadataProvider {
         };
         let stats = Arc::new(Mutex::new(carryover_stats));
         let (completed_tx, completed_rx) =
-            mpsc::sync_channel::<PortableCaptureLiteRunResult>(queue_capacity);
+            mpsc::sync_channel::<PortableCaptureLitePreparedBatch>(queue_capacity);
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_stats = Arc::clone(&stats);
         let worker = thread::spawn(move || {
@@ -184,8 +186,8 @@ impl LocalProxyMetadataProvider {
         status
     }
 
-    pub fn drain_completed_runs(&mut self) -> Vec<PortableCaptureLiteRunResult> {
-        let mut drained = std::mem::take(&mut self.stopped_runs);
+    pub fn drain_completed_batches(&mut self) -> Vec<PortableCaptureLitePreparedBatch> {
+        let mut drained = std::mem::take(&mut self.stopped_batches);
         let Some(runtime) = &mut self.runtime else {
             finish_stopped_drain(&mut self.last_status, &drained);
             return drained;
@@ -206,8 +208,19 @@ impl LocalProxyMetadataProvider {
         drained
     }
 
-    pub fn take_completed_runs(&mut self) -> Vec<PortableCaptureLiteRunResult> {
-        self.drain_completed_runs()
+    pub fn take_completed_batches(&mut self) -> Vec<PortableCaptureLitePreparedBatch> {
+        self.drain_completed_batches()
+    }
+
+    #[cfg(test)]
+    pub fn drain_completed_runs(&mut self) -> Vec<PortableCaptureLiteRunResult> {
+        self.drain_completed_batches()
+            .into_iter()
+            .map(|batch| {
+                crate::runtime_test_support::run_portable_capture_lite_for_test(&batch, &[])
+                    .expect("test-owned portable capture runtime")
+            })
+            .collect()
     }
 
     pub fn stop(
@@ -227,12 +240,12 @@ impl LocalProxyMetadataProvider {
         }
         let drained_after_stop = runtime.completed_rx.try_iter().collect::<Vec<_>>();
         if !drained_after_stop.is_empty() {
-            self.stopped_runs.extend(drained_after_stop);
+            self.stopped_batches.extend(drained_after_stop);
         }
         self.last_status = stopped_status(
             Some(listen_port),
             LocalProxyMetadataProviderStats {
-                pending_batches: self.stopped_runs.len(),
+                pending_batches: self.stopped_batches.len(),
                 ..snapshot
             },
         );
@@ -251,12 +264,12 @@ struct LocalProxyMetadataProviderRuntime {
     listen_port: u16,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<LocalProxyMetadataProviderStats>>,
-    completed_rx: Receiver<PortableCaptureLiteRunResult>,
+    completed_rx: Receiver<PortableCaptureLitePreparedBatch>,
     worker: JoinHandle<()>,
 }
 
 impl LocalProxyMetadataProviderRuntime {
-    fn finish_drained_runs(&self, drained: &[PortableCaptureLiteRunResult]) {
+    fn finish_drained_runs(&self, drained: &[PortableCaptureLitePreparedBatch]) {
         if drained.is_empty() {
             return;
         }
@@ -338,7 +351,7 @@ fn run_local_proxy_listener(
     listener: TcpListener,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<LocalProxyMetadataProviderStats>>,
-    completed_tx: SyncSender<PortableCaptureLiteRunResult>,
+    completed_tx: SyncSender<PortableCaptureLitePreparedBatch>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -360,7 +373,7 @@ fn handle_local_proxy_connection(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     stats: &Arc<Mutex<LocalProxyMetadataProviderStats>>,
-    completed_tx: &SyncSender<PortableCaptureLiteRunResult>,
+    completed_tx: &SyncSender<PortableCaptureLitePreparedBatch>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(STREAM_TIMEOUT_MILLIS)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(STREAM_TIMEOUT_MILLIS)));
@@ -377,12 +390,8 @@ fn handle_local_proxy_connection(
     };
 
     let duration_millis = cap_duration_millis(started.elapsed());
-    let run_result = match build_and_run_proxy_metadata(
-        peer_addr,
-        &parsed,
-        started_at,
-        duration_millis,
-    ) {
+    let prepared_batch = match build_proxy_metadata(peer_addr, &parsed, started_at, duration_millis)
+    {
         Ok(result) => result,
         Err(_) => {
             record_rejection(stats, LocalProxyConnectionError::MetadataPipelineFailed);
@@ -391,8 +400,8 @@ fn handle_local_proxy_connection(
         }
     };
 
-    let queued_event_count = proxy_event_count(&run_result);
-    match completed_tx.try_send(run_result) {
+    let queued_event_count = proxy_event_count(&prepared_batch);
+    match completed_tx.try_send(prepared_batch) {
         Ok(()) => {
             record_capture(stats, queued_event_count);
             let _ = write_response(stream, success_response(&parsed.method));
@@ -511,12 +520,12 @@ fn parse_proxy_request(header: &[u8]) -> Result<ParsedProxyRequest, LocalProxyCo
     })
 }
 
-fn build_and_run_proxy_metadata(
+fn build_proxy_metadata(
     peer_addr: SocketAddr,
     parsed: &ParsedProxyRequest,
     started_at: Timestamp,
     duration_millis: u64,
-) -> Result<PortableCaptureLiteRunResult, LocalProxyConnectionError> {
+) -> Result<PortableCaptureLitePreparedBatch, LocalProxyConnectionError> {
     let src_ip = IpAddress::from(peer_addr.ip());
     let dst_ip = destination_ip_for_host(&parsed.host);
     let ended_at = Timestamp::from_datetime(
@@ -588,7 +597,7 @@ fn build_and_run_proxy_metadata(
         .map_err(map_network_observation_error)?
         .ok_or(LocalProxyConnectionError::MetadataPipelineFailed)?;
 
-    let prepared = build_portable_capture_prepared_batch(
+    build_portable_capture_prepared_batch(
         PortableCaptureInputSourceType::LocalProxyMetadata,
         ParsedPortableCaptureInput {
             flow_records: vec![flow],
@@ -599,6 +608,7 @@ fn build_and_run_proxy_metadata(
             auth_metadata: Vec::new(),
             saas_cloud_metadata: Vec::new(),
             deception_events: Vec::new(),
+            sdn_control_plane_metadata: Vec::new(),
             redaction_status: if parsed.redaction_applied || host_redaction || path_redaction {
                 RedactionStatus::Redacted
             } else {
@@ -606,9 +616,7 @@ fn build_and_run_proxy_metadata(
             },
         },
     )
-    .map_err(map_portable_capture_error)?;
-
-    run_portable_capture_lite(&prepared).map_err(map_portable_capture_error)
+    .map_err(map_portable_capture_error)
 }
 
 fn find_header_terminator(buffer: &[u8]) -> Option<usize> {
@@ -677,7 +685,7 @@ fn record_drop(stats: &Arc<Mutex<LocalProxyMetadataProviderStats>>) {
 
 fn finish_stopped_drain(
     status: &mut LocalProxyMetadataProviderStatus,
-    drained: &[PortableCaptureLiteRunResult],
+    drained: &[PortableCaptureLitePreparedBatch],
 ) {
     if drained.is_empty() {
         return;
@@ -769,19 +777,15 @@ fn stopped_message(pending_event_count: u64) -> String {
     }
 }
 
-fn proxy_event_count(run_result: &PortableCaptureLiteRunResult) -> u64 {
-    (run_result.flow_records.len()
-        + run_result.session_records.len()
-        + run_result.dns_observations.len()
-        + run_result.tls_observations.len()
-        + run_result.http_metadata.len()
-        + run_result.service_capability_contexts.len()
-        + run_result.findings.len()
-        + run_result.evidence.len()
-        + run_result.graph_hints.len()
-        + run_result.risk_events.len()
-        + run_result.alerts.len()
-        + run_result.incidents.len()) as u64
+fn proxy_event_count(batch: &PortableCaptureLitePreparedBatch) -> u64 {
+    (batch.flow_records.len()
+        + batch.session_records.len()
+        + batch.dns_observations.len()
+        + batch.tls_observations.len()
+        + batch.http_metadata.len()
+        + batch.auth_metadata.len()
+        + batch.saas_cloud_metadata.len()
+        + batch.deception_events.len()) as u64
 }
 
 #[derive(Clone, Debug)]

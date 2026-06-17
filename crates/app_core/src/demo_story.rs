@@ -3,37 +3,29 @@
 //! The runner builds a deterministic local read model from fixture metadata.
 //! It never captures packets, persists payloads, or executes response actions.
 
-use crate::mutation_commands::static_response_planning_output;
+use crate::mutation_commands::fixture_response_planning_output;
 use crate::read_commands::ReadOnlyCommandState;
 use chrono::{DateTime, Duration, Utc};
 use sentinel_capabilities::{
-    register_static_risk_alerting_plugin, ExportDestinationMetadata, ExportFileHash,
-    ExportHistoryRecord, ExportHistoryStorageAdapter, ExportHistoryStore, ResponsePlanningInput,
-    ALERT_CANDIDATE_CONTRACT, INCIDENT_CANDIDATE_CONTRACT,
+    ExportDestinationMetadata, ExportFileHash, ExportHistoryRecord, ExportHistoryStorageAdapter,
+    ExportHistoryStore, ResponsePlanningInput, RiskBasedAlertingInput, RiskBasedAlertingPlugin,
 };
 use sentinel_contracts::report::ExportFormat;
 use sentinel_contracts::{
-    Alert, AlertCandidate, AlertState, ApprovalState, AttackMapping, AuditRef, CanonicalGraphEdge,
-    CanonicalGraphNode, CommandResult, ContractDescriptor, CoreError, CorrelationId, DnsAnswer,
-    DnsFeatures, DnsObservation, EntityId, EntityRef, EntityType, ErrorCode, ErrorSeverity,
-    EventEnvelope, EventType, EvidenceBundle, EvidenceId, EvidenceItem, Finding,
-    FindingExplanation, FindingId, FindingState, FlowRecord, GraphBadge, GraphBadgeTone,
-    GraphDetailRef, GraphEdgeId, GraphEdgeStyleHint, GraphEdgeType, GraphEdgeViewModel,
-    GraphLegend, GraphLegendItem, GraphNodeId, GraphNodeStatus, GraphNodeType, GraphNodeViewModel,
-    GraphPath, GraphPathId, GraphPathSummary, GraphPathType, GraphPositionHint,
-    GraphRedactionSummary, GraphScope, GraphType, GraphViewModel, Incident, IncidentCandidate,
-    IncidentState, IntelligenceRecordId, IpAddress, MappingProvenance, NetworkDirection, PluginId,
-    PluginManifest, PrivacyClass, ProcessContext, ProcessContextId, QualityScore,
-    RedactedDataCategory, RedactedLabel, RedactionStatus, RedactionSummary, Report, ReportSection,
-    ReportSectionType, ReportType, ResponseActionId, ResponsePlan, ResponsePlanSource,
-    ResponsePolicy, ResponseResult, RiskEvent, RiskHint, RiskReason, SchemaVersion,
-    SecuritySeverity, Timestamp, TlsObservation, TraceContext, TraceId, TransportProtocol,
-};
-use sentinel_platform::{
-    CheckpointSupport, ContractRegistry, PermissionResolver, PluginContext, PluginEventBatch,
-    PluginRuntime, ReplaySupport, TopicName, GRAPH_PATH, IDENTITY_PROCESS_CONTEXT, REPORT_EXPORTED,
-    REPORT_GENERATED, RESPONSE_PLAN, RESPONSE_RESULT, RESPONSE_ROLLBACK_RESULT, SECURITY_ALERT,
-    SECURITY_EVIDENCE, SECURITY_FINDING, SECURITY_INCIDENT, SECURITY_RISK,
+    Alert, AlertState, ApprovalState, AttackMapping, AuditRef, CanonicalGraphEdge,
+    CanonicalGraphNode, CommandResult, CoreError, CorrelationId, DnsAnswer, DnsFeatures,
+    DnsObservation, EntityId, EntityRef, EntityType, ErrorCode, ErrorSeverity, EvidenceBundle,
+    EvidenceId, EvidenceItem, Finding, FindingExplanation, FindingId, FindingState, FlowRecord,
+    GraphBadge, GraphBadgeTone, GraphDetailRef, GraphEdgeId, GraphEdgeStyleHint, GraphEdgeType,
+    GraphEdgeViewModel, GraphLegend, GraphLegendItem, GraphNodeId, GraphNodeStatus, GraphNodeType,
+    GraphNodeViewModel, GraphPath, GraphPathId, GraphPathSummary, GraphPathType, GraphPositionHint,
+    GraphRedactionSummary, GraphScope, GraphType, GraphViewModel, Incident, IncidentState,
+    IntelligenceRecordId, IpAddress, MappingProvenance, NetworkDirection, PluginId, PrivacyClass,
+    ProcessContext, ProcessContextId, QualityScore, RedactedDataCategory, RedactedLabel,
+    RedactionStatus, RedactionSummary, Report, ReportSection, ReportSectionType, ReportType,
+    ResponseActionId, ResponsePlan, ResponsePlanSource, ResponsePolicy, ResponseResult, RiskEvent,
+    RiskHint, RiskReason, SchemaVersion, SecuritySeverity, Timestamp, TlsObservation, TraceId,
+    TransportProtocol,
 };
 use sentinel_storage::{
     GraphStore, LogicalRecord, LogicalStore, ResponseStore, SqliteStoreFactory, StoreKind,
@@ -48,8 +40,7 @@ const FIXTURE_ATTACK_STORY_JSON: &str =
     include_str!("../../../fixtures/mock/fixture_attack_story.json");
 const STORY_START_RFC3339: &str = "2026-06-03T00:00:00Z";
 const DEMO_STORY_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
-const SECURITY_RISK_HINT: &str = "security.risk_hint";
-const RISK_RUNTIME_PROVENANCE: &str = "risk.runtime.static_internal.process_batch";
+const RISK_RUNTIME_PROVENANCE: &str = "risk.fixture.pure_capability.process";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixtureAttackStory {
@@ -1170,7 +1161,7 @@ fn build_read_model(story: &FixtureAttackStory) -> CommandResult<DemoStoryReadMo
     let graph_paths = graph_paths(&ids)?;
     incident = attach_graph_path_to_runtime_incident(incident, ids.graph_path.clone())?;
 
-    let response_plan = response_plan_from_static_runtime(
+    let response_plan = response_plan_from_fixture_capability(
         140,
         incident.id().clone(),
         producer_plugin.clone(),
@@ -1634,136 +1625,25 @@ struct RiskAlertIncidentRuntimeOutput {
 
 fn risk_alert_incident_from_static_runtime(
     producer_plugin: PluginId,
-    process_context: &ProcessContext,
-    evidence_items: &[EvidenceItem],
+    _process_context: &ProcessContext,
+    _evidence_items: &[EvidenceItem],
     findings: &[Finding],
     risk_hints: &[RiskHint],
     trace_id: &TraceId,
     correlation_id: &CorrelationId,
 ) -> CommandResult<RiskAlertIncidentRuntimeOutput> {
-    let mut runtime = PluginRuntime::new();
-    let plugin_id = register_static_risk_alerting_plugin(&mut runtime)
+    let mut input = RiskBasedAlertingInput::new(producer_plugin);
+    input.findings = findings.to_vec();
+    input.risk_hints = risk_hints.to_vec();
+    input.labels = vec!["DEMO_ONLY pure risk fixture".to_string()];
+    let output = RiskBasedAlertingPlugin::new()
+        .process(input)
         .map_err(|error| risk_runtime_error(error, trace_id))?;
-    let manifest = runtime
-        .manifest(&plugin_id)
-        .ok_or_else(|| {
-            risk_runtime_error("static risk alerting manifest was not registered", trace_id)
-        })?
-        .clone();
-    let contracts = demo_contract_registry_for_manifest(&manifest, trace_id)?;
-    let mut permissions = PermissionResolver::new();
-    permissions.register_plugin_manifest_permissions(&manifest);
-    let validation = runtime
-        .registry()
-        .validate_startup(&plugin_id, &contracts, &permissions)
-        .map_err(|error| risk_runtime_error(error, trace_id))?;
-    let trace_context = TraceContext::new(trace_id.clone());
-    let mut context = demo_plugin_context_for_manifest(&manifest, trace_context.clone(), trace_id)?;
-    runtime
-        .start_plugin(&plugin_id, &validation, &mut context)
-        .map_err(|error| risk_runtime_error(error, trace_id))?;
-
-    let mut batch = PluginEventBatch::new(
-        plugin_id.clone(),
-        findings.len() + evidence_items.len() + risk_hints.len() + 1,
-    );
-    for evidence in evidence_items {
-        batch
-            .push(demo_runtime_event(
-                &producer_plugin,
-                SECURITY_EVIDENCE,
-                evidence,
-                &trace_context,
-                trace_id,
-            )?)
-            .map_err(|error| risk_runtime_error(error, trace_id))?;
-    }
-    for hint in risk_hints {
-        batch
-            .push(demo_runtime_event(
-                &producer_plugin,
-                SECURITY_RISK_HINT,
-                hint,
-                &trace_context,
-                trace_id,
-            )?)
-            .map_err(|error| risk_runtime_error(error, trace_id))?;
-    }
-    batch
-        .push(demo_runtime_event(
-            &producer_plugin,
-            IDENTITY_PROCESS_CONTEXT,
-            process_context,
-            &trace_context,
-            trace_id,
-        )?)
-        .map_err(|error| risk_runtime_error(error, trace_id))?;
-    for finding in findings {
-        batch
-            .push(demo_runtime_event(
-                &producer_plugin,
-                SECURITY_FINDING,
-                finding,
-                &trace_context,
-                trace_id,
-            )?)
-            .map_err(|error| risk_runtime_error(error, trace_id))?;
-    }
-
-    let output = runtime
-        .process_batch(&plugin_id, &mut context, &batch)
-        .map_err(|error| risk_runtime_error(error, trace_id))?;
-    let mut risk_events = Vec::new();
-    let mut alerts = Vec::new();
-    let mut incidents = Vec::new();
-    let mut alert_candidate_count = 0usize;
-    let mut incident_candidate_count = 0usize;
-    for event in output.events {
-        match event.event_type.as_str() {
-            SECURITY_RISK => risk_events.push(parse_runtime_payload::<RiskEvent>(
-                event,
-                SECURITY_RISK,
-                trace_id,
-            )?),
-            ALERT_CANDIDATE_CONTRACT => {
-                let _: AlertCandidate =
-                    parse_runtime_payload(event, ALERT_CANDIDATE_CONTRACT, trace_id)?;
-                alert_candidate_count += 1;
-            }
-            SECURITY_ALERT => alerts.push(parse_runtime_payload::<Alert>(
-                event,
-                SECURITY_ALERT,
-                trace_id,
-            )?),
-            INCIDENT_CANDIDATE_CONTRACT => {
-                let _: IncidentCandidate =
-                    parse_runtime_payload(event, INCIDENT_CANDIDATE_CONTRACT, trace_id)?;
-                incident_candidate_count += 1;
-            }
-            SECURITY_INCIDENT => incidents.push(parse_runtime_payload::<Incident>(
-                event,
-                SECURITY_INCIDENT,
-                trace_id,
-            )?),
-            GRAPH_PATH
-            | RESPONSE_PLAN
-            | RESPONSE_RESULT
-            | RESPONSE_ROLLBACK_RESULT
-            | REPORT_GENERATED
-            | REPORT_EXPORTED => {
-                return Err(risk_runtime_error(
-                    "risk alerting runtime emitted a forbidden downstream output topic",
-                    trace_id,
-                ));
-            }
-            other => {
-                return Err(risk_runtime_error(
-                    format!("risk alerting runtime emitted unexpected output topic: {other}"),
-                    trace_id,
-                ));
-            }
-        }
-    }
+    let mut risk_events = output.risk_events;
+    let alerts = output.alerts;
+    let incidents = output.incidents;
+    let alert_candidate_count = output.alert_candidates.len();
+    let incident_candidate_count = output.incident_candidates.len();
 
     if risk_events.is_empty() || alerts.len() < 2 || incidents.is_empty() {
         return Err(risk_runtime_error(
@@ -1995,109 +1875,6 @@ fn attach_graph_path_to_runtime_incident(
         incident.with_graph_path_refs(vec![graph_path_id.clone()]),
         vec![("graph_path_refs", to_value(vec![graph_path_id])?)],
     )
-}
-
-fn parse_runtime_payload<TPayload>(
-    event: EventEnvelope,
-    expected: &'static str,
-    trace_id: &TraceId,
-) -> CommandResult<TPayload>
-where
-    TPayload: DeserializeOwned,
-{
-    serde_json::from_value(event.payload).map_err(|error| {
-        risk_runtime_error(
-            format!("{expected} runtime payload did not match metadata schema: {error}"),
-            trace_id,
-        )
-    })
-}
-
-fn demo_contract_registry_for_manifest(
-    manifest: &PluginManifest,
-    trace_id: &TraceId,
-) -> CommandResult<ContractRegistry> {
-    let mut registry = ContractRegistry::new();
-    for contract in manifest
-        .input_contracts
-        .iter()
-        .chain(manifest.output_contracts.iter())
-    {
-        registry
-            .register(contract.clone())
-            .map_err(|error| risk_runtime_error(error, trace_id))?;
-    }
-    Ok(registry)
-}
-
-fn demo_plugin_context_for_manifest(
-    manifest: &PluginManifest,
-    trace_context: TraceContext,
-    trace_id: &TraceId,
-) -> CommandResult<PluginContext<'static>> {
-    let mut context = PluginContext::new(
-        manifest.plugin_id.clone(),
-        manifest.runtime_mode.clone(),
-        trace_context,
-    );
-    for contract in &manifest.input_contracts {
-        context
-            .topic_scope
-            .subscribe_topics
-            .insert(demo_topic_for_contract(contract, trace_id)?);
-    }
-    for contract in &manifest.output_contracts {
-        context
-            .topic_scope
-            .publish_topics
-            .insert(demo_topic_for_contract(contract, trace_id)?);
-    }
-    for permission in &manifest.required_permissions {
-        context
-            .permission_scope
-            .required_permissions
-            .insert(permission.permission.clone());
-        context
-            .permission_scope
-            .granted_permissions
-            .insert(permission.permission.clone());
-    }
-    context.checkpoint =
-        CheckpointSupport::from_manifest_level(manifest.checkpoint_support.clone());
-    context.replay = ReplaySupport::from_manifest_level(manifest.replay_support.clone());
-    Ok(context)
-}
-
-fn demo_topic_for_contract(
-    contract: &ContractDescriptor,
-    trace_id: &TraceId,
-) -> CommandResult<TopicName> {
-    TopicName::new(
-        contract
-            .topic
-            .as_deref()
-            .unwrap_or(contract.contract_name.as_str()),
-    )
-    .map_err(|error| risk_runtime_error(error, trace_id))
-}
-
-fn demo_runtime_event(
-    producer_plugin: &PluginId,
-    topic: &str,
-    payload: impl Serialize,
-    trace_context: &TraceContext,
-    trace_id: &TraceId,
-) -> CommandResult<EventEnvelope> {
-    let mut event = EventEnvelope::new(
-        EventType::new(topic).map_err(contract_error)?,
-        DEMO_STORY_SCHEMA_VERSION,
-        producer_plugin.clone(),
-        trace_context.clone(),
-    );
-    event.privacy_class = PrivacyClass::Internal;
-    event.payload =
-        serde_json::to_value(payload).map_err(|error| risk_runtime_error(error, trace_id))?;
-    Ok(event)
 }
 
 fn risk_runtime_error(error: impl Display, trace_id: &TraceId) -> CoreError {
@@ -2734,7 +2511,7 @@ fn graph_paths(ids: &StoryIds) -> CommandResult<Vec<GraphPath>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn response_plan_from_static_runtime(
+fn response_plan_from_fixture_capability(
     id_slot: u16,
     incident_id: sentinel_contracts::IncidentId,
     producer_plugin: PluginId,
@@ -2744,17 +2521,10 @@ fn response_plan_from_static_runtime(
     graph_paths: &[GraphPath],
     trace_id: &TraceId,
 ) -> CommandResult<ResponsePlan> {
-    let output = static_response_planning_output(
+    let output = fixture_response_planning_output(
         response_planning_input(producer_plugin, findings, alerts, incident, graph_paths)?,
         trace_id,
     )?;
-    if !output.used_static_runtime {
-        return Err(story_error(
-            "response_runtime",
-            "static response planning runtime was not used for demo story response plan",
-            json!({ "source": "incident" }),
-        ));
-    }
 
     let source = ResponsePlanSource::Incident(incident_id);
     let mut plan = output
@@ -2764,7 +2534,7 @@ fn response_plan_from_static_runtime(
         .ok_or_else(|| {
             story_error(
                 "response_runtime",
-                "static response planning runtime did not return an incident-sourced plan",
+                "fixture response planning capability did not return an incident-sourced plan",
                 json!({ "source": "incident" }),
             )
         })?;
@@ -3524,7 +3294,7 @@ mod tests {
         assert!(plan
             .audit_requirements
             .iter()
-            .any(|requirement| requirement == "response.runtime.static_internal.process_batch"));
+            .any(|requirement| requirement == "response.fixture.pure_capability.process"));
         assert_eq!(plan.recommended_actions.len(), 3);
         assert_eq!(plan.policy_decisions.len(), plan.recommended_actions.len());
         assert_eq!(plan.rollback_plans.len(), plan.recommended_actions.len());
@@ -3626,7 +3396,7 @@ mod tests {
         for marker in forbidden_fixture_markers() {
             assert!(!lower.contains(marker), "marker leaked: {marker}");
         }
-        assert!(serialized.contains("response.runtime.static_internal.process_batch"));
+        assert!(serialized.contains("response.fixture.pure_capability.process"));
         assert!(!lower.contains("response_result"));
         assert!(!lower.contains("response_rollback_result"));
 

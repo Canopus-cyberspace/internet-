@@ -7,6 +7,7 @@ export {
 export {
   getDurableBaselineSummary,
   getEvidenceQualitySummary,
+  getEndpointThreatSummary,
   getIncidentDetail,
   getInvestigationDrillDownSummary,
   searchAlerts,

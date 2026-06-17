@@ -516,9 +516,42 @@ export function portableCaptureSourceTypeForPath(
   }
   if (
     (normalized.endsWith(".jsonl") || normalized.endsWith(".log")) &&
+    portableWafSourceHint(normalized)
+  ) {
+    return "imported_waf_log";
+  }
+  if (
+    (normalized.endsWith(".jsonl") || normalized.endsWith(".log")) &&
+    portableApiGatewaySourceHint(normalized)
+  ) {
+    return "imported_api_gateway_log";
+  }
+  if (
+    (normalized.endsWith(".jsonl") || normalized.endsWith(".log")) &&
+    portableCdnEdgeSourceHint(normalized)
+  ) {
+    return "imported_cdn_edge_log";
+  }
+  if (
+    (normalized.endsWith(".jsonl") || normalized.endsWith(".log")) &&
+    portableSdnControlPlaneSourceHint(normalized)
+  ) {
+    return "imported_sdn_control_plane_log";
+  }
+  if (
+    (normalized.endsWith(".jsonl") || normalized.endsWith(".log")) &&
+    portableObjectStorageAuditSourceHint(normalized)
+  ) {
+    return "imported_object_storage_audit_log";
+  }
+  if (
+    (normalized.endsWith(".jsonl") || normalized.endsWith(".log")) &&
     portableSaasCloudSourceHint(normalized)
   ) {
     return "imported_saas_cloud_metadata";
+  }
+  if (normalized.endsWith(".log") && portableDnsResolverSourceHint(normalized)) {
+    return "imported_dns_resolver_log";
   }
   if (normalized.endsWith(".jsonl")) {
     return "imported_jsonl_network_metadata";
@@ -541,6 +574,18 @@ export function portableCaptureSourceLabel(
       return "SaaS/cloud metadata";
     case "imported_deception_event_log":
       return "Deception event metadata";
+    case "imported_dns_resolver_log":
+      return "DNS resolver metadata";
+    case "imported_api_gateway_log":
+      return "API gateway metadata";
+    case "imported_waf_log":
+      return "WAF metadata";
+    case "imported_cdn_edge_log":
+      return "CDN/edge metadata";
+    case "imported_sdn_control_plane_log":
+      return "SDN control-plane metadata";
+    case "imported_object_storage_audit_log":
+      return "Object storage audit metadata";
     case "imported_jsonl_network_metadata":
       return "JSONL metadata";
     case "imported_web_access_log":
@@ -548,6 +593,88 @@ export function portableCaptureSourceLabel(
     default:
       return "Portable metadata";
   }
+}
+
+function portableDnsResolverSourceHint(normalizedPath: string) {
+  return ["dns", "resolver", "bind", "unbound", "dnsmasq"].some((hint) =>
+    normalizedPath.includes(hint),
+  );
+}
+
+function portableApiGatewaySourceHint(normalizedPath: string) {
+  return ["api-gateway", "apigateway", "api_gateway", "gateway", "apim", "kong", "envoy"].some(
+    (hint) => normalizedPath.includes(hint),
+  );
+}
+
+function portableWafSourceHint(normalizedPath: string) {
+  return [
+    "waf",
+    "modsecurity",
+    "mod_security",
+    "cloudflare-security",
+    "aws-waf",
+    "azure-waf",
+  ].some((hint) => normalizedPath.includes(hint));
+}
+
+function portableCdnEdgeSourceHint(normalizedPath: string) {
+  return normalizedPath
+    .split(/[^\da-z]+/)
+    .some((token) =>
+      [
+        "cdn",
+        "edge",
+        "cloudfront",
+        "frontdoor",
+        "front",
+        "door",
+        "cloudflare",
+        "akamai",
+        "fastly",
+      ].includes(token),
+    );
+}
+
+function portableSdnControlPlaneSourceHint(normalizedPath: string) {
+  return normalizedPath
+    .split(/[^\da-z]+/)
+    .some((token) =>
+      [
+        "sdn",
+        "controller",
+        "control",
+        "plane",
+        "topology",
+        "acl",
+        "policy",
+        "route",
+        "openflow",
+        "onos",
+        "odl",
+        "opendaylight",
+        "sdwan",
+      ].includes(token),
+    );
+}
+
+function portableObjectStorageAuditSourceHint(normalizedPath: string) {
+  return normalizedPath
+    .split(/[^\da-z]+/)
+    .some((token) =>
+      [
+        "object",
+        "storage",
+        "bucket",
+        "s3",
+        "blob",
+        "gcs",
+        "r2",
+        "minio",
+        "objectstorage",
+        "cloudtrail",
+      ].includes(token),
+    );
 }
 
 function portableCaptureCountItems(counts: PortableCaptureRecordCountsDto) {
@@ -560,6 +687,7 @@ function portableCaptureCountItems(counts: PortableCaptureRecordCountsDto) {
     { label: "Auth", value: counts.auth_metadata_records },
     { label: "SaaS/cloud", value: counts.saas_cloud_metadata_records },
     { label: "Deception", value: counts.deception_event_records },
+    { label: "SDN", value: counts.sdn_control_plane_records },
   ];
 }
 
@@ -585,6 +713,11 @@ function portableCaptureImportResultCountItems(
     {
       label: "Deception",
       value: result.deception_event_count,
+      tone: "neutral" as const,
+    },
+    {
+      label: "SDN",
+      value: result.sdn_control_plane_metadata_count,
       tone: "neutral" as const,
     },
     { label: "Security facts", value: result.security_fact_count, tone: "neutral" as const },

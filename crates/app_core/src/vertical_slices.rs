@@ -10,9 +10,9 @@ use crate::event_streams::{
     service_status_stream, ServiceStatusUpdate, StreamName, TauriEventDispatcher,
 };
 use crate::mutation_commands::{
-    create_response_plan, export_report, generate_incident_report, static_response_planning_output,
-    CreateResponsePlanRequest, ExportReportRequest, GenerateIncidentReportRequest,
-    MutationCommandState, ResponsePlanningCommandOutput,
+    create_response_plan, export_report, fixture_response_planning_output,
+    generate_incident_report, CreateResponsePlanRequest, ExportReportRequest,
+    GenerateIncidentReportRequest, ResponsePlanningCommandOutput,
 };
 use crate::read_commands::{
     get_capability_overview, get_graph_view, get_plugin_catalog, get_runtime_profile,
@@ -190,6 +190,7 @@ pub struct SliceValidationReport {
     pub windows_service_ipc: WindowsServiceIpcSlice,
 }
 
+#[cfg(test)]
 pub fn validate_vertical_slices() -> CommandResult<SliceValidationReport> {
     let read_state = ReadOnlyCommandState::bootstrap()?;
     let pipeline = MockNetworkPipeline::new()
@@ -205,7 +206,7 @@ pub fn validate_vertical_slices() -> CommandResult<SliceValidationReport> {
             edges: graph_output.edges.clone(),
         })
         .map_err(|error| capability_error("graph_analytics", error))?;
-    let response_output = static_response_planning_output(
+    let response_output = fixture_response_planning_output(
         response_input(&story, graph_analytics.paths.clone()),
         &TraceId::new_v4(),
     )?;
@@ -505,7 +506,7 @@ fn response_planning_slice(
         static_runtime_provenance_recorded,
         documentation: docs(
             &[
-                "Response planning consumes findings, alerts, incidents, graph paths, and policy settings through the static internal plugin runtime to produce recommend-first plans with policy decisions, approval requirements, audit requirements, TTL metadata, and rollback plans.",
+                "The fixture response-planning probe consumes bounded findings, alerts, incidents, graph paths, and policy settings through the pure capability algorithm; production mutation execution uses the container-owned static plugin runtime.",
                 "Replay mode disables execution while still proving the planning and policy path.",
             ],
             &[
@@ -515,13 +516,15 @@ fn response_planning_slice(
     })
 }
 
+#[cfg(test)]
 fn report_export_slice(story: &FixtureStory) -> CommandResult<ReportExportSlice> {
     let read = ReadOnlyCommandState::bootstrap()?
         .with_findings(story.findings.clone())
         .with_alerts(vec![story.alert.clone()])
         .with_incidents(vec![story.incident.clone()]);
     let incident_id = story.incident.id().clone();
-    let mut mutation_state = MutationCommandState::from_read_state(read)?;
+    let mut mutation_state = crate::RuntimeContainerBuilder::for_test("vertical-slice-report")
+        .build_test_mutation_state_from_read(read)?;
 
     create_response_plan(
         &mut mutation_state,
@@ -1103,8 +1106,8 @@ mod tests {
         assert!(report.detection_mvp.risk_hints_stay_evidence_input_only);
         assert!(report.graph_rendering.consumed_graph_view_model_only);
         assert!(report.response_planning.execution_disabled_in_replay);
-        assert!(report.response_planning.used_static_runtime);
-        assert!(report.response_planning.static_runtime_provenance_recorded);
+        assert!(!report.response_planning.used_static_runtime);
+        assert!(!report.response_planning.static_runtime_provenance_recorded);
         assert!(report.report_export.successful_export_recorded);
         assert!(report.report_export.denied_export_recorded_as_violation);
         assert!(report.windows_service_ipc.degraded_status_reported);

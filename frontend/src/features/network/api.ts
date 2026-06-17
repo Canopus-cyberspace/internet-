@@ -15,8 +15,13 @@ export {
 export {
   getMetadataWatchControllerStatus,
   getInvestigationDrillDownSummary,
+  getNetworkFallbackPlan,
+  getNetworkProviderStatus,
+  getNetworkVisibilitySummary,
+  getProviderControllerStatus,
   listMetadataSamplingBatches,
   listMetadataWatchSources,
+  listNetworkProviderStatus,
   searchDns,
   searchFlows,
   searchTls,

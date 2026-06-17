@@ -11,6 +11,10 @@ import type {
   MetadataSamplingBatchSummaryDto,
   MetadataWatchControllerStatusDto,
   MetadataWatchSourceStatusDto,
+  NetworkFallbackPlanDto,
+  NetworkProviderControllerStatusDto,
+  NetworkProviderStatusDto,
+  NetworkVisibilitySummaryDto,
   TlsObservationDto,
 } from "./dto/network";
 import type {
@@ -37,6 +41,7 @@ import type {
   DurableBaselineSummaryDto,
   EvidenceQualityRecordDto,
   EvidenceQualitySummaryDto,
+  EndpointThreatAnalysisSummaryDto,
   FindingDto,
   FusionSummaryDto,
   IncidentDetailViewDto,
@@ -70,6 +75,8 @@ import type {
   NativeSamplerRuntimeSummaryDto,
   NativeSamplerScheduleStatusDto,
   NativeSchedulerOperationalSummaryDto,
+  NativeSchedulerHostHealthSummaryDto,
+  NativeSchedulerHostStatusDto,
   NativeSchedulerStatusDto,
   NativeSchedulerSummaryDto,
   NativeVisibilitySummaryDto,
@@ -155,6 +162,30 @@ export function searchTls(request: QueryRequestDto) {
   });
 }
 
+export function getProviderControllerStatus() {
+  return invokeCore<NetworkProviderControllerStatusDto>(
+    "get_provider_controller_status",
+  );
+}
+
+export function listNetworkProviderStatus() {
+  return invokeCore<NetworkProviderStatusDto[]>("list_network_provider_status");
+}
+
+export function getNetworkProviderStatus(providerId: string) {
+  return invokeCore<NetworkProviderStatusDto>("get_network_provider_status", {
+    provider_id: providerId,
+  });
+}
+
+export function getNetworkVisibilitySummary() {
+  return invokeCore<NetworkVisibilitySummaryDto>("get_network_visibility_summary");
+}
+
+export function getNetworkFallbackPlan() {
+  return invokeCore<NetworkFallbackPlanDto>("get_network_fallback_plan");
+}
+
 export function getGraphView(request: GraphViewRequestDto) {
   return invokeCore<GraphViewModelDto>("get_graph_view", { request });
 }
@@ -235,6 +266,10 @@ export function getInvestigationDrillDownSummary() {
   return invokeCore<InvestigationDrillDownSummaryDto>(
     "get_investigation_drill_down_summary",
   );
+}
+
+export function getEndpointThreatSummary() {
+  return invokeCore<EndpointThreatAnalysisSummaryDto>("get_endpoint_threat_summary");
 }
 
 export function resolveNavigationReference(request: NavigationResolveRequestDto) {
@@ -534,6 +569,18 @@ export function getNativeSchedulerSummary() {
 export function getNativeSchedulerOperationalSummary() {
   return invokeCore<NativeSchedulerOperationalSummaryDto>(
     "get_native_scheduler_operational_summary",
+  );
+}
+
+export function getNativeSchedulerHostStatus() {
+  return invokeCore<NativeSchedulerHostStatusDto>(
+    "get_native_scheduler_host_status",
+  );
+}
+
+export function getNativeSchedulerHostHealth() {
+  return invokeCore<NativeSchedulerHostHealthSummaryDto>(
+    "get_native_scheduler_host_health",
   );
 }
 

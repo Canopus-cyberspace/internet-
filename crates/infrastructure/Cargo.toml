@@ -11,7 +11,20 @@ path = "src/lib.rs"
 [dependencies]
 chrono.workspace = true
 sentinel-contracts = { path = "../contracts" }
-sentinel-elevated-service = { package = "sentinel-guard-elevated", path = "../../service/elevated" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_EventLog",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+] }

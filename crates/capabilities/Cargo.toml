@@ -8,6 +8,9 @@ license.workspace = true
 name = "sentinel_capabilities"
 path = "src/lib.rs"
 
+[features]
+test-support = []
+
 [dependencies]
 sentinel-contracts = { path = "../contracts" }
 sentinel-platform = { path = "../platform" }

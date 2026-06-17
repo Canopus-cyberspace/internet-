@@ -1,6 +1,7 @@
 use crate::native_sampler_readiness::get_native_sampler_readiness_detail;
 use crate::native_sampler_runtime::NativeSamplerRuntime;
 use crate::read_commands::ReadOnlyCommandState;
+use crate::runtime_container::RuntimeEventBusHandle;
 use sentinel_contracts::{
     AuditId, CommandResult, CoreError, ErrorCode, ErrorSeverity, EventEnvelope, EventType,
     NativeMissedSampleDimensionSummary, NativeMissedSampleState, NativePermissionState,
@@ -25,7 +26,7 @@ use sentinel_contracts::{
     NATIVE_SCHEDULER_ALLOWED_TOPICS,
 };
 use sentinel_platform::{
-    EventBus, PublishOptions, TopicName, AUDIT_NATIVE_SCHEDULER, NATIVE_SCHEDULER_BACKPRESSURE,
+    PublishOptions, TopicName, AUDIT_NATIVE_SCHEDULER, NATIVE_SCHEDULER_BACKPRESSURE,
     NATIVE_SCHEDULER_CYCLE_COMPLETED, NATIVE_SCHEDULER_CYCLE_SKIPPED,
     NATIVE_SCHEDULER_CYCLE_STARTED, NATIVE_SCHEDULER_EXECUTION_CONTROL, NATIVE_SCHEDULER_FRESHNESS,
     NATIVE_SCHEDULER_MISSED_SAMPLE, NATIVE_SCHEDULER_STATUS,
@@ -56,12 +57,20 @@ pub struct NativeSchedulerController {
     active_sampler_executions: BTreeSet<String>,
     active_category_executions: BTreeMap<String, u32>,
     graceful_shutdown_requested: bool,
-    event_bus: EventBus,
+    event_bus: RuntimeEventBusHandle,
     producer_plugin: PluginId,
 }
 
 impl NativeSchedulerController {
+    #[cfg(test)]
     pub fn from_read_state(read: &ReadOnlyCommandState) -> Self {
+        Self::from_read_state_with_event_bus(read, RuntimeEventBusHandle::new_legacy_core_topics())
+    }
+
+    pub(crate) fn from_read_state_with_event_bus(
+        read: &ReadOnlyCommandState,
+        event_bus: RuntimeEventBusHandle,
+    ) -> Self {
         Self {
             controller_state: read.native_scheduler_controller_state.clone(),
             schedules: read.native_sampler_schedule_statuses.clone(),
@@ -73,9 +82,56 @@ impl NativeSchedulerController {
             active_sampler_executions: BTreeSet::new(),
             active_category_executions: BTreeMap::new(),
             graceful_shutdown_requested: read.native_scheduler_graceful_shutdown_requested,
-            event_bus: EventBus::with_core_topics(),
+            event_bus,
             producer_plugin: PluginId::new_v4(),
         }
+    }
+
+    pub(crate) fn schedule_status_from_read_state(
+        read: &ReadOnlyCommandState,
+        sampler_id: &str,
+    ) -> CommandResult<NativeSamplerScheduleStatus> {
+        schedule_status_from_parts(read, &read.native_sampler_schedule_statuses, sampler_id)
+    }
+
+    pub(crate) fn summary_from_read_state(
+        read: &ReadOnlyCommandState,
+    ) -> CommandResult<NativeSchedulerSummary> {
+        let schedules = SUPPORTED_SAMPLERS
+            .iter()
+            .map(|sampler_id| Self::schedule_status_from_read_state(read, sampler_id))
+            .collect::<CommandResult<Vec<_>>>()?;
+        let status = scheduler_status_from_parts(
+            &read.native_scheduler_controller_state,
+            &schedules,
+            &read.native_scheduler_cycles,
+            read.native_scheduler_last_tick_monotonic_millis,
+            read.native_scheduler_graceful_shutdown_requested,
+            &read.native_scheduler_audit_entries,
+        );
+        let summary = NativeSchedulerSummary {
+            status,
+            schedules,
+            authorization_independent: true,
+            activation_independent: true,
+            enablement_independent: true,
+            startup_auto_enablement: false,
+            latest_cycle: read.native_scheduler_cycles.last().cloned(),
+            generated_at: Timestamp::now(),
+        };
+        summary.validate().map_err(contract_error)?;
+        Ok(summary)
+    }
+
+    pub(crate) fn operational_summary_from_read_state(
+        read: &ReadOnlyCommandState,
+    ) -> CommandResult<NativeSchedulerOperationalSummary> {
+        let summary = Self::summary_from_read_state(read)?;
+        operational_summary_from_parts(
+            summary,
+            &read.native_scheduler_cycles,
+            &read.native_scheduler_retry_attempts,
+        )
     }
 
     pub fn sync_read_state(&self, read: &mut ReadOnlyCommandState) {
@@ -1287,55 +1343,7 @@ impl NativeSchedulerController {
             .with_severity(ErrorSeverity::Info)
             .with_redacted_details(json!({ "sampler_id": sampler_id })));
         }
-        let runtime =
-            NativeSamplerRuntime::from_read_state(read).status_for_detail(read, sampler_id)?;
-        let existing = self
-            .schedules
-            .iter()
-            .find(|status| status.contract.sampler_id == sampler_id);
-        let authorized = runtime.permission_state == NativePermissionState::GrantedSession;
-        let activated = matches!(
-            runtime.runtime_state,
-            NativeSamplerRuntimeState::Active
-                | NativeSamplerRuntimeState::Idle
-                | NativeSamplerRuntimeState::Paused
-        );
-        let schedule_eligible = authorized
-            && matches!(
-                runtime.runtime_state,
-                NativeSamplerRuntimeState::Active | NativeSamplerRuntimeState::Idle
-            );
-        let blocked_reason = if !authorized {
-            Some("authorization_required".to_string())
-        } else if runtime.runtime_state == NativeSamplerRuntimeState::Revoked {
-            Some("authorization_revoked".to_string())
-        } else if runtime.runtime_state == NativeSamplerRuntimeState::Paused {
-            Some("sampler_runtime_paused".to_string())
-        } else if !activated {
-            Some("explicit_sampler_activation_required".to_string())
-        } else {
-            None
-        };
-        let mut contract = existing
-            .map(|status| status.contract.clone())
-            .unwrap_or_else(|| default_schedule_contract(sampler_id, runtime.category.clone()));
-        if !schedule_eligible {
-            contract.schedule_enabled = false;
-        }
-        let status = NativeSamplerScheduleStatus {
-            contract,
-            permission_state: runtime.permission_state,
-            runtime_state: runtime.runtime_state,
-            authorized,
-            activated,
-            schedule_eligible,
-            blocked_reason,
-            audit_refs: existing
-                .map(|status| status.audit_refs.clone())
-                .unwrap_or_default(),
-        };
-        status.validate().map_err(contract_error)?;
-        Ok(status)
+        schedule_status_from_parts(read, &self.schedules, sampler_id)
     }
 
     pub fn summary(&self, read: &ReadOnlyCommandState) -> CommandResult<NativeSchedulerSummary> {
@@ -1455,111 +1463,14 @@ impl NativeSchedulerController {
         &self,
         schedules: &[NativeSamplerScheduleStatus],
     ) -> NativeSchedulerStatus {
-        let enabled_schedule_count = schedules
-            .iter()
-            .filter(|schedule| schedule.contract.schedule_enabled)
-            .count() as u32;
-        let latest_backpressure = self
-            .cycles
-            .iter()
-            .rev()
-            .filter_map(|cycle| cycle.backpressure.as_ref())
-            .find(|summary| summary.state != NativeSchedulerBackpressureState::None);
-        let latest_freshness = self
-            .cycles
-            .iter()
-            .rev()
-            .filter_map(|cycle| cycle.freshness.as_ref())
-            .next();
-        let latest_missed_sample = self
-            .cycles
-            .iter()
-            .rev()
-            .filter_map(|cycle| cycle.missed_sample.as_ref())
-            .next();
-        NativeSchedulerStatus {
-            controller_state: self.controller_state.clone(),
-            periodic_sampling_enabled: enabled_schedule_count > 0,
-            enabled_schedule_count,
-            eligible_schedule_count: schedules
-                .iter()
-                .filter(|schedule| schedule.schedule_eligible)
-                .count() as u32,
-            revoked_schedule_count: schedules
-                .iter()
-                .filter(|schedule| schedule.permission_state == NativePermissionState::Revoked)
-                .count() as u32,
-            scheduling_loop_implemented: true,
-            scheduling_loop_active: self.controller_state
-                == NativeSchedulerControllerState::Running
-                && enabled_schedule_count > 0,
-            backpressure_state: latest_backpressure
-                .map(|summary| summary.state.clone())
-                .unwrap_or(NativeSchedulerBackpressureState::None),
-            backpressure_cycle_count: self
-                .cycles
-                .iter()
-                .filter_map(|cycle| cycle.backpressure.as_ref())
-                .filter(|summary| summary.state != NativeSchedulerBackpressureState::None)
-                .count() as u32,
-            latest_backpressure_cycle_id: latest_backpressure
-                .map(|summary| summary.cycle_id.clone()),
-            freshness_stale_dimension_count: latest_freshness
-                .map(|summary| summary.stale_dimension_count)
-                .unwrap_or(0),
-            freshness_missing_dimension_count: latest_freshness
-                .map(|summary| {
-                    summary
-                        .missing_dimension_count
-                        .saturating_add(summary.unavailable_dimension_count)
-                        .saturating_add(summary.revoked_dimension_count)
-                })
-                .unwrap_or(0),
-            missed_sample_dimension_count: latest_missed_sample
-                .map(|summary| {
-                    summary
-                        .delayed_dimension_count
-                        .saturating_add(summary.missed_once_dimension_count)
-                        .saturating_add(summary.repeatedly_missed_dimension_count)
-                        .saturating_add(summary.paused_dimension_count)
-                        .saturating_add(summary.blocked_dimension_count)
-                        .saturating_add(summary.revoked_dimension_count)
-                })
-                .unwrap_or(0),
-            latest_freshness_cycle_id: latest_freshness.map(|summary| summary.cycle_id.clone()),
-            latest_missed_sample_cycle_id: latest_missed_sample
-                .map(|summary| summary.cycle_id.clone()),
-            periodic_execution_started: false,
-            sample_requested: false,
-            retry_execution_started: false,
-            graceful_shutdown_requested: self.graceful_shutdown_requested,
-            cycle_count: self.cycles.len() as u32,
-            completed_cycle_count: self
-                .cycles
-                .iter()
-                .filter(|cycle| cycle.cycle_state == NativeSchedulerCycleState::Completed)
-                .count() as u32,
-            skipped_cycle_count: self
-                .cycles
-                .iter()
-                .filter(|cycle| cycle.cycle_state == NativeSchedulerCycleState::Skipped)
-                .count() as u32,
-            latest_cycle_id: self.cycles.last().map(|cycle| cycle.cycle_id.clone()),
-            last_tick_monotonic_millis: self.last_tick_monotonic_millis,
-            automatic_llm_calls: false,
-            response_execution_started: false,
-            emitted_topics: vec![NATIVE_SCHEDULER_STATUS.to_string()],
-            audit_refs: self
-                .audit_entries
-                .iter()
-                .rev()
-                .take(sentinel_contracts::MAX_NATIVE_SCHEDULER_REFS)
-                .map(|entry| entry.audit_id.clone())
-                .collect(),
-            provenance_id: PROVENANCE_ID.to_string(),
-            redaction_status: RedactionStatus::Redacted,
-            generated_at: Timestamp::now(),
-        }
+        scheduler_status_from_parts(
+            &self.controller_state,
+            schedules,
+            &self.cycles,
+            self.last_tick_monotonic_millis,
+            self.graceful_shutdown_requested,
+            &self.audit_entries,
+        )
     }
 
     fn upsert_schedule(&mut self, status: NativeSamplerScheduleStatus) {
@@ -1616,6 +1527,246 @@ impl NativeSchedulerController {
             .map_err(internal_error)?;
         Ok(())
     }
+}
+
+fn schedule_status_from_parts(
+    read: &ReadOnlyCommandState,
+    schedules: &[NativeSamplerScheduleStatus],
+    sampler_id: &str,
+) -> CommandResult<NativeSamplerScheduleStatus> {
+    if !SUPPORTED_SAMPLERS.contains(&sampler_id) {
+        return Err(CoreError::new(
+            ErrorCode::InvalidRequest,
+            "native scheduler sampler was not found",
+        )
+        .with_severity(ErrorSeverity::Info)
+        .with_redacted_details(json!({ "sampler_id": sampler_id })));
+    }
+    let runtime = NativeSamplerRuntime::status_from_read_state(read, sampler_id)?;
+    let existing = schedules
+        .iter()
+        .find(|status| status.contract.sampler_id == sampler_id);
+    let authorized = runtime.permission_state == NativePermissionState::GrantedSession;
+    let activated = matches!(
+        runtime.runtime_state,
+        NativeSamplerRuntimeState::Active
+            | NativeSamplerRuntimeState::Idle
+            | NativeSamplerRuntimeState::Paused
+    );
+    let schedule_eligible = authorized
+        && matches!(
+            runtime.runtime_state,
+            NativeSamplerRuntimeState::Active | NativeSamplerRuntimeState::Idle
+        );
+    let blocked_reason = if !authorized {
+        Some("authorization_required".to_string())
+    } else if runtime.runtime_state == NativeSamplerRuntimeState::Revoked {
+        Some("authorization_revoked".to_string())
+    } else if runtime.runtime_state == NativeSamplerRuntimeState::Paused {
+        Some("sampler_runtime_paused".to_string())
+    } else if !activated {
+        Some("explicit_sampler_activation_required".to_string())
+    } else {
+        None
+    };
+    let mut contract = existing
+        .map(|status| status.contract.clone())
+        .unwrap_or_else(|| default_schedule_contract(sampler_id, runtime.category.clone()));
+    if !schedule_eligible {
+        contract.schedule_enabled = false;
+    }
+    let status = NativeSamplerScheduleStatus {
+        contract,
+        permission_state: runtime.permission_state,
+        runtime_state: runtime.runtime_state,
+        authorized,
+        activated,
+        schedule_eligible,
+        blocked_reason,
+        audit_refs: existing
+            .map(|status| status.audit_refs.clone())
+            .unwrap_or_default(),
+    };
+    status.validate().map_err(contract_error)?;
+    Ok(status)
+}
+
+fn scheduler_status_from_parts(
+    controller_state: &NativeSchedulerControllerState,
+    schedules: &[NativeSamplerScheduleStatus],
+    cycles: &[NativeSchedulerCycleSummary],
+    last_tick_monotonic_millis: Option<u64>,
+    graceful_shutdown_requested: bool,
+    audit_entries: &[NativeSchedulerAuditEntry],
+) -> NativeSchedulerStatus {
+    let enabled_schedule_count = schedules
+        .iter()
+        .filter(|schedule| schedule.contract.schedule_enabled)
+        .count() as u32;
+    let latest_backpressure = cycles
+        .iter()
+        .rev()
+        .filter_map(|cycle| cycle.backpressure.as_ref())
+        .find(|summary| summary.state != NativeSchedulerBackpressureState::None);
+    let latest_freshness = cycles
+        .iter()
+        .rev()
+        .find_map(|cycle| cycle.freshness.as_ref());
+    let latest_missed_sample = cycles
+        .iter()
+        .rev()
+        .find_map(|cycle| cycle.missed_sample.as_ref());
+    NativeSchedulerStatus {
+        controller_state: controller_state.clone(),
+        periodic_sampling_enabled: enabled_schedule_count > 0,
+        enabled_schedule_count,
+        eligible_schedule_count: schedules
+            .iter()
+            .filter(|schedule| schedule.schedule_eligible)
+            .count() as u32,
+        revoked_schedule_count: schedules
+            .iter()
+            .filter(|schedule| schedule.permission_state == NativePermissionState::Revoked)
+            .count() as u32,
+        scheduling_loop_implemented: true,
+        scheduling_loop_active: *controller_state == NativeSchedulerControllerState::Running
+            && enabled_schedule_count > 0,
+        backpressure_state: latest_backpressure
+            .map(|summary| summary.state.clone())
+            .unwrap_or(NativeSchedulerBackpressureState::None),
+        backpressure_cycle_count: cycles
+            .iter()
+            .filter_map(|cycle| cycle.backpressure.as_ref())
+            .filter(|summary| summary.state != NativeSchedulerBackpressureState::None)
+            .count() as u32,
+        latest_backpressure_cycle_id: latest_backpressure.map(|summary| summary.cycle_id.clone()),
+        freshness_stale_dimension_count: latest_freshness
+            .map(|summary| summary.stale_dimension_count)
+            .unwrap_or(0),
+        freshness_missing_dimension_count: latest_freshness
+            .map(|summary| {
+                summary
+                    .missing_dimension_count
+                    .saturating_add(summary.unavailable_dimension_count)
+                    .saturating_add(summary.revoked_dimension_count)
+            })
+            .unwrap_or(0),
+        missed_sample_dimension_count: latest_missed_sample
+            .map(|summary| {
+                summary
+                    .delayed_dimension_count
+                    .saturating_add(summary.missed_once_dimension_count)
+                    .saturating_add(summary.repeatedly_missed_dimension_count)
+                    .saturating_add(summary.paused_dimension_count)
+                    .saturating_add(summary.blocked_dimension_count)
+                    .saturating_add(summary.revoked_dimension_count)
+            })
+            .unwrap_or(0),
+        latest_freshness_cycle_id: latest_freshness.map(|summary| summary.cycle_id.clone()),
+        latest_missed_sample_cycle_id: latest_missed_sample.map(|summary| summary.cycle_id.clone()),
+        periodic_execution_started: false,
+        sample_requested: false,
+        retry_execution_started: false,
+        graceful_shutdown_requested,
+        cycle_count: cycles.len() as u32,
+        completed_cycle_count: cycles
+            .iter()
+            .filter(|cycle| cycle.cycle_state == NativeSchedulerCycleState::Completed)
+            .count() as u32,
+        skipped_cycle_count: cycles
+            .iter()
+            .filter(|cycle| cycle.cycle_state == NativeSchedulerCycleState::Skipped)
+            .count() as u32,
+        latest_cycle_id: cycles.last().map(|cycle| cycle.cycle_id.clone()),
+        last_tick_monotonic_millis,
+        automatic_llm_calls: false,
+        response_execution_started: false,
+        emitted_topics: vec![NATIVE_SCHEDULER_STATUS.to_string()],
+        audit_refs: audit_entries
+            .iter()
+            .rev()
+            .take(sentinel_contracts::MAX_NATIVE_SCHEDULER_REFS)
+            .map(|entry| entry.audit_id.clone())
+            .collect(),
+        provenance_id: PROVENANCE_ID.to_string(),
+        redaction_status: RedactionStatus::Redacted,
+        generated_at: Timestamp::now(),
+    }
+}
+
+fn operational_summary_from_parts(
+    summary: NativeSchedulerSummary,
+    cycles: &[NativeSchedulerCycleSummary],
+    retry_attempts: &BTreeMap<String, u32>,
+) -> CommandResult<NativeSchedulerOperationalSummary> {
+    let latest_cycle = summary.latest_cycle.clone();
+    let safe_persisted_schedules = summary
+        .schedules
+        .iter()
+        .map(|schedule| {
+            let persisted = NativeSchedulerSafePersistedSchedule {
+                sampler_id: schedule.contract.sampler_id.clone(),
+                sampler_category: schedule.contract.sampler_category.clone(),
+                schedule_enabled: schedule.contract.schedule_enabled,
+                interval_bucket: schedule.contract.interval_bucket.clone(),
+                timeout_bucket: schedule.contract.timeout_bucket.clone(),
+                retry_budget_bucket: schedule.contract.retry_budget_bucket.clone(),
+                provenance_id: PROVENANCE_ID.to_string(),
+                redaction_status: RedactionStatus::Redacted,
+            };
+            persisted.validate().map_err(contract_error)?;
+            Ok(persisted)
+        })
+        .collect::<CommandResult<Vec<_>>>()?;
+    let operational = NativeSchedulerOperationalSummary {
+        scheduler_health: scheduler_health_state(&summary.status),
+        status: summary.status,
+        safe_persisted_schedules,
+        freshness_summary: latest_cycle
+            .as_ref()
+            .and_then(|cycle| cycle.freshness.clone()),
+        missed_sample_summary: latest_cycle
+            .as_ref()
+            .and_then(|cycle| cycle.missed_sample.clone()),
+        retry_summary: scheduler_retry_summary(cycles, retry_attempts)?,
+        backpressure_summary: latest_cycle
+            .as_ref()
+            .and_then(|cycle| cycle.backpressure.clone()),
+        scheduler_refs: cycles
+            .iter()
+            .rev()
+            .take(MAX_NATIVE_SCHEDULER_CYCLES)
+            .map(|cycle| cycle.cycle_id.clone())
+            .collect(),
+        freshness_refs: cycles
+            .iter()
+            .rev()
+            .filter(|cycle| cycle.freshness.is_some())
+            .take(MAX_NATIVE_SCHEDULER_CYCLES)
+            .map(|cycle| cycle.cycle_id.clone())
+            .collect(),
+        missed_sample_refs: cycles
+            .iter()
+            .rev()
+            .filter(|cycle| cycle.missed_sample.is_some())
+            .take(MAX_NATIVE_SCHEDULER_CYCLES)
+            .map(|cycle| cycle.cycle_id.clone())
+            .collect(),
+        quality_refs: Vec::new(),
+        safe_persistence_only: true,
+        raw_native_data_persisted: false,
+        runtime_subject_persisted: false,
+        source_location_persisted: false,
+        launch_text_persisted: false,
+        machine_identifier_persisted: false,
+        scheduler_enablement_started: false,
+        provider_refresh_started: false,
+        automatic_llm_calls: false,
+        response_execution_started: false,
+        generated_at: Timestamp::now(),
+    };
+    operational.validate().map_err(contract_error)?;
+    Ok(operational)
 }
 
 fn default_schedule_contract(

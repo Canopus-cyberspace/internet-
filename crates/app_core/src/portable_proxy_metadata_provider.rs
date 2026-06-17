@@ -1,5 +1,6 @@
 use crate::portable_capture_import::apply_portable_capture_run;
 use crate::read_commands::ReadOnlyCommandState;
+use crate::runtime_container::RuntimeServices;
 use sentinel_capabilities::{
     LocalProxyMetadataProvider, LocalProxyMetadataProviderError,
     LocalProxyMetadataProviderStateKind, LocalProxyMetadataProviderStatus,
@@ -14,12 +15,20 @@ use std::thread;
 #[cfg(test)]
 use std::time::Duration;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PortableProxyMetadataRuntime {
     provider: LocalProxyMetadataProvider,
+    runtime_services: RuntimeServices,
 }
 
 impl PortableProxyMetadataRuntime {
+    pub(crate) fn new(runtime_services: RuntimeServices) -> Self {
+        Self {
+            provider: LocalProxyMetadataProvider::default(),
+            runtime_services,
+        }
+    }
+
     pub fn start(
         &mut self,
         state: &mut ReadOnlyCommandState,
@@ -38,7 +47,7 @@ impl PortableProxyMetadataRuntime {
         &mut self,
         state: &mut ReadOnlyCommandState,
     ) -> CommandResult<LocalProxyMetadataProviderStatus> {
-        let _ = drain_proxy_runs(state, &mut self.provider);
+        let _ = drain_proxy_runs(state, &mut self.provider, &self.runtime_services);
         let status = self.provider.status();
         update_capture_availability(state, &status);
         Ok(status)
@@ -51,7 +60,7 @@ impl PortableProxyMetadataRuntime {
         LocalProxyMetadataProviderStatus,
         Vec<PortableCaptureLiteRunResult>,
     )> {
-        let runs = drain_proxy_runs(state, &mut self.provider);
+        let runs = drain_proxy_runs(state, &mut self.provider, &self.runtime_services);
         let status = self.provider.status();
         update_capture_availability(state, &status);
         Ok((status, runs))
@@ -62,7 +71,7 @@ impl PortableProxyMetadataRuntime {
         state: &mut ReadOnlyCommandState,
     ) -> CommandResult<LocalProxyMetadataProviderStatus> {
         self.provider.stop().map_err(proxy_error)?;
-        let _ = drain_proxy_runs(state, &mut self.provider);
+        let _ = drain_proxy_runs(state, &mut self.provider, &self.runtime_services);
         let status = self.provider.status();
         update_capture_availability(state, &status);
         Ok(status)
@@ -72,12 +81,24 @@ impl PortableProxyMetadataRuntime {
 fn drain_proxy_runs(
     state: &mut ReadOnlyCommandState,
     provider: &mut LocalProxyMetadataProvider,
+    runtime_services: &RuntimeServices,
 ) -> Vec<PortableCaptureLiteRunResult> {
-    let runs = provider.take_completed_runs();
+    let runs = provider
+        .take_completed_batches()
+        .into_iter()
+        .filter_map(|batch| runtime_services.run_portable_capture(&batch, &[]).ok())
+        .collect::<Vec<_>>();
     for run in &runs {
         apply_portable_capture_run(state, run);
     }
     runs
+}
+
+#[cfg(test)]
+impl Default for PortableProxyMetadataRuntime {
+    fn default() -> Self {
+        Self::new(RuntimeServices::for_test("portable-proxy").expect("test runtime services"))
+    }
 }
 
 fn update_capture_availability(

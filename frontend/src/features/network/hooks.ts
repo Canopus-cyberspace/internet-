@@ -16,11 +16,16 @@ import {
   drainLocalMetadataProxy,
   getLocalMetadataProxyStatus,
   getMetadataWatchControllerStatus,
+  getNetworkFallbackPlan,
+  getNetworkProviderStatus,
+  getNetworkVisibilitySummary,
+  getProviderControllerStatus,
   getInvestigationDrillDownSummary,
   confirmPortableCaptureImport,
   confirmMetadataWatchSource,
   listMetadataSamplingBatches,
   listMetadataWatchSources,
+  listNetworkProviderStatus,
   previewPortableCaptureImport,
   previewMetadataWatchSource,
   runMetadataSamplingLoop,
@@ -52,6 +57,42 @@ export function useTlsQuery(request: QueryRequestDto = defaultQueryRequest()) {
   return useQuery({
     queryKey: queryKeys.network.tls(request),
     queryFn: () => searchTls(request),
+  });
+}
+
+export function useProviderControllerStatusQuery() {
+  return useQuery({
+    queryKey: queryKeys.network.providerController,
+    queryFn: getProviderControllerStatus,
+  });
+}
+
+export function useNetworkProviderStatusesQuery() {
+  return useQuery({
+    queryKey: queryKeys.network.providerStatuses,
+    queryFn: listNetworkProviderStatus,
+  });
+}
+
+export function useNetworkProviderStatusQuery(providerId: string) {
+  return useQuery({
+    queryKey: queryKeys.network.providerStatus(providerId),
+    queryFn: () => getNetworkProviderStatus(providerId),
+    enabled: providerId.length > 0,
+  });
+}
+
+export function useNetworkVisibilitySummaryQuery() {
+  return useQuery({
+    queryKey: queryKeys.network.providerVisibility,
+    queryFn: getNetworkVisibilitySummary,
+  });
+}
+
+export function useNetworkFallbackPlanQuery() {
+  return useQuery({
+    queryKey: queryKeys.network.providerFallbackPlan,
+    queryFn: getNetworkFallbackPlan,
   });
 }
 
